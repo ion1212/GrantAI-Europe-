@@ -1,44 +1,95 @@
-import json
-from pathlib import Path
 import streamlit as st
 
-BASE = Path(__file__).parent
-PROFILE = BASE / "data" / "profile.json"
+st.set_page_config(
+    page_title="GrantAI Europe",
+    page_icon="🇪🇺",
+    layout="wide"
+)
 
-st.set_page_config(page_title="GrantAI Europe", page_icon="🇪🇺", layout="wide")
 st.title("🇪🇺 GrantAI Europe")
 st.caption("Agent AI pentru identificarea și pregătirea proiectelor europene")
 
-profile = json.loads(PROFILE.read_text(encoding="utf-8"))
+profile = {
+    "organisation": {
+        "legal_name": "II Ciobotaru Viorel Razvan Ionut",
+        "country": "Romania",
+        "organisation_type": "SME / întreprindere individuală",
+        "capabilities": [
+            "agriculture",
+            "smart greenhouse",
+            "renewable energy",
+            "battery storage",
+            "AI automation"
+        ]
+    },
+    "project": {
+        "name": "GreenRise",
+        "summary": "Seră inteligentă cu energie regenerabilă, baterii și automatizare AI.",
+        "keywords": [
+            "agriculture",
+            "greenhouse",
+            "energy",
+            "battery",
+            "AI"
+        ]
+    }
+}
 
-tab1, tab2, tab3 = st.tabs(["Profil", "Apeluri", "Generator"])
+tab1, tab2, tab3 = st.tabs([
+    "Profil",
+    "Apeluri",
+    "Generator"
+])
 
 with tab1:
     st.subheader("Organizație")
-    st.write(profile["organisation"])
+    st.json(profile["organisation"])
+
     st.subheader("Proiect principal")
-    st.write(profile["projects"][0])
+    st.json(profile["project"])
 
 with tab2:
-    st.info("Modulul de căutare automată a apelurilor va fi conectat în etapa următoare.")
-    keyword = st.text_input("Cuvinte-cheie", "agriculture energy AI")
+    st.subheader("Căutare apeluri europene")
+    keyword = st.text_input(
+        "Cuvinte-cheie",
+        "agriculture energy AI"
+    )
+
     if st.button("Caută apeluri"):
-        st.success(f"Căutarea pentru «{keyword}» este pregătită pentru integrarea API.")
+        st.success(
+            f"Căutarea pentru „{keyword}” este pregătită."
+        )
+        st.info(
+            "În etapa următoare conectăm aplicația la Funding & Tenders Portal."
+        )
 
 with tab3:
-    st.info("Generatorul AI va folosi cheia OpenAI configurată în cloud.")
+    st.subheader("Generator proiect")
+
     if st.button("Generează structură proiect"):
         st.markdown("""
-### Structură inițială
-1. Excellence
-2. Impact
-3. Implementation
-4. Work packages
-5. Buget
-6. Riscuri
-7. Parteneri
-8. Checklist de conformitate
+### Excellence
+- Obiective
+- Ambiție
+- Metodologie
+- Stadiul actual al tehnologiei
+
+### Impact
+- Rezultate estimate
+- Indicatori de performanță
+- Exploatare
+- Diseminare
+
+### Implementation
+- Work packages
+- Milestones
+- Deliverables
+- Riscuri
+- Buget
+- Parteneri
 """)
 
 st.divider()
-st.caption("Declarațiile juridice, datele financiare și depunerea finală trebuie aprobate de o persoană autorizată.")
+st.caption(
+    "Declarațiile juridice, datele financiare și depunerea finală trebuie aprobate de o persoană autorizată."
+)
