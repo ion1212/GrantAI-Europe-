@@ -1,4 +1,0 @@
-streamlit>=1.46,<2
-openai>=1.93,<2
-requests>=2.32,<3
-pandas>=2.2,<3
