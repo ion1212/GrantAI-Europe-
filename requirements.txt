@@ -1,7 +1,0 @@
-streamlit>=1.46,<2
-requests>=2.32,<3
-pandas>=2.2,<3
-python-dateutil>=2.9,<3
-openai>=1.93,<2
-python-docx>=1.1,<2
-supabase>=2.18,<3
