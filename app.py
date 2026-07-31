@@ -1011,6 +1011,4 @@ with history_tab:
             st.markdown(row["content"])
 
 st.divider()
-st.caption(
-    "Parserul este tolerant la schimbări ale structurii Search API. "
-    "Depunerea oficială și EU Login rămân în portalul Comisiei Europene."
+st.caption("Parserul este tolerant la schimbări ale structurii Search API. Depunerea oficială și EU Login rămân în portalul Comisiei Europene.")
