@@ -157,17 +157,47 @@ def load_opportunities() -> list[dict[str, Any]]:
 
 
 def load_latest_proposal(project_id: str, identity: str) -> dict[str, Any] | None:
-    result = (
-        get_supabase()
-        .table("proposal_versions")
-        .select("*")
-        .eq("project_id", project_id)
-        .eq("opportunity_identity", identity)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
+    """
+    Încearcă mai întâi schema nouă Etapa 10.
+    Dacă baza de date folosește schema veche proposal_versions, face fallback
+    la ultima propunere a proiectului și normalizează câmpurile.
+    """
+    try:
+        result = (
+            get_supabase()
+            .table("proposal_versions")
+            .select("*")
+            .eq("project_id", project_id)
+            .eq("opportunity_identity", identity)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        try:
+            result = (
+                get_supabase()
+                .table("proposal_versions")
+                .select("*")
+                .eq("project_id", project_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+        except Exception:
+            return None
+
+    if not result.data:
+        return None
+
+    proposal = dict(result.data[0])
+    proposal.setdefault(
+        "document_type",
+        proposal.get("section") or proposal.get("title") or "Proposal draft",
     )
-    return result.data[0] if result.data else None
+    proposal.setdefault("version", 1)
+    proposal.setdefault("content", "")
+    return proposal
 
 
 def load_match(project_id: str, identity: str) -> dict[str, Any] | None:
