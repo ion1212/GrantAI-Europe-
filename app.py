@@ -754,7 +754,14 @@ with engine_tab:
     minimum_score = f2.slider("Scor minim", 0, 100, 0, 5)
     minimum_days = f3.slider("Minimum zile rămase", 0, 180, 0, 7)
     only_open = f4.checkbox("Doar active", value=True)
-    auto_save_threshold = st.slider("Salvează automat peste scorul", 50, 100, 75, 5)
+    auto_save_threshold = st.slider(
+        "Salvează automat peste scorul",
+        min_value=0,
+        max_value=100,
+        value=25,
+        step=5,
+        help="Oportunitățile cu scor egal sau mai mare sunt salvate automat în Supabase.",
+    )
 
     if st.button("Sincronizează și evaluează", type="primary", use_container_width=True):
         with st.spinner("Preiau și interpretez apelurile..."):
@@ -867,9 +874,18 @@ with engine_tab:
             with st.expander("Descriere publică"):
                 st.write(selected["description"])
 
-        if st.button("Salvează manual"):
+        save_col1, save_col2 = st.columns(2)
+        if save_col1.button("Salvează oportunitatea selectată"):
             save_opportunity(selected, auto_saved=False)
-            st.success("Oportunitate salvată.")
+            st.success("Oportunitate salvată în Supabase.")
+
+        if save_col2.button("Salvează toate oportunitățile filtrate"):
+            saved_count = 0
+            for opportunity_item in filtered:
+                save_opportunity(opportunity_item, auto_saved=False)
+                saved_count += 1
+            st.success(f"{saved_count} oportunități salvate în Supabase.")
+            st.rerun()
     elif results:
         st.warning("Niciun apel nu respectă filtrele.")
 
@@ -998,4 +1014,3 @@ st.divider()
 st.caption(
     "Parserul este tolerant la schimbări ale structurii Search API. "
     "Depunerea oficială și EU Login rămân în portalul Comisiei Europene."
-)
