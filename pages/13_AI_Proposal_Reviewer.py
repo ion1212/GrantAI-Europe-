@@ -134,10 +134,13 @@ def load_opportunities(sb, uid: str, project_id: str):
 
 def load_writer_sections(sb, uid: str, project_id: str, identity: str):
     """
-    Încarcă documentul Etapei 12 pentru oportunitatea curentă.
-    Dacă opportunity_identity diferă între pagini, folosește ca fallback
-    cel mai recent document Writer pentru același utilizator și proiect.
+    Etapa 12 salvează atât documentul, cât și secțiunile cu:
+      user_id, project_id, opportunity_identity.
+    Reviewer-ul încearcă mai multe căi de legare și nu ascunde erorile SQL.
     """
+    errors = []
+
+    # 1. Potrivire exactă: document + identity.
     try:
         docs = rows(
             sb.table("grant_writer_documents")
@@ -145,44 +148,86 @@ def load_writer_sections(sb, uid: str, project_id: str, identity: str):
             .eq("user_id", uid)
             .eq("project_id", project_id)
             .eq("opportunity_identity", identity)
-            .order("updated_at", desc=True)
             .limit(1)
             .execute()
         )
-    except Exception:
-        docs = []
-
-    if not docs:
-        try:
-            docs = rows(
-                sb.table("grant_writer_documents")
+        if docs:
+            doc = docs[0]
+            sections = rows(
+                sb.table("grant_writer_sections")
                 .select("*")
                 .eq("user_id", uid)
                 .eq("project_id", project_id)
-                .order("updated_at", desc=True)
-                .limit(1)
+                .eq("document_id", doc["id"])
                 .execute()
             )
-        except Exception:
-            docs = []
+            if sections:
+                return doc, sections, "exact", errors
+    except Exception as exc:
+        errors.append(f"exact: {exc}")
 
-    if not docs:
-        return None, []
-
-    doc = docs[0]
-
+    # 2. Etapa 12 pune opportunity_identity direct și în grant_writer_sections.
     try:
         sections = rows(
             sb.table("grant_writer_sections")
             .select("*")
-            .eq("document_id", doc["id"])
-            .order("section_key")
+            .eq("user_id", uid)
+            .eq("project_id", project_id)
+            .eq("opportunity_identity", identity)
             .execute()
         )
-    except Exception:
-        sections = []
+        if sections:
+            did = sections[0].get("document_id")
+            doc = None
+            if did:
+                d = rows(
+                    sb.table("grant_writer_documents")
+                    .select("*")
+                    .eq("id", did)
+                    .limit(1)
+                    .execute()
+                )
+                doc = d[0] if d else {"id": did, "opportunity_identity": identity}
+            return doc, sections, "section_identity", errors
+    except Exception as exc:
+        errors.append(f"section_identity: {exc}")
 
-    return doc, sections
+    # 3. Fallback sigur pentru proiect: secțiunile cele mai recent actualizate.
+    # Nu depinde de updated_at din grant_writer_documents.
+    try:
+        sections = rows(
+            sb.table("grant_writer_sections")
+            .select("*")
+            .eq("user_id", uid)
+            .eq("project_id", project_id)
+            .order("updated_at", desc=True)
+            .limit(100)
+            .execute()
+        )
+        if sections:
+            # Păstrează un singur document, preferând documentul celei mai recente secțiuni.
+            did = sections[0].get("document_id")
+            if did:
+                sections = [s for s in sections if str(s.get("document_id")) == str(did)]
+            doc = {"id": did, "opportunity_identity": sections[0].get("opportunity_identity")}
+            try:
+                if did:
+                    d = rows(
+                        sb.table("grant_writer_documents")
+                        .select("*")
+                        .eq("id", did)
+                        .limit(1)
+                        .execute()
+                    )
+                    if d:
+                        doc = d[0]
+            except Exception as exc:
+                errors.append(f"document_lookup: {exc}")
+            return doc, sections, "project_fallback", errors
+    except Exception as exc:
+        errors.append(f"project_fallback: {exc}")
+
+    return None, [], "none", errors
 
 
 def normalize_section_title(section: dict[str, Any]) -> str:
@@ -466,14 +511,23 @@ identity = opportunity_identity(opportunity)
 with st.expander("Datele apelului selectat"):
     st.json(opportunity)
 
-document, sections = load_writer_sections(sb, uid, project_id, identity)
+document, sections, writer_match_mode, writer_errors = load_writer_sections(
+    sb, uid, project_id, identity
+)
 proposal_text = combine_sections(sections)
 
-if document and document.get("opportunity_identity") != identity:
-    st.info(
-        "Reviewer-ul a folosit cel mai recent document din AI Grant Writer pentru acest proiect, "
-        "deoarece identificatorul oportunității diferă între module."
+if writer_match_mode == "section_identity":
+    st.info("Conținutul Etapei 12 a fost găsit direct în grant_writer_sections.")
+elif writer_match_mode == "project_fallback":
+    st.warning(
+        "Identificatorul oportunității nu s-a potrivit exact. "
+        "Reviewer-ul a încărcat cel mai recent document Writer al proiectului."
     )
+
+if not proposal_text and writer_errors:
+    with st.expander("Diagnostic Etapa 12 → Etapa 13"):
+        for err in writer_errors:
+            st.code(err)
 
 if not proposal_text:
     st.warning(
