@@ -665,7 +665,7 @@ else:
                     # Stage 23 does NOT execute the final submission itself.
                     task_update = {
                         "proposed_resolution": edited_resolution.strip(),
-                        "status": "Ready",
+                        "status": "Proposed",
                     }
 
                     supabase.table("resolution_tasks").update(
