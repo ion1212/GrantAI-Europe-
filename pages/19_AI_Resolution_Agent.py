@@ -55,17 +55,43 @@ def rows(resp):
     return data if isinstance(data, list) else []
 
 
+def restore_auth_session(sb) -> None:
+    """Restore the Supabase JWT session created on the main app page."""
+    session = st.session_state.get("auth_session")
+    if not session:
+        return
+
+    access_token = (
+        session.get("access_token")
+        if isinstance(session, dict)
+        else getattr(session, "access_token", None)
+    )
+    refresh_token = (
+        session.get("refresh_token")
+        if isinstance(session, dict)
+        else getattr(session, "refresh_token", None)
+    )
+
+    if access_token and refresh_token:
+        try:
+            sb.auth.set_session(access_token, refresh_token)
+        except Exception:
+            pass
+
+
 def current_user_id(sb) -> str | None:
+    # Main app stores the logged-in user under "auth_user".
+    for key in ("auth_user", "user"):
+        user = st.session_state.get(key)
+        if isinstance(user, dict) and user.get("id"):
+            return str(user["id"])
+        if getattr(user, "id", None):
+            return str(user.id)
+
     for key in ("user_id", "auth_user_id"):
         value = st.session_state.get(key)
         if value:
             return str(value)
-
-    user = st.session_state.get("user")
-    if isinstance(user, dict) and user.get("id"):
-        return str(user["id"])
-    if getattr(user, "id", None):
-        return str(user.id)
 
     try:
         user = sb.auth.get_user().user
@@ -514,6 +540,9 @@ try:
 except Exception as exc:
     st.error(f"Supabase nu este configurat corect: {exc}")
     st.stop()
+
+# Reuse the login session created by app.py so RLS-authenticated queries work.
+restore_auth_session(sb)
 
 uid = current_user_id(sb)
 if not uid:
