@@ -19,8 +19,26 @@ st.caption(
     "Nicio modificare nu este aplicată fără aprobare explicită."
 )
 
-# Reuse the authenticated session created by app.py.
-def restore_auth_session(sb):
+# ---------------------------------------------------------------------
+# Secrets / Supabase / shared authentication bootstrap
+# ---------------------------------------------------------------------
+def secret(name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:
+        return os.getenv(name, default)
+
+
+@st.cache_resource
+def get_supabase():
+    return create_client(
+        secret("SUPABASE_URL"),
+        secret("SUPABASE_KEY") or secret("SUPABASE_ANON_KEY"),
+    )
+
+
+def restore_auth_session(sb) -> None:
+    """Restore the Supabase JWT session created on the main app page."""
     session = st.session_state.get("auth_session")
     if not session:
         return
@@ -43,7 +61,7 @@ def restore_auth_session(sb):
             pass
 
 
-def current_user_id(sb):
+def current_user_id(sb) -> str | None:
     for key in ("auth_user", "user"):
         user = st.session_state.get(key)
         if isinstance(user, dict) and user.get("id"):
@@ -66,9 +84,15 @@ def current_user_id(sb):
     return None
 
 
-restore_auth_session(supabase)
-user_id = current_user_id(supabase)
+try:
+    supabase = get_supabase()
+except Exception as exc:
+    st.error(f"Supabase nu este configurat corect: {exc}")
+    st.stop()
 
+restore_auth_session(supabase)
+
+user_id = current_user_id(supabase)
 if not user_id:
     st.error("Intră în cont din pagina principală și revino.")
     st.stop()
