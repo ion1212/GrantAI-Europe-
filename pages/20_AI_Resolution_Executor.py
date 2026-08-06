@@ -19,19 +19,59 @@ st.caption(
     "Nicio modificare nu este aplicată fără aprobare explicită."
 )
 
-# Session/auth must already be established by the shared Stage 19 bootstrap.
-user = None
-try:
-    user = supabase.auth.get_user()
-    user = getattr(user, "user", None)
-except Exception:
-    user = None
+# Reuse the authenticated session created by app.py.
+def restore_auth_session(sb):
+    session = st.session_state.get("auth_session")
+    if not session:
+        return
 
-if not user:
+    access_token = (
+        session.get("access_token")
+        if isinstance(session, dict)
+        else getattr(session, "access_token", None)
+    )
+    refresh_token = (
+        session.get("refresh_token")
+        if isinstance(session, dict)
+        else getattr(session, "refresh_token", None)
+    )
+
+    if access_token and refresh_token:
+        try:
+            sb.auth.set_session(access_token, refresh_token)
+        except Exception:
+            pass
+
+
+def current_user_id(sb):
+    for key in ("auth_user", "user"):
+        user = st.session_state.get(key)
+        if isinstance(user, dict) and user.get("id"):
+            return str(user["id"])
+        if getattr(user, "id", None):
+            return str(user.id)
+
+    for key in ("user_id", "auth_user_id"):
+        value = st.session_state.get(key)
+        if value:
+            return str(value)
+
+    try:
+        user = sb.auth.get_user().user
+        if user and getattr(user, "id", None):
+            return str(user.id)
+    except Exception:
+        pass
+
+    return None
+
+
+restore_auth_session(supabase)
+user_id = current_user_id(supabase)
+
+if not user_id:
     st.error("Intră în cont din pagina principală și revino.")
     st.stop()
-
-user_id = str(user.id)
 
 # Load user's projects.
 try:
