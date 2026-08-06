@@ -810,7 +810,7 @@ if resolution_tasks:
         ],
     ]
 
-    for tab, group in zip(tabs, groups):
+    for tab_idx, (tab, group) in enumerate(zip(tabs, groups)):
         with tab:
             if not group:
                 st.info("Nu există task-uri în această categorie.")
@@ -853,14 +853,14 @@ if resolution_tasks:
                         "Rezolvare propusă",
                         value=task.get("proposed_resolution") or "",
                         height=180,
-                        key=f"proposed_{task['id']}",
+                        key=f"proposed_{tab_idx}_{task['id']}",
                     )
 
                     required_input = st.text_area(
                         "Input / verificare necesară",
                         value=task.get("required_input") or "",
                         height=100,
-                        key=f"input_{task['id']}",
+                        key=f"input_{tab_idx}_{task['id']}",
                     )
 
                     status_options = [
@@ -880,14 +880,14 @@ if resolution_tasks:
                             if current_status in status_options
                             else 0
                         ),
-                        key=f"resolution_status_{task['id']}",
+                        key=f"resolution_status_{tab_idx}_{task['id']}",
                     )
 
                     x1, x2, x3 = st.columns(3)
 
                     if x1.button(
                         "Salvează",
-                        key=f"save_resolution_{task['id']}",
+                        key=f"save_resolution_{tab_idx}_{task['id']}",
                         use_container_width=True,
                     ):
                         try:
@@ -910,7 +910,7 @@ if resolution_tasks:
 
                     if x2.button(
                         "Marchează în lucru",
-                        key=f"in_progress_{task['id']}",
+                        key=f"in_progress_{tab_idx}_{task['id']}",
                         use_container_width=True,
                         disabled=not readiness_item_id,
                     ):
@@ -940,7 +940,7 @@ if resolution_tasks:
 
                     if x3.button(
                         "Confirm rezolvat",
-                        key=f"done_{task['id']}",
+                        key=f"done_{tab_idx}_{task['id']}",
                         use_container_width=True,
                         disabled=not readiness_item_id,
                     ):
