@@ -450,7 +450,7 @@ if st.button(
                     "source_reference": str(item.get("source_reference") or ""),
                     "confidence": confidence,
                     "reason": str(item.get("reason") or ""),
-                    "suggestion_status": "Proposed" if suggested_value else "No safe suggestion",
+                    "suggestion_status": "Proposed" if suggested_value else "Rejected",
                     "ai_result": item,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
