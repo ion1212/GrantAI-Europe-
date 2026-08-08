@@ -52,17 +52,58 @@ sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 oa = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ---------- Auth ----------
-try:
-    session = sb.auth.get_session()
-    user = session.user if session else None
-except Exception:
-    user = None
+def restore_auth_session(sb) -> None:
+    session = st.session_state.get("auth_session")
+    if not session:
+        return
 
-if not user:
-    st.warning("Trebuie să fii autentificat pentru Etapa 29.")
+    access_token = (
+        session.get("access_token")
+        if isinstance(session, dict)
+        else getattr(session, "access_token", None)
+    )
+    refresh_token = (
+        session.get("refresh_token")
+        if isinstance(session, dict)
+        else getattr(session, "refresh_token", None)
+    )
+
+    if access_token and refresh_token:
+        try:
+            sb.auth.set_session(access_token, refresh_token)
+        except Exception:
+            pass
+
+
+def current_user_id(sb):
+    for key in ("auth_user", "user"):
+        user = st.session_state.get(key)
+        if isinstance(user, dict) and user.get("id"):
+            return str(user["id"])
+        if getattr(user, "id", None):
+            return str(user.id)
+
+    for key in ("user_id", "auth_user_id"):
+        value = st.session_state.get(key)
+        if value:
+            return str(value)
+
+    try:
+        user = sb.auth.get_user().user
+        if user and getattr(user, "id", None):
+            return str(user.id)
+    except Exception:
+        pass
+
+    return None
+
+
+restore_auth_session(sb)
+USER_ID = current_user_id(sb)
+
+if not USER_ID:
+    st.error("Nu am putut identifica utilizatorul autentificat. Revino în pagina principală și apoi redeschide Etapa 29.")
     st.stop()
-
-USER_ID = str(user.id)
 
 # ---------- Helpers ----------
 def rows(table, filters=None, order=None, limit=100):
