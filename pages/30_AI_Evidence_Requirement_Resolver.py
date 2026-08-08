@@ -199,6 +199,15 @@ opportunity_identity = str(gate_run.get("opportunity_identity") or "")
 st.text_input("Oportunitate", value=opportunity_identity or "—", disabled=True)
 
 gate_result = safe_json(gate_run.get("result"))
+
+# Etapa 29 may explicitly flag claims that require official call verification.
+# These claims must override an earlier USER_EVIDENCE classification.
+official_verification_claims = [
+    str(x).strip()
+    for x in (gate_result.get("claims_requiring_official_call_verification") or [])
+    if str(x).strip()
+]
+
 gate_items = rows(
     "opportunity_fit_gate_items",
     {
@@ -265,6 +274,40 @@ for item in existing_items:
 # ---------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------
+def _tokens(text: str) -> set[str]:
+    stop = {
+        "the", "and", "for", "with", "from", "that", "this", "are", "was",
+        "call", "requirements", "requirement", "official", "verification",
+        "proposal", "project", "missing", "explicit", "address", "themes",
+        "thematic", "priorities", "criteria", "mandatory"
+    }
+    return {
+        token for token in
+        "".join(ch.lower() if ch.isalnum() else " " for ch in str(text or "")).split()
+        if len(token) >= 4 and token not in stop
+    }
+
+
+def requires_official_verification(item: dict) -> bool:
+    if str(item.get("classification") or "") == "OFFICIAL_VERIFICATION":
+        return True
+
+    gap_text = " ".join([
+        str(item.get("title") or ""),
+        str(item.get("reason") or ""),
+        str(item.get("required_next_action") or ""),
+        str(item.get("evidence") or ""),
+    ])
+    gap_tokens = _tokens(gap_text)
+
+    for claim in official_verification_claims:
+        claim_tokens = _tokens(claim)
+        if claim_tokens and len(gap_tokens & claim_tokens) >= min(2, len(claim_tokens)):
+            return True
+
+    return False
+
+
 classification_counts = {
     "AI_DRAFTABLE": 0,
     "USER_EVIDENCE": 0,
@@ -273,7 +316,11 @@ classification_counts = {
 }
 
 for item in open_gate_items:
-    cls = str(item.get("classification") or "")
+    cls = (
+        "OFFICIAL_VERIFICATION"
+        if requires_official_verification(item)
+        else str(item.get("classification") or "")
+    )
     if cls in classification_counts:
         classification_counts[cls] += 1
 
@@ -304,6 +351,7 @@ Rules:
 - OPPORTUNITY_MISMATCH: block continuation and explain what must be clarified before further drafting.
 - Return strict JSON only.
 - One output item per input gap.
+- Preserve the classification supplied in each input gap. Never downgrade OFFICIAL_VERIFICATION to USER_EVIDENCE.
 
 Schema:
 {
@@ -327,18 +375,28 @@ Schema:
 
 
 def build_gap_payload():
-    return [
-        {
+    payload = []
+    for item in open_gate_items:
+        classification = str(item.get("classification") or "")
+        overridden = requires_official_verification(item)
+
+        if overridden:
+            classification = "OFFICIAL_VERIFICATION"
+
+        payload.append({
             "opportunity_fit_gate_item_id": str(item.get("id") or ""),
             "title": str(item.get("title") or ""),
-            "classification": str(item.get("classification") or ""),
+            "classification": classification,
             "severity": str(item.get("severity") or "Medium"),
             "reason": str(item.get("reason") or ""),
             "required_next_action": str(item.get("required_next_action") or ""),
             "evidence": str(item.get("evidence") or ""),
-        }
-        for item in open_gate_items
-    ]
+            "classification_override_reason": (
+                "Etapa 29 explicitly marked a matching claim as requiring official call verification."
+                if overridden else ""
+            ),
+        })
+    return payload
 
 
 def ai_plan():
