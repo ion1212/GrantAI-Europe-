@@ -15,8 +15,8 @@ st.set_page_config(
 
 st.title("🔄 Etapa 28 — AI Re-Review Orchestrator")
 st.caption(
-    "Reevaluează proiectul după corecțiile validate în Etapa 27 folosind contextul real "
-    "din Proposal Versions, Grant Reviews, Compliance și Submission Readiness."
+    "Reevaluează proiectul după corecțiile validate folosind snapshot-ul cel mai complet "
+    "disponibil din Writer, Optimizer, Proposal Versions și Submission Pack."
 )
 
 
@@ -48,18 +48,8 @@ def restore_auth_session(sb) -> None:
     session = st.session_state.get("auth_session")
     if not session:
         return
-
-    access_token = (
-        session.get("access_token")
-        if isinstance(session, dict)
-        else getattr(session, "access_token", None)
-    )
-    refresh_token = (
-        session.get("refresh_token")
-        if isinstance(session, dict)
-        else getattr(session, "refresh_token", None)
-    )
-
+    access_token = session.get("access_token") if isinstance(session, dict) else getattr(session, "access_token", None)
+    refresh_token = session.get("refresh_token") if isinstance(session, dict) else getattr(session, "refresh_token", None)
     if access_token and refresh_token:
         try:
             sb.auth.set_session(access_token, refresh_token)
@@ -74,20 +64,21 @@ def current_user_id(sb) -> str | None:
             return str(user["id"])
         if getattr(user, "id", None):
             return str(user.id)
-
     for key in ("user_id", "auth_user_id"):
         value = st.session_state.get(key)
         if value:
             return str(value)
-
     try:
         user = sb.auth.get_user().user
         if user and getattr(user, "id", None):
             return str(user.id)
     except Exception:
         pass
-
     return None
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def safe_score(value: Any) -> float | None:
@@ -99,49 +90,65 @@ def safe_score(value: Any) -> float | None:
         return None
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def clean_json(text: str) -> str:
     text = (text or "").strip()
     if text.startswith("```"):
-        text = (
-            text.replace("```json", "", 1)
-            .replace("```JSON", "", 1)
-            .replace("```", "")
-            .strip()
-        )
+        text = text.replace("```json", "", 1).replace("```JSON", "", 1).replace("```", "").strip()
     return text
 
 
-def compact_json(obj: Any, limit: int = 42000) -> str:
+def compact_json(obj: Any, limit: int = 52000) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)[:limit]
 
 
 def json_score(obj: Any) -> float | None:
     if not isinstance(obj, dict):
         return None
-
-    for key in (
-        "score",
-        "overall_score",
-        "compliance_score",
-        "total_score",
-        "readiness_score",
-    ):
+    for key in ("score", "overall_score", "compliance_score", "total_score", "readiness_score"):
         value = safe_score(obj.get(key))
         if value is not None:
             return value
-
     for key in ("summary", "result", "evaluation"):
         nested = obj.get(key)
         if isinstance(nested, dict):
             found = json_score(nested)
             if found is not None:
                 return found
-
     return None
+
+
+def latest_rows(table: str, user_id: str, project_id: str, opportunity_identity: str = "", limit: int = 100):
+    try:
+        q = (
+            supabase.table(table)
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("project_id", project_id)
+        )
+        if opportunity_identity:
+            try:
+                q = q.eq("opportunity_identity", opportunity_identity)
+            except Exception:
+                pass
+        return q.order("created_at", desc=True).limit(limit).execute().data or []
+    except Exception:
+        return []
+
+
+def pick_latest_per(rows: list[dict], key_fields: list[str]) -> list[dict]:
+    seen = set()
+    out = []
+    for row in rows:
+        key = None
+        for field in key_fields:
+            if row.get(field):
+                key = str(row.get(field))
+                break
+        key = key or str(row.get("id") or "")
+        if key and key not in seen:
+            seen.add(key)
+            out.append(row)
+    return out
 
 
 try:
@@ -158,68 +165,49 @@ if not user_id:
     st.stop()
 
 
-# ---------------------------------------------------------------------
 # Project
-# ---------------------------------------------------------------------
-try:
-    projects = (
-        supabase.table("projects")
-        .select("*")
-        .eq("user_id", user_id)
-        .order("created_at", desc=True)
-        .execute()
-    ).data or []
-except Exception as exc:
-    st.error(f"Nu am putut încărca proiectele: {exc}")
-    st.stop()
-
+projects = latest_rows("projects", user_id, "", "", 100)
 if not projects:
-    st.warning("Nu există proiecte disponibile.")
-    st.stop()
+    try:
+        projects = (
+            supabase.table("projects")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .execute()
+        ).data or []
+    except Exception as exc:
+        st.error(f"Nu am putut încărca proiectele: {exc}")
+        st.stop()
 
 project_labels = {
     f"{p.get('name') or p.get('title') or 'Project'} — {str(p.get('id'))[:8]}": p
     for p in projects
 }
-
-selected_label = st.selectbox("Project", list(project_labels.keys()))
-project = project_labels[selected_label]
+selected = st.selectbox("Project", list(project_labels.keys()))
+project = project_labels[selected]
 project_id = str(project["id"])
 
 
-# ---------------------------------------------------------------------
-# Stage 27 validated items
-# ---------------------------------------------------------------------
-try:
-    validated_items = (
-        supabase.table("post_execution_validation_items")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("project_id", project_id)
-        .eq("validation_status", "Validated")
-        .order("created_at", desc=True)
-        .execute()
-    ).data or []
-except Exception as exc:
-    st.error(f"Nu am putut încărca Etapa 27: {exc}")
-    st.stop()
-
+# Validated stage 27
+validated_items = latest_rows(
+    "post_execution_validation_items",
+    user_id,
+    project_id,
+    "",
+    100,
+)
+validated_items = [r for r in validated_items if str(r.get("validation_status") or "") == "Validated"]
 if not validated_items:
     st.warning("Nu există rezultate Validated în Etapa 27.")
     st.stop()
 
 opportunity_identity = str(validated_items[0].get("opportunity_identity") or "")
 validated_items = [
-    row for row in validated_items
-    if str(row.get("opportunity_identity") or "") == opportunity_identity
+    r for r in validated_items
+    if str(r.get("opportunity_identity") or "") == opportunity_identity
 ]
-
-dedup = {}
-for row in validated_items:
-    key = str(row.get("controlled_execution_id") or row.get("id") or "")
-    if key and key not in dedup:
-        dedup[key] = row
-validated_items = list(dedup.values())
+validated_items = pick_latest_per(validated_items, ["controlled_execution_id"])
 
 st.text_input("Oportunitate", value=opportunity_identity or "—", disabled=True)
 
@@ -228,174 +216,137 @@ execution_plan_id = validated_items[0].get("execution_plan_id")
 
 
 # ---------------------------------------------------------------------
-# Real proposal content from proposal_versions
-# Keep latest version per section.
+# Build best available proposal snapshot
+# Priority:
+# 1) grant_optimization_sections.optimized_content
+# 2) grant_writer_sections.content
+# 3) grant_writer_versions.content
+# 4) proposal_versions.content
+# 5) submission_packs excellence/impact/implementation
 # ---------------------------------------------------------------------
-try:
-    proposal_rows = (
-        supabase.table("proposal_versions")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("project_id", project_id)
-        .order("created_at", desc=True)
-        .execute()
-    ).data or []
-except Exception:
-    proposal_rows = []
+writer_sections = latest_rows("grant_writer_sections", user_id, project_id, opportunity_identity, 200)
+writer_versions = latest_rows("grant_writer_versions", user_id, project_id, opportunity_identity, 200)
+optimization_sections = latest_rows("grant_optimization_sections", user_id, project_id, opportunity_identity, 200)
+proposal_versions = latest_rows("proposal_versions", user_id, project_id, "", 200)
+submission_packs = latest_rows("submission_packs", user_id, project_id, opportunity_identity, 20)
 
-latest_section_versions = {}
-for row in proposal_rows:
-    section = str(row.get("section") or row.get("title") or "General")
-    if section not in latest_section_versions:
-        latest_section_versions[section] = row
+writer_sections = pick_latest_per(writer_sections, ["section_key", "section_title"])
+writer_versions = pick_latest_per(writer_versions, ["section_key"])
+optimization_sections = pick_latest_per(optimization_sections, ["section_key"])
+proposal_versions = pick_latest_per(proposal_versions, ["section", "title"])
 
-proposal_context = [
+snapshot = {}
+snapshot_source = {}
+
+for row in proposal_versions:
+    key = str(row.get("section") or row.get("title") or "General")
+    content = str(row.get("content") or "").strip()
+    if content:
+        snapshot[key] = content
+        snapshot_source[key] = "proposal_versions"
+
+for row in writer_versions:
+    key = str(row.get("section_key") or "General")
+    content = str(row.get("content") or "").strip()
+    if content:
+        snapshot[key] = content
+        snapshot_source[key] = "grant_writer_versions"
+
+for row in writer_sections:
+    key = str(row.get("section_key") or row.get("section_title") or "General")
+    content = str(row.get("content") or "").strip()
+    if content:
+        snapshot[key] = content
+        snapshot_source[key] = "grant_writer_sections"
+
+for row in optimization_sections:
+    key = str(row.get("section_key") or "General")
+    content = str(row.get("optimized_content") or row.get("original_content") or "").strip()
+    if content:
+        snapshot[key] = content
+        snapshot_source[key] = "grant_optimization_sections"
+
+if submission_packs:
+    pack = submission_packs[0]
+    for key, field in [
+        ("Excellence", "excellence_content"),
+        ("Impact", "impact_content"),
+        ("Implementation", "implementation_content"),
+    ]:
+        content = str(pack.get(field) or "").strip()
+        if content and key not in snapshot:
+            snapshot[key] = content
+            snapshot_source[key] = "submission_packs"
+
+# Apply validated Stage 27 content over target section in snapshot.
+for item in validated_items:
+    section = str(item.get("target_section") or item.get("category") or "General")
+    content = str(item.get("applied_content") or "").strip()
+    if content:
+        snapshot[section] = content
+        snapshot_source[section] = "Stage 27 validated correction"
+
+proposal_snapshot = [
     {
         "section": section,
-        "title": row.get("title"),
-        "content": row.get("content"),
-        "ai_score": row.get("ai_score"),
-        "status": row.get("status"),
-        "version_id": row.get("id"),
-        "created_at": row.get("created_at"),
+        "content": content,
+        "source": snapshot_source.get(section, "unknown"),
     }
-    for section, row in latest_section_versions.items()
+    for section, content in snapshot.items()
 ]
 
 
-# ---------------------------------------------------------------------
-# Real previous Reviewer result
-# ---------------------------------------------------------------------
-try:
-    reviewer_rows = (
-        supabase.table("grant_reviews")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("project_id", project_id)
-        .eq("opportunity_identity", opportunity_identity)
-        .order("created_at", desc=True)
-        .limit(20)
-        .execute()
-    ).data or []
-except Exception:
-    reviewer_rows = []
-
+# Previous evaluations
+reviewer_rows = latest_rows("grant_reviews", user_id, project_id, opportunity_identity, 20)
 previous_reviewer = reviewer_rows[0] if reviewer_rows else {}
 reviewer_before = safe_score(previous_reviewer.get("overall_score"))
 
-
-# ---------------------------------------------------------------------
-# Real previous Compliance result
-# ---------------------------------------------------------------------
-try:
-    compliance_rows = (
-        supabase.table("grant_compliance_checks")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("project_id", project_id)
-        .eq("opportunity_identity", opportunity_identity)
-        .order("created_at", desc=True)
-        .limit(20)
-        .execute()
-    ).data or []
-except Exception:
-    compliance_rows = []
-
+compliance_rows = latest_rows("grant_compliance_checks", user_id, project_id, opportunity_identity, 20)
 previous_compliance = compliance_rows[0] if compliance_rows else {}
 compliance_before = json_score(previous_compliance.get("result") or {})
 
-
-# ---------------------------------------------------------------------
-# Real previous Submission Readiness result
-# ---------------------------------------------------------------------
-try:
-    readiness_rows = (
-        supabase.table("submission_readiness_runs")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("project_id", project_id)
-        .eq("opportunity_identity", opportunity_identity)
-        .order("created_at", desc=True)
-        .limit(20)
-        .execute()
-    ).data or []
-except Exception:
-    readiness_rows = []
-
+readiness_rows = latest_rows("submission_readiness_runs", user_id, project_id, opportunity_identity, 20)
 previous_readiness = readiness_rows[0] if readiness_rows else {}
 readiness_before = safe_score(previous_readiness.get("readiness_score"))
 
-try:
-    readiness_items = (
-        supabase.table("submission_readiness_items")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("project_id", project_id)
-        .eq("opportunity_identity", opportunity_identity)
-        .order("created_at", desc=True)
-        .limit(100)
-        .execute()
-    ).data or []
-except Exception:
-    readiness_items = []
+readiness_items = latest_rows("submission_readiness_items", user_id, project_id, opportunity_identity, 100)
 
-
-# ---------------------------------------------------------------------
-# Existing Stage 28 run
-# ---------------------------------------------------------------------
-try:
-    existing_runs = (
-        supabase.table("rereview_orchestration_runs")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("project_id", project_id)
-        .eq("opportunity_identity", opportunity_identity)
-        .order("created_at", desc=True)
-        .execute()
-    ).data or []
-except Exception:
-    existing_runs = []
-
+existing_runs = latest_rows("rereview_orchestration_runs", user_id, project_id, opportunity_identity, 50)
 latest_run = existing_runs[0] if existing_runs else None
 
 
-# ---------------------------------------------------------------------
 # Metrics
-# ---------------------------------------------------------------------
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Validated Etapa 27", len(validated_items))
-c2.metric(
-    "Reviewer before",
-    "—" if reviewer_before is None else f"{reviewer_before:g}/100",
-)
-c3.metric(
-    "Compliance before",
-    "—" if compliance_before is None else f"{compliance_before:g}/100",
-)
-c4.metric(
-    "Readiness before",
-    "—" if readiness_before is None else f"{readiness_before:g}/100",
-)
+c2.metric("Reviewer before", "—" if reviewer_before is None else f"{reviewer_before:g}/100")
+c3.metric("Compliance before", "—" if compliance_before is None else f"{compliance_before:g}/100")
+c4.metric("Readiness before", "—" if readiness_before is None else f"{readiness_before:g}/100")
 
-if not proposal_context:
-    st.warning(
-        "Nu am găsit conținut în proposal_versions. Re-review-ul poate fi rulat, "
-        "dar contextul propunerii va fi incomplet."
-    )
+if proposal_snapshot:
+    st.success(f"Snapshot complet: {len(proposal_snapshot)} secțiuni încărcate.")
 else:
-    st.success(
-        f"Au fost încărcate {len(proposal_context)} secțiuni reale din proposal_versions."
+    st.error("Nu am găsit conținut de propunere în Writer / Optimizer / Proposal Versions / Submission Pack.")
+
+with st.expander("Surse snapshot"):
+    st.dataframe(
+        [
+            {
+                "section": row["section"],
+                "source": row["source"],
+                "characters": len(row["content"]),
+            }
+            for row in proposal_snapshot
+        ],
+        use_container_width=True,
+        hide_index=True,
     )
 
 st.info(
-    "Etapa 28 folosește acum evaluările reale anterioare și ultimele versiuni ale secțiunilor "
-    "propunerii. Nu modifică automat documentul."
+    "Etapa 28 folosește acum sursa cea mai completă pentru fiecare secțiune și suprapune "
+    "corecțiile validate în Etapa 27 înainte de reevaluare."
 )
 
 
-# ---------------------------------------------------------------------
-# Build real context
-# ---------------------------------------------------------------------
 def validated_context():
     return [
         {
@@ -418,7 +369,6 @@ def prior_context():
             "overall_score": reviewer_before,
             "review_type": previous_reviewer.get("review_type"),
             "result": previous_reviewer.get("result") or {},
-            "created_at": previous_reviewer.get("created_at"),
         },
         "compliance": {
             "score_if_available": compliance_before,
@@ -447,27 +397,20 @@ def prior_context():
 
 def ai_rereview():
     prompt = f"""
-You are performing a controlled re-review of an EU grant proposal after a validated correction.
+You are performing a controlled re-review of an EU grant proposal after validated corrections.
 
-You have:
-1. The actual latest proposal sections from proposal_versions.
-2. Actual previous Reviewer data from grant_reviews.
-3. Actual previous Compliance data from grant_compliance_checks.
-4. Actual previous Submission Readiness data and items.
-5. The validated correction from Stage 27.
+You receive the best available full proposal snapshot assembled from the application's own databases.
+The snapshot may combine optimized sections, writer sections, writer versions, proposal versions,
+submission pack content, and Stage 27 validated corrections.
 
 STRICT RULES:
 - Use only supplied data.
-- Never invent budgets, partners, eligibility, TRL, KPIs, legal status, deadlines, official confirmation, or evidence.
-- A missing fact remains missing.
-- Do not treat "User confirmed" as "Officially verified".
-- Reviewer score_after, Compliance score_after and Readiness score_after must be 0-100.
-- score_before must reflect the supplied real previous score when present; otherwise null.
-- Reviewer: evaluate proposal quality based on actual proposal sections plus validated correction.
-- Compliance: evaluate compliance based on actual prior compliance fields plus actual proposal content and correction.
-- Readiness: evaluate readiness based on actual readiness run/items plus actual proposal content and correction.
-- Do not penalize the project for a "missing project description" if a substantive project description is present in the supplied proposal sections.
-- Do not claim an issue is fixed unless the supplied content actually fixes it.
+- Never invent budget values, partners, eligibility, TRL, KPIs, legal status, deadlines or evidence.
+- If a fact exists in the FULL PROPOSAL SNAPSHOT, do not claim it is missing.
+- If a fact is absent from the FULL PROPOSAL SNAPSHOT and prior stored evidence, it remains missing.
+- Do not confuse lack of a specific database table with lack of proposal content.
+- score_before must reflect the real prior score supplied when available; otherwise null.
+- Recalculate score_after on 0-100.
 - Return JSON only.
 
 Return exactly:
@@ -503,8 +446,8 @@ Return exactly:
 PROJECT:
 {compact_json(project)}
 
-ACTUAL PROPOSAL SECTIONS:
-{compact_json(proposal_context)}
+FULL PROPOSAL SNAPSHOT:
+{compact_json(proposal_snapshot)}
 
 ACTUAL PREVIOUS EVALUATIONS:
 {compact_json(prior_context())}
@@ -516,25 +459,22 @@ VALIDATED STAGE 27 CHANGES:
     response = get_openai().responses.create(
         model=model_name(),
         instructions=(
-            "Return JSON only. Use actual stored proposal/evaluation context. "
-            "Never invent grant facts."
+            "Return JSON only. Evaluate the actual assembled proposal snapshot. "
+            "Do not invent facts and do not claim present content is missing."
         ),
         input=prompt,
     )
-
     result = json.loads(clean_json(response.output_text))
     if not isinstance(result, dict):
         raise ValueError("Răspuns AI invalid.")
     return result
 
 
-# ---------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------
 if st.button(
-    "🔄 Rulează Re-Review complet pe datele reale",
+    "🔄 Rulează Re-Review complet pe snapshot",
     type="primary",
     use_container_width=True,
+    disabled=not bool(proposal_snapshot),
 ):
     with st.spinner("Reevaluăm Reviewer → Compliance → Readiness..."):
         try:
@@ -553,18 +493,16 @@ if st.button(
                     "overall_status": "Running",
                     "summary": {
                         "stage": 28,
-                        "context_source": "real_database_context",
+                        "context_source": "assembled_full_snapshot",
                     },
                     "started_at": now_iso(),
                     "updated_at": now_iso(),
                 })
                 .execute()
             )
-
             run_data = run_insert.data or []
             if not run_data:
                 raise RuntimeError("Nu am putut crea orchestration run.")
-
             orchestration_run_id = str(run_data[0]["id"])
 
             result = ai_rereview()
@@ -574,22 +512,16 @@ if st.button(
                 ("Compliance", "compliance", compliance_before),
                 ("Readiness", "readiness", readiness_before),
             ]
-
             saved_results = {}
 
             for module_name, key, real_before in modules:
                 module_result = result.get(key, {}) or {}
-
                 module_status = str(module_result.get("status") or "Completed")
                 if module_status not in ("Completed", "Failed"):
                     module_status = "Completed"
 
                 score_after = safe_score(module_result.get("score_after"))
-                score_before = (
-                    real_before
-                    if real_before is not None
-                    else safe_score(module_result.get("score_before"))
-                )
+                score_before = real_before if real_before is not None else safe_score(module_result.get("score_before"))
 
                 module_result["score_before"] = score_before
                 module_result["score_after"] = score_after
@@ -613,16 +545,11 @@ if st.button(
                             "score_before": score_before,
                             "score_after": score_after,
                             "result": module_result,
-                            "error_message": (
-                                None
-                                if module_status == "Completed"
-                                else str(module_result.get("summary") or "")
-                            ),
+                            "error_message": None if module_status == "Completed" else str(module_result.get("summary") or ""),
                             "updated_at": now_iso(),
                         })
                         .execute()
                     )
-
                 saved_results[key] = module_result
 
             reviewer_status = str(saved_results.get("reviewer", {}).get("status") or "Completed")
@@ -652,7 +579,8 @@ if st.button(
                     "summary": {
                         "stage": 28,
                         "text": result.get("overall_summary", ""),
-                        "context_source": "proposal_versions + grant_reviews + grant_compliance_checks + submission_readiness",
+                        "context_source": "writer + optimizer + proposal_versions + submission_pack + stage27",
+                        "snapshot_sections": len(proposal_snapshot),
                     },
                     "completed_at": now_iso(),
                     "updated_at": now_iso(),
@@ -662,29 +590,14 @@ if st.button(
                 .execute()
             )
 
-            st.success("Re-Review complet finalizat pe datele reale.")
+            st.success("Re-Review complet finalizat pe snapshot-ul asamblat.")
             st.rerun()
 
         except Exception as exc:
             st.error(f"Re-Review nu a putut fi executat: {exc}")
 
 
-# ---------------------------------------------------------------------
-# Reload / display
-# ---------------------------------------------------------------------
-try:
-    existing_runs = (
-        supabase.table("rereview_orchestration_runs")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("project_id", project_id)
-        .eq("opportunity_identity", opportunity_identity)
-        .order("created_at", desc=True)
-        .execute()
-    ).data or []
-except Exception:
-    existing_runs = []
-
+existing_runs = latest_rows("rereview_orchestration_runs", user_id, project_id, opportunity_identity, 50)
 latest_run = existing_runs[0] if existing_runs else None
 
 st.subheader("Rezultate Re-Review")
@@ -705,18 +618,10 @@ else:
     ]:
         with st.expander(title, expanded=True):
             s1, s2 = st.columns(2)
-
             before = result.get("score_before")
             after = result.get("score_after")
-
-            s1.metric(
-                "Score before",
-                "—" if before is None else f"{before}/100",
-            )
-            s2.metric(
-                "Score after",
-                "—" if after is None else f"{after}/100",
-            )
+            s1.metric("Score before", "—" if before is None else f"{before}/100")
+            s2.metric("Score after", "—" if after is None else f"{after}/100")
 
             if result.get("summary"):
                 st.write(result.get("summary"))
@@ -736,49 +641,11 @@ else:
                 st.success("Nu au fost raportate probleme suplimentare.")
 
             if "submission_ready" in result:
-                st.write(
-                    f"**Submission ready:** "
-                    f"{'YES' if bool(result.get('submission_ready')) else 'NO'}"
-                )
+                st.write(f"**Submission ready:** {'YES' if bool(result.get('submission_ready')) else 'NO'}")
 
     summary = latest_run.get("summary") or {}
     if isinstance(summary, dict) and summary.get("text"):
         st.info(str(summary.get("text")))
-
-
-st.divider()
-
-with st.expander("Context real folosit de Etapa 28"):
-    st.write(f"**Proposal sections:** {len(proposal_context)}")
-    st.write(
-        f"**Reviewer score anterior:** "
-        f"{'—' if reviewer_before is None else reviewer_before}"
-    )
-    st.write(
-        f"**Compliance score anterior:** "
-        f"{'—' if compliance_before is None else compliance_before}"
-    )
-    st.write(
-        f"**Readiness score anterior:** "
-        f"{'—' if readiness_before is None else readiness_before}"
-    )
-
-    if proposal_context:
-        st.dataframe(
-            [
-                {
-                    "section": row.get("section"),
-                    "title": row.get("title"),
-                    "ai_score": row.get("ai_score"),
-                    "status": row.get("status"),
-                    "created_at": row.get("created_at"),
-                }
-                for row in proposal_context
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
 
 with st.expander("Istoric Re-Review Orchestration"):
     if existing_runs:
@@ -803,6 +670,6 @@ with st.expander("Istoric Re-Review Orchestration"):
         st.caption("Nu există încă rulări.")
 
 st.caption(
-    "Etapa 28 folosește acum proposal_versions, grant_reviews, grant_compliance_checks "
-    "și submission_readiness pentru a realiza o reevaluare comparabilă înainte/după."
+    "Etapa 28 reconstruiește acum snapshot-ul propunerii din sursele reale disponibile "
+    "și suprapune corecțiile validate înainte de reevaluare."
 )
