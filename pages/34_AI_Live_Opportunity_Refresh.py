@@ -105,24 +105,96 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def parse_date(value):
-    if not value:
+def unwrap_value(value):
+    """
+    EC SEARCH API frequently returns display fields as one-element arrays.
+    Reduce arrays/dicts to the first useful scalar value without turning
+    Python lists into strings such as "['HORIZON-...']".
+    """
+    if value is None:
         return None
+
+    if isinstance(value, list):
+        for item in value:
+            unwrapped = unwrap_value(item)
+            if unwrapped not in (None, "", [], {}):
+                return unwrapped
+        return None
+
+    if isinstance(value, dict):
+        # Common wrappers used by search/index APIs.
+        for key in (
+            "value", "date", "label", "name", "title", "text",
+            "identifier", "reference", "url"
+        ):
+            if key in value:
+                unwrapped = unwrap_value(value.get(key))
+                if unwrapped not in (None, "", [], {}):
+                    return unwrapped
+
+        # Last-resort: use the first scalar-looking child.
+        for item in value.values():
+            unwrapped = unwrap_value(item)
+            if unwrapped not in (None, "", [], {}):
+                return unwrapped
+        return None
+
+    return value
+
+
+def parse_date(value):
+    value = unwrap_value(value)
+    if value in (None, ""):
+        return None
+
+    # Support epoch timestamps if the API ever returns them.
+    if isinstance(value, (int, float)):
+        try:
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:  # milliseconds
+                timestamp /= 1000.0
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).date()
+        except Exception:
+            return None
+
     text = str(value).strip()
+    if not text:
+        return None
+
+    # ISO-8601, including timestamps such as 2026-09-16T17:00:00Z.
     try:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
     except Exception:
         pass
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+
+    # Common date-only formats.
+    for fmt in (
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y/%m/%d",
+        "%d.%m.%Y",
+    ):
         try:
             return datetime.strptime(text[:10], fmt).date()
         except Exception:
             pass
+
+    # Safe fallback when a longer string begins with an ISO date.
+    if len(text) >= 10:
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").date()
+        except Exception:
+            pass
+
     return None
 
 
 def normalize_text(value):
-    return str(value or "").strip()
+    value = unwrap_value(value)
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 try:
@@ -326,7 +398,7 @@ def pick(d: dict, names):
     lowered = {str(k).lower(): v for k, v in d.items()}
     for name in names:
         if name.lower() in lowered:
-            value = lowered[name.lower()]
+            value = unwrap_value(lowered[name.lower()])
             if value not in (None, "", [], {}):
                 return value
     return None
@@ -355,20 +427,32 @@ def extract_candidates(raw):
             "callIdentifier", "id"
         ])
         deadline = pick(d, [
-            "deadline", "deadlineDate", "submissionDeadline",
-            "closingDate", "endDate"
+            "deadline", "deadlineDate", "deadline_date",
+            "submissionDeadline", "submission_deadline",
+            "closingDate", "closing_date", "endDate", "end_date"
         ])
         opening = pick(d, [
             "openingDate", "opening_date", "startDate", "publicationDate"
         ])
         status = pick(d, ["status", "callStatus", "topicStatus"])
-        programme = pick(d, ["programme", "program", "programmeName"])
+        programme = pick(d, [
+            "programme", "program", "programmeName",
+            "frameworkProgramme", "programmePeriod"
+        ])
         region = pick(d, ["country", "region", "countryOrRegion"])
         description = pick(d, ["description", "summary", "abstract"])
         source_url = pick(d, ["url", "officialUrl", "sourceUrl"])
 
         if not identity and title:
             identity = str(title)[:180]
+
+        identity_text = normalize_text(identity)
+        if not source_url and identity_text:
+            source_url = (
+                "https://ec.europa.eu/info/funding-tenders/opportunities/portal/"
+                "screen/opportunities/topic-details/" +
+                urllib.parse.quote(identity_text, safe="-_.~")
+            )
 
         candidate = {
             "identity": normalize_text(identity),
