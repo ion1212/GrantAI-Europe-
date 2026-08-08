@@ -2,6 +2,7 @@ import os
 import json
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone, date
 from typing import Any
 
@@ -182,36 +183,111 @@ st.info(
 # ---------------------------------------------------------------------
 # EU Funding & Tenders search
 # ---------------------------------------------------------------------
+def _multipart_form_data(fields: dict):
+    """
+    Build multipart/form-data body without adding an extra dependency.
+    EU Funding & Tenders SEARCH API expects POST with query JSON as form data.
+    """
+    boundary = "----GrantAIEuropeBoundary7MA4YWxkTrZu0gW"
+    parts = []
+
+    for name, value in fields.items():
+        if value is None:
+            continue
+
+        parts.append(f"--{boundary}\r\n")
+        parts.append(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+        )
+        parts.append(str(value))
+        parts.append("\r\n")
+
+    parts.append(f"--{boundary}--\r\n")
+    body = "".join(parts).encode("utf-8")
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
+
+
 def fetch_eu_opportunities(search_text: str, limit: int):
     """
-    Uses the EU Funding & Tenders search endpoint used by the earlier Opportunity Engine.
-    If the endpoint shape changes, the raw response is preserved for diagnostics.
-    """
-    query = normalize_text(search_text) or "agriculture energy innovation"
+    Official EU Funding & Tenders SEARCH API.
 
-    # Public Funding & Tenders search API.
+    Important:
+    - endpoint requires HTTPS POST, not GET;
+    - search criteria are sent as JSON in multipart/form-data field `query`;
+    - request is restricted to grant/topic types and non-closed statuses;
+    - free-text keywords are sent through the documented `text` parameter.
+    """
+    query_text_clean = normalize_text(search_text) or "agriculture energy innovation"
+
+    endpoint = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
+
+    # Official API reference codes:
+    # type 1,2,8 = grant/topic related records
+    # status 31094501 / 31094502 = non-closed states used by the Portal API examples.
+    query_data = {
+        "bool": {
+            "must": [
+                {
+                    "terms": {
+                        "type": ["1", "2", "8"]
+                    }
+                },
+                {
+                    "terms": {
+                        "status": ["31094501", "31094502"]
+                    }
+                }
+            ]
+        }
+    }
+
     url = (
-        "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
-        "?apiKey=SEDIA"
-        "&text="
-        + urllib.parse.quote(query)
-        + "&pageSize="
-        + str(limit)
+        endpoint
+        + "?apiKey=SEDIA"
+        + "&text=" + urllib.parse.quote(query_text_clean)
+        + "&pageSize=" + str(int(limit))
         + "&pageNumber=1"
+        + "&language=en"
     )
+
+    body, content_type = _multipart_form_data({
+        "query": json.dumps(query_data, ensure_ascii=False),
+    })
 
     req = urllib.request.Request(
         url,
+        data=body,
+        method="POST",
         headers={
             "User-Agent": "GrantAI-Europe/1.0",
             "Accept": "application/json",
+            "Content-Type": content_type,
         },
     )
 
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=35) as resp:
+            response_body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"EU Funding & Tenders API HTTP {exc.code}: "
+            f"{details[:1000] or exc.reason}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Nu s-a putut conecta la EU Funding & Tenders API: {exc.reason}"
+        ) from exc
 
-    data = json.loads(body)
+    try:
+        data = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "EU Funding & Tenders API nu a returnat JSON valid. "
+            f"Răspuns: {response_body[:1000]}"
+        ) from exc
+
     return data, url
 
 
