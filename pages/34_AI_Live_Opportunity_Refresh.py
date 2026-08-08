@@ -183,76 +183,85 @@ st.info(
 # ---------------------------------------------------------------------
 # EU Funding & Tenders search
 # ---------------------------------------------------------------------
-def _multipart_form_data(fields: dict):
+def _multipart_json_files(parts: dict):
     """
-    Build multipart/form-data body without adding an extra dependency.
-    EU Funding & Tenders SEARCH API expects POST with query JSON as form data.
+    Build multipart/form-data exactly as file-like JSON parts.
+    Each part has filename='blob' and Content-Type: application/json,
+    matching the format expected by the EC corporate SEARCH API.
     """
     boundary = "----GrantAIEuropeBoundary7MA4YWxkTrZu0gW"
-    parts = []
+    body = bytearray()
 
-    for name, value in fields.items():
-        if value is None:
-            continue
-
-        parts.append(f"--{boundary}\r\n")
-        parts.append(
-            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+    for name, value in parts.items():
+        payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="{name}"; filename="blob"\r\n'
+                "Content-Type: application/json\r\n\r\n"
+            ).encode("utf-8")
         )
-        parts.append(str(value))
-        parts.append("\r\n")
+        body.extend(payload)
+        body.extend(b"\r\n")
 
-    parts.append(f"--{boundary}--\r\n")
-    body = "".join(parts).encode("utf-8")
-    content_type = f"multipart/form-data; boundary={boundary}"
-    return body, content_type
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
 def fetch_eu_opportunities(search_text: str, limit: int):
     """
-    Official EU Funding & Tenders SEARCH API.
+    EU Funding & Tenders corporate SEARCH API.
 
-    Important:
-    - endpoint requires HTTPS POST, not GET;
-    - search criteria are sent as JSON in multipart/form-data field `query`;
-    - request is restricted to grant/topic types and non-closed statuses;
-    - free-text keywords are sent through the documented `text` parameter.
+    The API expects POST multipart parts encoded as JSON files, rather than
+    ordinary text form fields. We request open + forthcoming grant/topic
+    records and still validate the actual deadline locally before saving.
     """
-    query_text_clean = normalize_text(search_text) or "agriculture energy innovation"
-
+    query_text_clean = normalize_text(search_text) or "***"
     endpoint = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
 
-    # Official API reference codes:
-    # type 1,2,8 = grant/topic related records
-    # status 31094501 / 31094502 = non-closed states used by the Portal API examples.
     query_data = {
         "bool": {
             "must": [
-                {
-                    "terms": {
-                        "type": ["1", "2", "8"]
-                    }
-                },
-                {
-                    "terms": {
-                        "status": ["31094501", "31094502"]
-                    }
-                }
+                {"terms": {"type": ["1", "2", "8"]}},
+                {"terms": {"status": ["31094501", "31094502"]}},
             ]
         }
     }
 
-    url = (
-        endpoint
-        + "?apiKey=SEDIA"
-        + "&text=" + urllib.parse.quote(query_text_clean)
-        + "&pageSize=" + str(int(limit))
-        + "&pageNumber=1"
-        + "&language=en"
-    )
+    sort_data = {"order": "ASC", "field": "sortStatus"}
 
-    body, content_type = _multipart_form_data({
-        "query": json.dumps(query_data, ensure_ascii=False),
+    display_fields = [
+        "type",
+        "identifier",
+        "reference",
+        "callccm2Id",
+        "title",
+        "status",
+        "caName",
+        "projectAcronym",
+        "startDate",
+        "deadlineDate",
+        "deadlineModel",
+        "frameworkProgramme",
+        "typesOfAction",
+        "description",
+        "programmePeriod",
+        "callIdentifier",
+    ]
+
+    params = {
+        "apiKey": "SEDIA",
+        "text": query_text_clean,
+        "pageSize": str(int(limit)),
+        "pageNumber": "1",
+    }
+    url = endpoint + "?" + urllib.parse.urlencode(params)
+
+    body, content_type = _multipart_json_files({
+        "sort": sort_data,
+        "query": query_data,
+        "languages": ["en"],
+        "displayFields": display_fields,
     })
 
     req = urllib.request.Request(
@@ -260,20 +269,29 @@ def fetch_eu_opportunities(search_text: str, limit: int):
         data=body,
         method="POST",
         headers={
-            "User-Agent": "GrantAI-Europe/1.0",
-            "Accept": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
             "Content-Type": content_type,
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://ec.europa.eu",
+            "Referer": "https://ec.europa.eu/",
+            "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
         },
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=35) as resp:
+        with urllib.request.urlopen(req, timeout=40) as resp:
             response_body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(
             f"EU Funding & Tenders API HTTP {exc.code}: "
-            f"{details[:1000] or exc.reason}"
+            f"{details[:1500] or exc.reason}"
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(
@@ -285,7 +303,7 @@ def fetch_eu_opportunities(search_text: str, limit: int):
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             "EU Funding & Tenders API nu a returnat JSON valid. "
-            f"Răspuns: {response_body[:1000]}"
+            f"Răspuns: {response_body[:1500]}"
         ) from exc
 
     return data, url
@@ -472,6 +490,7 @@ if st.button(
         st.warning("Introdu o căutare.")
     else:
         with st.spinner("Caut oportunități actuale și filtrez rezultatele..."):
+            run_id = None
             try:
                 run_insert = (
                     supabase.table("opportunity_refresh_runs")
@@ -606,7 +625,30 @@ if st.button(
                 st.rerun()
 
             except Exception as exc:
-                st.error(f"Etapa 34 nu a putut finaliza refresh-ul: {exc}")
+                error_text = str(exc)
+
+                if run_id:
+                    try:
+                        (
+                            supabase.table("opportunity_refresh_runs")
+                            .update({
+                                "run_status": "Failed",
+                                "summary": {
+                                    "stage": 34,
+                                    "error": error_text[:4000],
+                                    "source": "EU Funding & Tenders SEARCH API",
+                                },
+                                "completed_at": now_iso(),
+                                "updated_at": now_iso(),
+                            })
+                            .eq("id", run_id)
+                            .eq("user_id", user_id)
+                            .execute()
+                        )
+                    except Exception:
+                        pass
+
+                st.error(f"Etapa 34 nu a putut finaliza refresh-ul: {error_text}")
 
 
 # ---------------------------------------------------------------------
