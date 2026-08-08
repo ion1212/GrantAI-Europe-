@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -213,18 +214,42 @@ st.write(f"**Oportunități găsite:** {len(opportunities)}")
 # ---------------------------------------------------------------------
 # Helpers to normalize opportunity fields
 # ---------------------------------------------------------------------
+def opportunity_data(row: dict) -> dict:
+    """Return the JSONB payload used by public.opportunities."""
+    raw = row.get("data")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 def first_value(row: dict, *keys):
+    """
+    Read normal columns first, then public.opportunities.data JSONB.
+    This keeps compatibility with other opportunity table layouts.
+    """
+    payload = opportunity_data(row)
     for key in keys:
         value = row.get(key)
+        if value not in (None, "", [], {}):
+            return value
+        value = payload.get(key)
         if value not in (None, "", [], {}):
             return value
     return None
 
 
 def opportunity_identity_of(row: dict) -> str:
+    # public.opportunities uses the top-level `identity` column.
     return str(
         first_value(
             row,
+            "identity",
             "opportunity_identity",
             "reference",
             "call_id",
@@ -252,11 +277,28 @@ def deadline_of(row: dict):
 
 
 def status_of(row: dict) -> str:
-    return str(first_value(row, "official_status", "status", "call_status") or "")
+    # deadline_label is more meaningful than opaque numeric status values
+    # in the current opportunities.data payload.
+    return str(
+        first_value(row, "deadline_label", "official_status", "status", "call_status")
+        or ""
+    )
 
 
 def url_of(row: dict) -> str:
     return str(first_value(row, "official_url", "source_url", "url") or "")
+
+
+def days_left_of(row: dict):
+    value = first_value(row, "days_left")
+    try:
+        return int(float(value)) if value not in (None, "") else None
+    except Exception:
+        return None
+
+
+def deadline_label_of(row: dict) -> str:
+    return str(first_value(row, "deadline_label") or "")
 
 
 # ---------------------------------------------------------------------
@@ -294,6 +336,16 @@ def classify(row: dict):
     deadline = deadline_of(row)
     status = status_of(row)
     source_url = url_of(row)
+    days_left = days_left_of(row)
+    deadline_label = deadline_label_of(row)
+
+    # Strong deterministic evidence from opportunities.data.
+    # A past deadline, negative days_left, or explicit closed label
+    # must never remain UNKNOWN merely because the raw status is opaque.
+    label_l = lower(deadline_label)
+    explicit_closed_label = any(
+        x in label_l for x in ("închis", "inchis", "closed", "expired", "archived", "ended")
+    )
 
     if stage32:
         title = str(stage32.get("opportunity_title") or title)
@@ -308,7 +360,24 @@ def classify(row: dict):
         reason = str(stage32.get("verification_reason") or "")
         stage32_blocked = bool(stage32.get("workflow_blocked"))
 
-        if verdict == "VALID" and not stage32_blocked:
+        # Database deadline evidence overrides an older UNKNOWN/VALID Stage 32 result.
+        if (
+            (deadline and deadline < today)
+            or (days_left is not None and days_left < 0)
+            or explicit_closed_label
+        ):
+            validity = "EXPIRED"
+            deadline_verified = deadline is not None or days_left is not None
+            status_verified = explicit_closed_label
+            eligible = False
+            reason = (
+                f"Datele oportunității indică apel expirat/închis: "
+                f"deadline={deadline.isoformat() if deadline else 'unknown'}, "
+                f"days_left={days_left}, deadline_label={deadline_label or 'unknown'}."
+            )
+            confidence = "High"
+
+        elif verdict == "VALID" and not stage32_blocked:
             validity = "VALID"
             deadline_verified = deadline is not None
             status_verified = bool(status)
@@ -349,9 +418,17 @@ def classify(row: dict):
 
     status_l = lower(status)
 
-    if deadline and deadline < today:
+    if (
+        (deadline and deadline < today)
+        or (days_left is not None and days_left < 0)
+        or explicit_closed_label
+    ):
         validity = "EXPIRED"
-        reason = f"Deadline {deadline.isoformat()} este anterior datei curente {today.isoformat()}."
+        reason = (
+            "Datele oportunității indică apel expirat/închis: "
+            f"deadline={deadline.isoformat() if deadline else 'unknown'}, "
+            f"days_left={days_left}, deadline_label={deadline_label or 'unknown'}."
+        )
         confidence = "High"
         eligible = False
         deadline_verified = True
