@@ -342,8 +342,13 @@ def apply_change(original: str, approved_change: str, execution_type: str) -> st
             return approved_change.strip()
         return original.rstrip() + "\n\n" + approved_change.strip()
 
-    if execution_type in ("rewrite", "replace", "insert"):
+    if execution_type in ("rewrite", "replace"):
         return approved_change.strip()
+
+    if execution_type == "insert":
+        if not original.strip():
+            return approved_change.strip()
+        return original.rstrip() + "\n\n" + approved_change.strip()
 
     return approved_change.strip()
 
@@ -365,11 +370,20 @@ for pos, item in enumerate(approved_items):
     target_section = str(item.get("target_section") or "")
     execution_type = str(item.get("execution_type") or "manual")
     approved_change_default = str(
-        item.get("proposed_change")
-        or item.get("approved_resolution")
+        item.get("approved_resolution")
+        or item.get("proposed_change")
         or ""
     )
+
     original_default = str(item.get("current_content") or "")
+
+    # If Stage 25 stored only an execution instruction (e.g. "Insert the approved ..."),
+    # prefer the actual approved resolution text from Stage 23/25.
+    instruction_like = approved_change_default.strip().lower().startswith(
+        ("insert the approved", "append the approved", "replace the current", "rewrite the")
+    )
+    if instruction_like and item.get("approved_resolution"):
+        approved_change_default = str(item.get("approved_resolution") or "")
 
     icon = {
         "Applied": "✅",
@@ -422,6 +436,12 @@ for pos, item in enumerate(approved_items):
             disabled=True,
             key=f"stage26_preview_{item_id}",
         )
+
+        if not original_content.strip():
+            st.warning(
+                "Original content este gol. Execuția va folosi doar textul aprobat ca nou conținut "
+                "pentru secțiunea țintă. Verifică atent Preview înainte de Apply."
+            )
 
         confirm = st.checkbox(
             "Confirm că vreau să aplic exact această modificare",
