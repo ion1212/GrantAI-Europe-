@@ -5513,3 +5513,395 @@ st.caption(
 # =====================================================================
 # END STAGE 45 v7.8
 # =====================================================================
+
+# =====================================================================
+# STAGE 45 v7.9 — REFERENCE CHAIN EVIDENCE RESOLVER
+# =====================================================================
+# v7.9 extends v7.8. It follows authoritative references recursively from the
+# exact locked topic, materialises referenced EC/EU documents, extracts their
+# content and evaluates the three OFFICIAL requirements fail-closed.
+
+from urllib.parse import urljoin as s45v79_urljoin
+
+
+def s45v79_extract_links(base_url, fetch_result):
+    """Return unique authoritative links explicitly present in a fetched document."""
+    out = []
+    raw_text = normalize_text(fetch_result.get("text"))
+    content_type = normalize_text(fetch_result.get("content_type")).lower()
+
+    # HTML hrefs are preferable because relative links can be resolved safely.
+    if "html" in content_type and BeautifulSoup is not None and raw_text:
+        try:
+            soup = BeautifulSoup(raw_text, "html.parser")
+            for tag in soup.find_all("a", href=True):
+                href = normalize_text(tag.get("href"))
+                if href:
+                    out.append(s45v79_urljoin(base_url, href))
+        except Exception:
+            pass
+
+    # Also inspect raw/extracted text for absolute official URLs.
+    extracted, _ = s45v78_extract_document_text(fetch_result)
+    for corpus in (raw_text, extracted):
+        for u in re.findall(r'https?://[^\s|<>"\'\]\[(){}]+', corpus or ""):
+            out.append(u.rstrip(".,;:"))
+
+    dedup = []
+    seen = set()
+    for u in out:
+        u = normalize_text(u)
+        key = s45v77_normalize_url(u)
+        if not u or not key or key in seen or not s45v78_is_authoritative_url(u):
+            continue
+        seen.add(key)
+        dedup.append(u)
+    return dedup
+
+
+def s45v79_seed_documents(ranked_docs):
+    """Select exact-topic official documents as the root of the reference graph."""
+    seeds = []
+    for doc in ranked_docs:
+        url = normalize_text(doc.get("source_url"))
+        hay = " ".join([
+            url,
+            normalize_text(doc.get("source_title")),
+            normalize_text(doc.get("evidence_excerpt")),
+        ])
+        if url and s45v78_is_authoritative_url(url) and (
+            bool(doc.get("exact_topic_verified")) or s45v7_exact_topic(hay)
+        ):
+            seeds.append(doc)
+    return seeds[:12]
+
+
+def s45v79_build_reference_graph(ranked_docs, max_depth=3, max_nodes=80):
+    """Breadth-first exact-topic -> official-reference graph with traceable parents."""
+    seeds = s45v79_seed_documents(ranked_docs)
+    queue = []
+    graph = {}
+    fetch_cache = {}
+
+    for doc in seeds:
+        url = normalize_text(doc.get("source_url"))
+        key = s45v77_normalize_url(url)
+        if key and key not in graph:
+            graph[key] = {
+                "url": url, "parent_url": None, "root_url": url, "depth": 0,
+                "reason": "Exact locked-topic official source.", "exact_topic_root": True,
+            }
+            queue.append(key)
+
+    while queue and len(graph) < max_nodes:
+        key = queue.pop(0)
+        node = graph[key]
+        if int(node.get("depth") or 0) >= max_depth:
+            continue
+
+        url = node["url"]
+        fetched = s45v78_fetch_raw(url)
+        fetch_cache[key] = fetched
+        if not fetched.get("ok"):
+            node["fetch_ok"] = False
+            node["fetch_status"] = fetched.get("status")
+            node["fetch_error"] = fetched.get("error")
+            continue
+
+        node["fetch_ok"] = True
+        node["fetch_status"] = fetched.get("status")
+        links = s45v79_extract_links(url, fetched)
+        node["outgoing_links"] = len(links)
+
+        for child_url in links:
+            if len(graph) >= max_nodes:
+                break
+            child_key = s45v77_normalize_url(child_url)
+            if not child_key or child_key in graph:
+                continue
+            graph[child_key] = {
+                "url": child_url,
+                "parent_url": url,
+                "root_url": node.get("root_url") or url,
+                "depth": int(node.get("depth") or 0) + 1,
+                "reason": "Explicit official hyperlink/reference followed from an exact-topic chain.",
+                "exact_topic_root": False,
+            }
+            queue.append(child_key)
+
+    return graph, fetch_cache
+
+
+def s45v79_chain_for_node(graph, node_key):
+    node = graph.get(node_key) or {}
+    chain = []
+    seen = set()
+    current = node
+    while current and len(chain) < 8:
+        url = normalize_text(current.get("url"))
+        if not url or url in seen:
+            break
+        seen.add(url)
+        chain.append(url)
+        parent = normalize_text(current.get("parent_url"))
+        if not parent:
+            break
+        current = graph.get(s45v77_normalize_url(parent)) or {"url": parent}
+    return list(reversed(chain))
+
+
+def s45v79_candidates_for_task(task, graph, fetch_cache):
+    candidates = []
+    inspected = []
+
+    for key, node in graph.items():
+        url = node.get("url")
+        fetched = fetch_cache.get(key)
+        if fetched is None:
+            fetched = s45v78_fetch_raw(url)
+            fetch_cache[key] = fetched
+
+        if not fetched.get("ok"):
+            inspected.append({
+                "url": url, "depth": node.get("depth"), "fetch_ok": False,
+                "status": fetched.get("status"), "error": fetched.get("error"),
+                "chain": s45v79_chain_for_node(graph, key),
+            })
+            continue
+
+        text, kind = s45v78_extract_document_text(fetched)
+        chunks = s45v78_chunk_text(text)
+        count = 0
+
+        for idx, chunk in enumerate(chunks):
+            req_score, strong_hits, supporting_hits = s45v78_requirement_score(chunk, task)
+            if req_score <= 0:
+                continue
+
+            exact_here = s45v7_exact_topic(" ".join([url, chunk]))
+            chain = s45v79_chain_for_node(graph, key)
+            # Applicability is established only by an explicit chain rooted in an exact-topic source.
+            applicable_by_chain = bool(chain and node.get("root_url") and len(chain) >= 1)
+            if not (exact_here or applicable_by_chain):
+                continue
+
+            depth = int(node.get("depth") or 0)
+            score = req_score + (120 if exact_here else 0) + max(0, 70 - depth * 12)
+            candidates.append({
+                "source_url": fetched.get("final_url") or url,
+                "source_title": None,
+                "document_type": kind,
+                "chunk_index": idx,
+                "excerpt": chunk[:6000],
+                "score": score,
+                "requirement_score": req_score,
+                "exact_topic": exact_here,
+                "applicable_by_reference": applicable_by_chain,
+                "reference_source_url": node.get("parent_url"),
+                "reference_chain": chain,
+                "reference_depth": depth,
+                "applicability_reason": (
+                    "Requirement passage occurs in the exact-topic official source."
+                    if exact_here else
+                    "Requirement passage occurs in an authoritative document reached by an explicit reference chain rooted at the exact locked topic."
+                ),
+                "strong_hits": strong_hits,
+                "supporting_hits": supporting_hits,
+            })
+            count += 1
+
+        inspected.append({
+            "url": url, "depth": node.get("depth"), "fetch_ok": True,
+            "status": fetched.get("status"), "content_type": fetched.get("content_type"),
+            "content_kind": kind, "text_chars": len(text), "chunks": len(chunks),
+            "candidate_count": count, "chain": s45v79_chain_for_node(graph, key),
+        })
+
+    candidates.sort(key=lambda x: x.get("score") or 0, reverse=True)
+    dedup, seen = [], set()
+    for c in candidates:
+        k = (s45v77_normalize_url(c.get("source_url")), normalize_text(c.get("excerpt"))[:1800].lower())
+        if k in seen:
+            continue
+        seen.add(k)
+        dedup.append(c)
+    return dedup[:50], inspected
+
+
+def s45v79_evaluate(task, candidates):
+    usable = [c for c in candidates if c.get("exact_topic") or c.get("applicable_by_reference")][:14]
+    if not usable:
+        return {"status": "WAITING_OFFICIAL", "reason": "No explicit authoritative passage was found through the exact-topic reference graph.", "used_candidates": []}
+
+    blob = "\n\n".join(
+        f"[OFFICIAL SOURCE {c.get('source_url')} | CHAIN {' -> '.join(c.get('reference_chain') or [])} | "
+        f"CHUNK {c.get('chunk_index')} | APPLICABILITY {c.get('applicability_reason')}]\n{c.get('excerpt')}"
+        for c in usable
+    )
+    evaluation = ai_evaluate(task, collect_snapshot_evidence(task, sources), blob, usable[0].get("source_url") or official_url)
+    return {"status": evaluation.get("status"), "evaluation": evaluation, "used_candidates": usable}
+
+
+def s45v79_run_task(task, worker_run_id, graph, fetch_cache):
+    inserted = (supabase.table("locked_evidence_worker_items").insert({
+        "user_id": user_id, "project_id": project_id, "opportunity_lock_id": lock_id,
+        "execution_run_id": execution_run_id, "worker_run_id": worker_run_id,
+        "execution_task_id": task["id"], "requirement_id": task.get("requirement_id"),
+        "opportunity_identity": identity, "requirement_key": task.get("requirement_key"),
+        "requirement_category": task.get("requirement_category"), "requirement_label": task.get("requirement_label"),
+        "route_type": task.get("route_type"), "destination_module": task.get("destination_module"),
+        "worker_action": "REFERENCE_CHAIN_EVIDENCE_RESOLUTION", "worker_status": "WAITING_OFFICIAL",
+        "topic_identity": identity, "resolution_method": "OFFICIAL_REFERENCE_CHAIN",
+        "official_document_status": "SEARCHING", "metadata": {"stage": 45, "version": "v7.9"},
+        "updated_at": now_iso(),
+    }).execute()).data or []
+    if not inserted:
+        raise RuntimeError("Could not create v7.9 worker item.")
+    item_id = str(inserted[0]["id"])
+
+    candidates, inspected = s45v79_candidates_for_task(task, graph, fetch_cache)
+    s45v78_persist_candidate_documents(task, worker_run_id, item_id, candidates)
+    wrap = s45v79_evaluate(task, candidates)
+
+    if wrap.get("status") == "RESOLVED":
+        ev = wrap.get("evaluation") or {}
+        used = wrap.get("used_candidates") or []
+        best = used[0] if used else {}
+        worker_result = {
+            "resolved_value": ev.get("resolved_value") or {},
+            "evidence_source": "OFFICIAL_REFERENCE_CHAIN",
+            "evidence_reference": ev.get("evidence_reference") or f"reference-chain chunk {best.get('chunk_index')}",
+            "evidence_url": ev.get("evidence_url") or best.get("source_url"),
+            "evidence_excerpt": ev.get("evidence_excerpt") or normalize_text(best.get("excerpt"))[:5000],
+            "confidence": ev.get("confidence") or "High",
+            "reason": ev.get("reason") or "Explicit authoritative evidence verified through an exact-topic reference chain.",
+        }
+        update_execution_task_completed(task, worker_result, "VERIFIED")
+        supabase.table("locked_evidence_worker_items").update({
+            "worker_status": "RESOLVED", "resolved_value": worker_result["resolved_value"],
+            "evidence_source": worker_result["evidence_source"], "evidence_reference": worker_result["evidence_reference"],
+            "evidence_url": worker_result["evidence_url"], "evidence_excerpt": worker_result["evidence_excerpt"],
+            "confidence": worker_result["confidence"], "official_verified": True, "reason": worker_result["reason"],
+            "next_action": "RETURN_TO_STAGE_44", "documents_checked": inspected,
+            "resolution_method": "OFFICIAL_REFERENCE_CHAIN", "retrieved_at": now_iso(),
+            "exact_topic_verified": any(c.get("exact_topic") for c in used),
+            "authoritative_source_verified": True, "explicit_evidence_verified": True,
+            "official_document_status": "VERIFIED",
+            "provenance_chain": [c.get("reference_chain") for c in used[:12]],
+            "official_document_payload": {"version": "v7.9", "inspected": inspected, "candidate_count": len(candidates), "top_candidates": candidates[:12], "evaluation": ev},
+            "resolved_at": now_iso(), "updated_at": now_iso(),
+        }).eq("id", item_id).eq("user_id", user_id).execute()
+        return "RESOLVED"
+
+    supabase.table("locked_evidence_worker_items").update({
+        "worker_status": "WAITING_OFFICIAL", "documents_checked": inspected,
+        "missing_evidence_reason": wrap.get("reason") or "No explicit authoritative evidence was established through the reference chain.",
+        "next_action": "Remain WAITING_OFFICIAL; authoritative reference traversal found no sufficient explicit passage.",
+        "resolution_method": "OFFICIAL_REFERENCE_CHAIN", "retrieved_at": now_iso(),
+        "authoritative_source_verified": bool(candidates),
+        "exact_topic_verified": any(c.get("exact_topic") for c in candidates),
+        "explicit_evidence_verified": False, "official_document_status": "WAITING_OFFICIAL",
+        "provenance_chain": [c.get("reference_chain") for c in candidates[:12]],
+        "official_document_payload": {"version": "v7.9", "inspected": inspected, "candidate_count": len(candidates), "top_candidates": candidates[:12], "evaluation": wrap},
+        "updated_at": now_iso(),
+    }).eq("id", item_id).eq("user_id", user_id).execute()
+    return "WAITING_OFFICIAL"
+
+
+st.divider()
+st.subheader("Stage 45 v7.9 — Reference Chain Evidence Resolver")
+st.info(
+    "v7.9 pornește de la documentul oficial al topicului blocat, urmărește recursiv referințele oficiale până la 3 niveluri, "
+    "extrage conținutul documentelor referite și caută pasajul explicit pentru fiecare cerință. Rămâne fail-closed."
+)
+
+v79_docs = s45v77_load_documents()
+v79_graph, v79_fetch_cache = {}, {}
+try:
+    v79_graph, v79_fetch_cache = s45v79_build_reference_graph(v79_docs, max_depth=3, max_nodes=80)
+except Exception as exc:
+    st.warning(f"v7.9 reference graph warning: {type(exc).__name__}: {str(exc)[:500]}")
+
+v79_tasks = [t for t in current_tasks if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION" and normalize_text(t.get("task_status")).upper() != "COMPLETED"]
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Unresolved OFFICIAL", len(v79_tasks))
+m2.metric("Reference graph nodes", len(v79_graph))
+m3.metric("Exact-topic roots", sum(1 for n in v79_graph.values() if n.get("depth") == 0))
+m4.metric("Max reference depth", max([int(n.get("depth") or 0) for n in v79_graph.values()] or [0]))
+
+with st.expander("v7.9 reference graph", expanded=False):
+    if v79_graph:
+        st.dataframe([{"Depth": n.get("depth"), "Root": n.get("root_url"), "Parent": n.get("parent_url"), "URL": n.get("url"), "Reason": n.get("reason")} for n in v79_graph.values()], use_container_width=True, hide_index=True)
+    else:
+        st.info("No authoritative reference graph is currently available.")
+
+if v79_tasks and st.button("🧬 Run Stage 45 v7.9 reference-chain resolution", type="primary", use_container_width=True, key="stage45_v79_run"):
+    run = (supabase.table("locked_evidence_worker_runs").insert({
+        "user_id": user_id, "project_id": project_id, "opportunity_lock_id": lock_id,
+        "execution_run_id": execution_run_id, "opportunity_identity": identity,
+        "total_tasks": len(v79_tasks), "worker_status": "RUNNING", "deep_resolution_version": "v7.9",
+        "started_at": now_iso(), "summary": {"stage": 45, "version": "v7.9", "reference_graph_nodes": len(v79_graph)},
+        "updated_at": now_iso(),
+    }).execute()).data or []
+    if not run:
+        st.error("Nu am putut crea Stage 45 v7.9 run.")
+    else:
+        run_id = str(run[0]["id"])
+        resolved = waiting = failed = 0
+        bar = st.progress(0)
+        for idx, task in enumerate(v79_tasks, 1):
+            try:
+                state = s45v79_run_task(task, run_id, v79_graph, v79_fetch_cache)
+                resolved += int(state == "RESOLVED")
+                waiting += int(state != "RESOLVED")
+            except Exception as exc:
+                failed += 1
+                try:
+                    diagnostic = s45v71_log_error(task=task, worker_run_id=run_id, worker_item_id=None, error_stage="V79_TASK_EXECUTION", exc=exc, error_url=None, request_payload={"identity": identity, "requirement": task.get("requirement_label")}, diagnostic_payload={"stage": 45, "version": "v7.9", "function": "s45v79_run_task"})
+                    s45v71_update_run_diagnostics(run_id, task, diagnostic)
+                except Exception:
+                    pass
+                st.error(f"{task.get('requirement_label')} — {type(exc).__name__}: {str(exc)[:500]}")
+            bar.progress(idx / len(v79_tasks))
+
+        final = "FAILED" if failed and not resolved and not waiting else "COMPLETED" if resolved == len(v79_tasks) else "WAITING"
+        run_items = rows("locked_evidence_worker_items", {"user_id": user_id, "project_id": project_id, "opportunity_lock_id": lock_id, "worker_run_id": run_id}, "created_at", 100)
+        total_candidates = sum(int((i.get("official_document_payload") or {}).get("candidate_count") or 0) for i in run_items)
+        total_inspected = sum(len((i.get("official_document_payload") or {}).get("inspected") or []) for i in run_items)
+        supabase.table("locked_evidence_worker_runs").update({
+            "resolved_tasks": resolved, "waiting_tasks": waiting, "failed_tasks": failed,
+            "worker_status": final, "diagnostic_status": "FAILED" if final == "FAILED" else "PARTIAL_FAILURE" if failed else "CLEAN",
+            "official_documents_checked": total_inspected, "official_sources_found": len(v79_graph),
+            "official_tasks_resolved": resolved, "official_tasks_waiting": waiting,
+            "deep_resolution_version": "v7.9",
+            "provenance_summary": {"reference_graph_nodes": len(v79_graph), "documents_inspected": total_inspected, "evidence_candidates": total_candidates, "resolved": resolved, "waiting": waiting, "failed": failed},
+            "completed_at": now_iso() if final in {"COMPLETED", "FAILED"} else None, "updated_at": now_iso(),
+        }).eq("id", run_id).eq("user_id", user_id).execute()
+        st.success(f"Stage 45 v7.9: {final} — Resolved {resolved}, Waiting {waiting}, Failed {failed}, Candidates {total_candidates}.")
+        st.rerun()
+
+v79_runs = rows("locked_evidence_worker_runs", {"user_id": user_id, "project_id": project_id, "opportunity_lock_id": lock_id}, "created_at", 50)
+v79_runs = [r for r in v79_runs if normalize_text(r.get("deep_resolution_version")).lower() == "v7.9"]
+if v79_runs:
+    latest = v79_runs[0]
+    st.subheader("Latest Stage 45 v7.9 Result")
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Status", latest.get("worker_status") or "—")
+    q2.metric("Official resolved", latest.get("official_tasks_resolved") or 0)
+    q3.metric("Official waiting", latest.get("official_tasks_waiting") or 0)
+    q4.metric("Reference graph nodes", (latest.get("provenance_summary") or {}).get("reference_graph_nodes", 0))
+    latest_items = rows("locked_evidence_worker_items", {"user_id": user_id, "project_id": project_id, "opportunity_lock_id": lock_id, "worker_run_id": str(latest.get("id"))}, "created_at", 100)
+    if latest_items:
+        st.dataframe([{
+            "Requirement": i.get("requirement_label"), "Status": i.get("worker_status"),
+            "Exact topic": i.get("exact_topic_verified"), "Authoritative": i.get("authoritative_source_verified"),
+            "Explicit evidence": i.get("explicit_evidence_verified"), "Evidence URL": i.get("evidence_url"),
+            "Evidence excerpt": normalize_text(i.get("evidence_excerpt"))[:1200],
+            "Reason": i.get("reason") or i.get("missing_evidence_reason"),
+        } for i in latest_items], use_container_width=True, hide_index=True)
+
+st.caption("v7.9 invariant: a reference chain establishes applicability, not the substantive rule itself. COMPLETED still requires an explicit authoritative passage that answers the locked requirement.")
+# =====================================================================
+# END STAGE 45 v7.9
+# =====================================================================
