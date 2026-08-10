@@ -197,7 +197,10 @@ st.write(f"**Project:** {project.get('name') or '—'}")
 # ---------------------------------------------------------------------
 # Latest Etapa 33 Guard run for selected project
 # ---------------------------------------------------------------------
-guard_runs = rows(
+# Etapa 33 validează oportunitățile independent de proiect.
+# Preferăm un Guard specific proiectului, dacă există; altfel folosim
+# ultimul Guard global finalizat al utilizatorului.
+project_guard_runs = rows(
     "opportunity_engine_guard_runs",
     {"user_id": user_id, "project_id": project_id},
     "created_at",
@@ -205,27 +208,61 @@ guard_runs = rows(
 )
 
 latest_guard_run = next(
-    (r for r in guard_runs if str(r.get("run_status") or "") == "Completed"),
+    (r for r in project_guard_runs if str(r.get("run_status") or "") == "Completed"),
     None,
 )
+guard_source = "Project-specific Etapa 33"
 
 if not latest_guard_run:
-    st.warning("Nu există un Guard Etapa 33 finalizat pentru acest proiect.")
+    all_guard_runs = rows(
+        "opportunity_engine_guard_runs",
+        {"user_id": user_id},
+        "created_at",
+        500,
+    )
+    latest_guard_run = next(
+        (
+            r for r in all_guard_runs
+            if str(r.get("run_status") or "") == "Completed"
+            and not r.get("project_id")
+        ),
+        None,
+    )
+    guard_source = "Global Etapa 33"
+
+if not latest_guard_run:
+    st.warning(
+        "Nu există niciun Guard Etapa 33 finalizat pentru proiect și niciun Guard global finalizat."
+    )
     st.stop()
 
 guard_run_id = str(latest_guard_run["id"])
 
+st.success(
+    f"Guard source: {guard_source} — run {guard_run_id[:8]} "
+    f"— VALID raportate: {int(latest_guard_run.get('valid_opportunities') or 0)}"
+)
+
+# Citim toate check-urile utilizatorului și le restrângem apoi la run-ul
+# Etapei 33 selectat. Astfel funcționează atât Guard-ul global (project_id NULL),
+# cât și unul specific proiectului.
 validity_checks = rows(
     "opportunity_engine_validity_checks",
-    {"user_id": user_id, "project_id": project_id},
+    {"user_id": user_id},
     "created_at",
-    2000,
+    5000,
 )
 
 authorized_checks = []
 for check in validity_checks:
     metadata = as_dict(check.get("metadata"))
-    if str(metadata.get("guard_run_id") or "") != guard_run_id:
+    check_guard_run_id = str(
+        metadata.get("guard_run_id")
+        or metadata.get("opportunity_engine_guard_run_id")
+        or metadata.get("run_id")
+        or ""
+    )
+    if check_guard_run_id != guard_run_id:
         continue
     if str(check.get("validity_status") or "") != "VALID":
         continue
