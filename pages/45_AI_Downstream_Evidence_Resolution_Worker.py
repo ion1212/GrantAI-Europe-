@@ -934,3 +934,338 @@ st.caption(
 )
 
 
+# =====================================================================
+# STAGE 45 v6 — DATABASE-BACKED OFFICIAL DEEP RESOLUTION
+# =====================================================================
+
+def s45v6_save_document(task, worker_run_id, worker_item_id, url, excerpt="", status="FETCHED", payload=None):
+    exact = bool(identity and (
+        identity.lower() in (url or "").lower()
+        or identity.lower() in (excerpt or "").lower()
+    ))
+
+    row = {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+        "execution_run_id": execution_run_id,
+        "worker_run_id": worker_run_id,
+        "worker_item_id": worker_item_id,
+        "execution_task_id": task.get("id"),
+        "requirement_id": task.get("requirement_id"),
+        "opportunity_identity": identity,
+        "requirement_key": task.get("requirement_key"),
+        "requirement_category": task.get("requirement_category"),
+        "requirement_label": task.get("requirement_label"),
+        "source_url": url,
+        "source_title": "Official European Commission source",
+        "document_type": "OFFICIAL_EC_DOCUMENT",
+        "source_authority": "EUROPEAN_COMMISSION",
+        "topic_identity": identity,
+        "exact_topic_verified": exact,
+        "applicability_verified": exact,
+        "applicability_reason": (
+            "Exact locked topic identity found in source URL/evidence."
+            if exact else
+            "Official source found, but exact applicability to locked topic is not explicit."
+        ),
+        "evidence_found": bool(excerpt),
+        "evidence_excerpt": excerpt[:10000] if excerpt else None,
+        "evidence_reference": task.get("requirement_label"),
+        "evidence_payload": payload or {},
+        "provenance_chain": [official_url, url] if url != official_url else [url],
+        "retrieval_status": "VERIFIED" if (exact and excerpt) else status,
+        "retrieved_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    existing = (
+        supabase.table("locked_evidence_official_documents")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("worker_item_id", worker_item_id)
+        .eq("source_url", url)
+        .limit(1)
+        .execute()
+    ).data or []
+
+    if existing:
+        supabase.table("locked_evidence_official_documents").update(row).eq(
+            "id", existing[0]["id"]
+        ).eq("user_id", user_id).execute()
+    else:
+        supabase.table("locked_evidence_official_documents").insert(row).execute()
+
+    return exact
+
+
+def s45v6_run_task(task, worker_run_id):
+    item_insert = (
+        supabase.table("locked_evidence_worker_items")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "worker_run_id": worker_run_id,
+            "execution_task_id": task["id"],
+            "requirement_id": task["requirement_id"],
+            "opportunity_identity": identity,
+            "requirement_key": task.get("requirement_key"),
+            "requirement_category": task.get("requirement_category"),
+            "requirement_label": task.get("requirement_label"),
+            "route_type": task.get("route_type"),
+            "destination_module": task.get("destination_module"),
+            "worker_action": "OFFICIAL_DOCUMENTATION_DEEP_RESOLUTION",
+            "worker_status": "WAITING_OFFICIAL",
+            "topic_identity": identity,
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+            "official_document_status": "SEARCHING",
+            "metadata": {"stage": 45, "version": "v6"},
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not item_insert:
+        raise RuntimeError("Could not create v6 worker item.")
+
+    worker_item_id = str(item_insert[0]["id"])
+
+    result = s45v4_resolve_official_source(
+        official_url,
+        task.get("requirement_label") or task.get("requirement_key") or "",
+    )
+
+    evidence = result.get("evidence", []) or []
+    trace = result.get("trace", []) or []
+    docs = result.get("discovered_official_urls", []) or []
+
+    verified = []
+    for ev in evidence:
+        url = normalize_text(ev.get("url"))
+        excerpt = normalize_text(ev.get("excerpt"))
+        if not url or not excerpt:
+            continue
+        exact = s45v6_save_document(
+            task, worker_run_id, worker_item_id, url, excerpt,
+            payload={"resolver_status": result.get("status")}
+        )
+        if exact:
+            verified.append(ev)
+
+    # Save discovered official URLs even when no evidence was extracted.
+    for url in docs:
+        url = normalize_text(url)
+        if url:
+            s45v6_save_document(
+                task, worker_run_id, worker_item_id, url,
+                status="FETCHED",
+                payload={"discovered_only": True}
+            )
+
+    if verified:
+        combined = "\n\n".join(normalize_text(x.get("excerpt")) for x in verified)
+        evaluation = ai_evaluate(
+            task,
+            collect_snapshot_evidence(task, sources),
+            combined,
+            normalize_text(verified[0].get("url")),
+        )
+
+        if evaluation.get("status") == "RESOLVED":
+            worker_result = {
+                "resolved_value": evaluation.get("resolved_value") or {},
+                "evidence_source": "OFFICIAL_DOCUMENTATION",
+                "evidence_reference": evaluation.get("evidence_reference") or task.get("requirement_label"),
+                "evidence_url": evaluation.get("evidence_url") or verified[0].get("url"),
+                "evidence_excerpt": evaluation.get("evidence_excerpt") or combined[:5000],
+                "confidence": evaluation.get("confidence") or "High",
+                "reason": evaluation.get("reason") or "Explicit official evidence verified.",
+            }
+            update_execution_task_completed(task, worker_result, "VERIFIED")
+
+            supabase.table("locked_evidence_worker_items").update({
+                "worker_status": "RESOLVED",
+                "resolved_value": worker_result["resolved_value"],
+                "evidence_source": worker_result["evidence_source"],
+                "evidence_reference": worker_result["evidence_reference"],
+                "evidence_url": worker_result["evidence_url"],
+                "evidence_excerpt": worker_result["evidence_excerpt"],
+                "confidence": worker_result["confidence"],
+                "official_verified": True,
+                "reason": worker_result["reason"],
+                "next_action": "RETURN_TO_STAGE_44",
+                "source_title": "Official European Commission source",
+                "document_type": "OFFICIAL_EC_DOCUMENT",
+                "source_authority": "EUROPEAN_COMMISSION",
+                "topic_identity": identity,
+                "provenance_chain": [official_url, worker_result["evidence_url"]],
+                "documents_checked": docs,
+                "searches_attempted": [official_url],
+                "transport_attempts": trace,
+                "resolution_method": "OFFICIAL_DOCUMENTATION",
+                "retrieved_at": now_iso(),
+                "exact_topic_verified": True,
+                "authoritative_source_verified": True,
+                "explicit_evidence_verified": True,
+                "official_document_status": "VERIFIED",
+                "official_document_payload": {"resolver": result, "evaluation": evaluation},
+                "resolved_at": now_iso(),
+                "updated_at": now_iso(),
+            }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+            return "RESOLVED"
+
+    supabase.table("locked_evidence_worker_items").update({
+        "worker_status": "WAITING_OFFICIAL",
+        "documents_checked": docs,
+        "searches_attempted": [official_url],
+        "transport_attempts": trace,
+        "missing_evidence_reason": "No explicit authoritative evidence applicable to the exact locked topic was established.",
+        "next_action": "Continue official document discovery; do not infer the missing rule.",
+        "resolution_method": "OFFICIAL_DOCUMENTATION",
+        "retrieved_at": now_iso(),
+        "authoritative_source_verified": bool(evidence),
+        "explicit_evidence_verified": False,
+        "official_document_status": "WAITING_OFFICIAL",
+        "official_document_payload": {
+            "resolver_status": result.get("status"),
+            "discovered_official_urls": docs,
+            "evidence_count": len(evidence),
+        },
+        "updated_at": now_iso(),
+    }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+    return "WAITING_OFFICIAL"
+
+
+st.divider()
+st.subheader("Stage 45 v6 — Official Documentation Deep Resolver")
+st.info(
+    "v6 folosește schema SQL nouă și salvează documentele/provenance. "
+    "Procesează numai OFFICIAL_VERIFICATION nerezolvate și rămâne fail-closed."
+)
+
+v6_tasks = [
+    t for t in current_tasks
+    if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION"
+    and normalize_text(t.get("task_status")).upper() != "COMPLETED"
+]
+
+st.metric("Unresolved OFFICIAL tasks", len(v6_tasks))
+
+if v6_tasks and st.button(
+    "🔬 Run official deep resolution",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v6_run",
+):
+    run = (
+        supabase.table("locked_evidence_worker_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "total_tasks": len(v6_tasks),
+            "worker_status": "RUNNING",
+            "deep_resolution_version": "v6",
+            "started_at": now_iso(),
+            "summary": {"stage": 45, "version": "v6"},
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not run:
+        st.error("Nu am putut crea Stage 45 v6 run.")
+    else:
+        run_id = str(run[0]["id"])
+        resolved = waiting = failed = 0
+        bar = st.progress(0)
+
+        for idx, task in enumerate(v6_tasks, 1):
+            try:
+                result_status = s45v6_run_task(task, run_id)
+                if result_status == "RESOLVED":
+                    resolved += 1
+                else:
+                    waiting += 1
+            except Exception as exc:
+                failed += 1
+                st.warning(f"{task.get('requirement_label')}: {str(exc)[:500]}")
+            bar.progress(idx / len(v6_tasks))
+
+        final = (
+            "FAILED" if failed
+            else "COMPLETED" if resolved == len(v6_tasks)
+            else "WAITING"
+        )
+
+        docs_saved = rows(
+            "locked_evidence_official_documents",
+            {
+                "user_id": user_id,
+                "project_id": project_id,
+                "opportunity_lock_id": lock_id,
+                "worker_run_id": run_id,
+            },
+            "created_at",
+            5000,
+        )
+
+        supabase.table("locked_evidence_worker_runs").update({
+            "resolved_tasks": resolved,
+            "waiting_tasks": waiting,
+            "failed_tasks": failed,
+            "worker_status": final,
+            "official_documents_checked": len(docs_saved),
+            "official_sources_found": len(docs_saved),
+            "official_tasks_resolved": resolved,
+            "official_tasks_waiting": waiting,
+            "deep_resolution_version": "v6",
+            "provenance_summary": {
+                "documents_saved": len(docs_saved),
+                "resolved": resolved,
+                "waiting": waiting,
+                "failed": failed,
+            },
+            "completed_at": now_iso() if final in {"COMPLETED", "FAILED"} else None,
+            "updated_at": now_iso(),
+        }).eq("id", run_id).eq("user_id", user_id).execute()
+
+        st.success(
+            f"Stage 45 v6: {final} — Resolved {resolved}, Waiting {waiting}, "
+            f"Failed {failed}, Documents {len(docs_saved)}."
+        )
+        st.rerun()
+
+v6_runs = rows(
+    "locked_evidence_worker_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    50,
+)
+v6_runs = [r for r in v6_runs if normalize_text(r.get("deep_resolution_version")).lower() == "v6"]
+
+if v6_runs:
+    latest_v6 = v6_runs[0]
+    st.subheader("Latest Stage 45 v6 Result")
+    x1, x2, x3, x4 = st.columns(4)
+    x1.metric("Status", latest_v6.get("worker_status") or "—")
+    x2.metric("Official resolved", latest_v6.get("official_tasks_resolved") or 0)
+    x3.metric("Official waiting", latest_v6.get("official_tasks_waiting") or 0)
+    x4.metric("Documents", latest_v6.get("official_documents_checked") or 0)
+
+st.caption(
+    "v6 invariant: finding a URL/document is not completion. "
+    "COMPLETED requires explicit authoritative evidence traceable to the exact locked opportunity."
+)
+# =====================================================================
+# END STAGE 45 v6
+# =====================================================================
