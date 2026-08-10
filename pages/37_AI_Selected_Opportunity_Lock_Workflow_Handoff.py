@@ -522,16 +522,31 @@ if st.button(
             1000,
         )
 
-        existing_ready = {
-            str(h.get("destination_module") or "")
+        # Canonical destinations required by downstream workflow.
+        # Do not rely only on the Streamlit multiselect/session state: Etapa 38
+        # requires at minimum the Evidence Requirement Resolver handoff.
+        required_destinations = {
+            "AI Evidence Requirement Resolver",
+        }
+        effective_destinations = list(
+            dict.fromkeys(list(destination_options) + list(required_destinations))
+        )
+
+        # A destination may already exist for this lock but be CONSUMED,
+        # SUPERSEDED, FAILED, etc. In that case we reactivate that row instead
+        # of assuming the destination is available merely because a row exists.
+        existing_by_destination = {
+            str(h.get("destination_module") or ""): h
             for h in existing_handoffs
-            if str(h.get("handoff_status") or "") == "READY"
+            if h.get("destination_module")
         }
 
         created = 0
+        reactivated = 0
 
-        for destination in destination_options:
-            if destination in existing_ready:
+        for destination in effective_destinations:
+            existing = existing_by_destination.get(destination)
+            if existing and str(existing.get("handoff_status") or "") == "READY":
                 continue
 
             payload = {
@@ -576,7 +591,7 @@ if st.button(
                 "created_at": now_iso(),
             }
 
-            supabase.table("selected_opportunity_handoffs").insert({
+            handoff_values = {
                 "user_id": user_id,
                 "project_id": project_id,
                 "opportunity_lock_id": lock_id,
@@ -585,12 +600,54 @@ if st.button(
                 "handoff_status": "READY",
                 "payload": payload,
                 "updated_at": now_iso(),
-            }).execute()
-            created += 1
+            }
+
+            if existing:
+                # Re-arm the handoff for the same canonical lock. Clear the
+                # consumption timestamp so Etapa 38 can consume it once.
+                update_values = {
+                    "handoff_status": "READY",
+                    "payload": payload,
+                    "consumed_at": None,
+                    "updated_at": now_iso(),
+                }
+                supabase.table("selected_opportunity_handoffs").update(
+                    update_values
+                ).eq("id", existing["id"]).eq("user_id", user_id).execute()
+                reactivated += 1
+            else:
+                supabase.table("selected_opportunity_handoffs").insert(
+                    handoff_values
+                ).execute()
+                created += 1
+
+        # Hard postcondition: never report success unless the mandatory
+        # Evidence Requirement Resolver handoff is READY for this exact lock.
+        post_handoffs = rows(
+            "selected_opportunity_handoffs",
+            {
+                "user_id": user_id,
+                "project_id": project_id,
+                "opportunity_lock_id": lock_id,
+            },
+            "created_at",
+            1000,
+        )
+        evidence_ready = any(
+            str(h.get("destination_module") or "") == "AI Evidence Requirement Resolver"
+            and str(h.get("handoff_status") or "") == "READY"
+            for h in post_handoffs
+        )
+        if not evidence_ready:
+            raise RuntimeError(
+                "Handoff-ul obligatoriu către AI Evidence Requirement Resolver "
+                "nu este READY pentru lock-ul activ."
+            )
 
         st.success(
             f"Oportunitatea {selected_identity} este LOCKED și workflow_allowed=true. "
-            f"Handoff-uri noi create: {created}."
+            f"Handoff-uri noi create: {created}; reactivate: {reactivated}. "
+            "Evidence Requirement Resolver: READY."
         )
         st.rerun()
 
