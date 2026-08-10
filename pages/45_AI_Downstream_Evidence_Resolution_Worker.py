@@ -12,47 +12,71 @@ from openai import OpenAI
 from supabase import create_client
 
 
-# ===== Stage 45 v2: robust official-source URL handling =====
-def stage45_extract_official_urls(raw_value):
-    """Return unique HTTP(S) URLs from DB fields, including values joined with |."""
-    if raw_value is None:
+# ===== Stage 45 v3 official-source transport =====
+def s45v3_urls(raw):
+    if not raw:
         return []
-    if isinstance(raw_value, (list, tuple, set)):
-        parts = [str(x) for x in raw_value if x]
-    else:
-        parts = re.split(r"\s*\|\s*|\s*\n\s*", str(raw_value))
-    urls = []
-    for part in parts:
-        for url in re.findall(r'https?://[^\s|<>"\']+', part):
-            url = url.rstrip(".,;)")
-            if url not in urls:
-                urls.append(url)
-    return urls
+    vals = raw if isinstance(raw, (list, tuple, set)) else re.split(r"\s*\|\s*|\s*\n\s*", str(raw))
+    out = []
+    for val in vals:
+        for u in re.findall(r'https?://[^\s|<>"\']+', str(val)):
+            u = u.rstrip(".,;)")
+            if u not in out:
+                out.append(u)
+    return out
 
-def stage45_fetch_first_readable(urls, timeout=20):
-    """Try official URLs independently; never treat a concatenated field as one URL."""
+def s45v3_fetch(raw, timeout=20):
     attempts = []
-    for url in urls:
+    for url in s45v3_urls(raw):
         try:
-            response = requests.get(
+            r = requests.get(
                 url,
                 timeout=timeout,
-                headers={"User-Agent": "GreenRise-Stage45/2.0", "Accept": "application/json,text/html,*/*"},
+                headers={
+                    "User-Agent": "GreenRise/Stage45-v3",
+                    "Accept": "application/json,text/html,application/xhtml+xml,*/*",
+                },
             )
-            attempts.append({"url": url, "status_code": response.status_code})
-            if response.ok and response.text and response.text.strip():
+            attempts.append({
+                "url": url,
+                "http_status": r.status_code,
+                "content_type": r.headers.get("content-type", ""),
+                "bytes": len(r.content or b""),
+            })
+            if r.ok and (r.text or "").strip():
                 return {
-                    "ok": True,
-                    "url": url,
-                    "status_code": response.status_code,
-                    "text": response.text,
-                    "content_type": response.headers.get("content-type", ""),
-                    "attempts": attempts,
+                    "ok": True, "url": url, "response": r,
+                    "text": r.text, "attempts": attempts
                 }
-        except Exception as exc:
-            attempts.append({"url": url, "error": str(exc)})
-    return {"ok": False, "attempts": attempts}
-# ===== End Stage 45 v2 patch =====
+        except Exception as e:
+            attempts.append({"url": url, "error": repr(e)})
+    return {"ok": False, "url": None, "response": None, "text": "", "attempts": attempts}
+# ===== end v3 =====
+
+class _S45V3CompatResponse:
+    def __init__(self, result):
+        self._result = result
+        r = result.get("response")
+        self.status_code = getattr(r, "status_code", 599)
+        self.text = result.get("text", "")
+        self.content = getattr(r, "content", b"")
+        self.headers = getattr(r, "headers", {})
+        self.ok = bool(result.get("ok"))
+    def json(self):
+        r = self._result.get("response")
+        if r is None:
+            raise ValueError("No readable official response")
+        return r.json()
+    def raise_for_status(self):
+        r = self._result.get("response")
+        if r is None:
+            raise requests.HTTPError("No readable official response")
+        return r.raise_for_status()
+
+def s45v3_get(raw, *args, **kwargs):
+    timeout = kwargs.get("timeout", 20)
+    return _S45V3CompatResponse(s45v3_fetch(raw, timeout=timeout))
+
 
 
 st.set_page_config(
@@ -62,12 +86,6 @@ st.set_page_config(
 )
 
 st.title("🛠️ Etapa 45 — AI Downstream Evidence Resolution Worker")
-
-st.info(
-    "Etapa 45 v2 separă sursele oficiale concatenate și încearcă fiecare URL individual. "
-    "Un task devine COMPLETED numai pe baza unei dovezi explicite; lipsa dovezii rămâne WAITING."
-)
-
 st.caption(
     "Execută efectiv task-urile WAITING din Etapa 43: verificare oficială, "
     "dovadă de la utilizator și evidence resolver. "
@@ -552,6 +570,9 @@ completed_tasks = [
 ]
 
 st.subheader("Task workspace")
+
+st.info("Stage 45 v3: official-source transport activ. URL-urile concatenate sunt încercate separat; verdictul rămâne WAITING fără dovadă explicită.")
+
 
 if completed_tasks:
     st.success(f"{len(completed_tasks)} task-uri sunt deja COMPLETED.")
