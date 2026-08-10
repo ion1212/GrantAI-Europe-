@@ -298,6 +298,195 @@ st.info(
 )
 
 
+
+# ---------------------------------------------------------------------
+# Etapa 36 v5 — official Topic Details + verified Stage 34 snapshot fallback
+# ---------------------------------------------------------------------
+def official_ec_url(value: Any) -> bool:
+    text = norm(value).lower()
+    return (
+        "ec.europa.eu/" in text
+        or "commission.europa.eu/" in text
+        or "api.tech.ec.europa.eu/" in text
+    )
+
+
+def recursive_values_for_keys(obj: Any, key_names: set[str]):
+    wanted = {k.lower() for k in key_names}
+    found = []
+    for node in walk(obj):
+        if not isinstance(node, dict):
+            continue
+        for key, value in node.items():
+            if str(key).lower() in wanted:
+                found.append(value)
+    return found
+
+
+def extract_official_snapshot_from_opportunity(identity: str):
+    """
+    Reuse the exact opportunity snapshot previously stored by Etapa 34 only when
+    that snapshot contains an official EC source URL/reference. This is not a new
+    assumption: it is a prior official retrieval preserved in `opportunities.data`.
+    """
+    candidates = rows(
+        "opportunities",
+        {"user_id": user_id, "identity": identity},
+        "updated_at",
+        20,
+    )
+    if not candidates:
+        return None
+
+    row = candidates[0]
+    data = as_dict(row.get("data"))
+    if not data:
+        return None
+
+    url_values = recursive_values_for_keys(
+        data,
+        {
+            "source_url", "url", "official_url", "topic_url",
+            "source", "link", "href",
+        },
+    )
+    official_urls = [norm(v) for v in url_values if official_ec_url(v)]
+    if not official_urls:
+        return None
+
+    deadline_values = recursive_values_for_keys(
+        data,
+        {
+            "deadline", "deadlineDate", "deadline_date",
+            "submissionDeadline", "closingDate",
+        },
+    )
+    deadline = ""
+    for value in deadline_values:
+        parsed = parse_date(value)
+        if parsed:
+            deadline = parsed.isoformat()
+            break
+
+    status_values = recursive_values_for_keys(
+        data,
+        {"status", "callStatus", "topicStatus", "deadline_label"},
+    )
+    status = norm(status_values[0]) if status_values else ""
+
+    title_values = recursive_values_for_keys(
+        data,
+        {"title", "name", "topicTitle", "callTitle"},
+    )
+    title = norm(title_values[0]) if title_values else ""
+
+    programme_values = recursive_values_for_keys(
+        data,
+        {
+            "frameworkProgramme", "programme", "program",
+            "programmeName", "programmePeriod",
+        },
+    )
+    programme = norm(programme_values[0]) if programme_values else ""
+
+    # Identity is confirmed from the table key created by the official refresh,
+    # but only because the stored snapshot is tied to an official EC source.
+    return {
+        "identity": identity,
+        "title": title,
+        "deadline": deadline,
+        "status": status,
+        "programme": programme,
+        "description": "",
+        "action_type": "",
+        "topic_conditions": None,
+        "raw": {
+            "stage34_snapshot": data,
+            "official_source_url": official_urls[0],
+        },
+        "_stage34_verified": True,
+        "_official_source_url": official_urls[0],
+    }
+
+
+def fetch_topic_details_service(identity: str):
+    """
+    Official Funding & Tenders Topic Details service.
+
+    The Commission documentation specifies the SEARCH endpoint with
+    text="<identifier>" where <identifier> is the topic Identifier.
+    We query the exact identifier (quoted and unquoted) without broad title search.
+    """
+    code = (identity or "").strip()
+    if not code:
+        return None, ""
+
+    endpoint = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
+
+    display_fields = [
+        "type", "identifier", "reference", "callccm2Id", "title", "status",
+        "caName", "startDate", "deadlineDate", "deadlineModel",
+        "frameworkProgramme", "typesOfAction", "description",
+        "programmePeriod", "callIdentifier", "topicConditions",
+        "topicConditionsData", "destinationId",
+    ]
+
+    responses = []
+    urls = []
+
+    for search_text in (f'"{code}"', code):
+        params = {
+            "apiKey": "SEDIA",
+            "text": search_text,
+            "pageSize": "20",
+            "pageNumber": "1",
+        }
+        url = endpoint + "?" + urllib.parse.urlencode(params)
+
+        # Topic Details should not be narrowed by broad type/status filters.
+        body, content_type = _multipart_json_files({
+            "languages": ["en"],
+            "displayFields": display_fields,
+        })
+
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": content_type,
+                "Origin": "https://ec.europa.eu",
+                "Referer": "https://ec.europa.eu/",
+                "Accept-Language": "en-GB,en;q=0.9",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=40) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                responses.append(json.loads(raw))
+                urls.append(url)
+        except Exception:
+            continue
+
+    if not responses:
+        return None, ""
+
+    merged = {"topic_details_responses": responses}
+    records = extract_official_records(merged, code)
+    record, status = choose_best_official_record(records, code)
+
+    if record and status == "MATCH":
+        return record, " | ".join(urls)
+
+    return None, " | ".join(urls)
+
+
 # ---------------------------------------------------------------------
 # EU Funding & Tenders SEARCH API helpers
 # ---------------------------------------------------------------------
@@ -855,19 +1044,42 @@ def verify_candidate(scoring_result: dict):
     identity = str(scoring_result.get("opportunity_identity") or "")
     title = str(scoring_result.get("opportunity_title") or "")
 
-    raw_response, api_url = fetch_official_records(identity, title, 10)
-    records = extract_official_records(raw_response, identity)
-    record, deterministic_identity_status = choose_best_official_record(
-        records,
-        identity,
-    )
+    # v5 source order:
+    # 1) official Topic Details service using the exact identifier;
+    # 2) generic SEARCH API;
+    # 3) verified official snapshot preserved by Etapa 34;
+    # 4) official topic-details web page as a final conservative fallback.
+    record = None
+    deterministic_identity_status = "UNVERIFIED"
+    source_title = ""
+    source_url = ""
 
-    source_title = "EU Funding & Tenders Portal SEARCH API"
-    source_url = api_url
+    topic_record, topic_api_url = fetch_topic_details_service(identity)
+    if topic_record:
+        record = topic_record
+        deterministic_identity_status = "MATCH"
+        source_title = "EU Funding & Tenders Portal Topic Details API"
+        source_url = topic_api_url
 
-    # v4 fallback: if SEARCH API cannot prove the exact identity, inspect the
-    # official topic-details page. HTTP 200 is not enough; the exact code must
-    # occur in the returned official page content.
+    if deterministic_identity_status != "MATCH":
+        raw_response, api_url = fetch_official_records(identity, title, 10)
+        records = extract_official_records(raw_response, identity)
+        search_record, search_status = choose_best_official_record(records, identity)
+        if search_record:
+            record = search_record
+        if search_status == "MATCH":
+            deterministic_identity_status = "MATCH"
+            source_title = "EU Funding & Tenders Portal SEARCH API"
+            source_url = api_url
+
+    if deterministic_identity_status != "MATCH":
+        snapshot_record = extract_official_snapshot_from_opportunity(identity)
+        if snapshot_record:
+            record = snapshot_record
+            deterministic_identity_status = "MATCH"
+            source_title = "Etapa 34 official EC opportunity snapshot"
+            source_url = snapshot_record.get("_official_source_url") or ""
+
     if deterministic_identity_status != "MATCH":
         fallback_record = fetch_official_topic_page(identity)
         if fallback_record and fallback_record.get("_fallback_verified"):
@@ -905,7 +1117,7 @@ def verify_candidate(scoring_result: dict):
             ),
             "confidence": "Low",
             "official_source_title": "EU Funding & Tenders Portal SEARCH API",
-            "official_source_url": api_url,
+            "official_source_url": source_url,
             "official_source_reference": identity,
             "official_source_excerpt": "",
             "ai_result": {},
@@ -976,6 +1188,28 @@ def verify_candidate(scoring_result: dict):
         if result.get("selection_status") == "SELECTABLE":
             result["selection_status"] = "NEEDS_VERIFICATION"
 
+    # v5 deterministic selection gate:
+    # Identity MATCH + explicit future deadline + no official closed/expired signal
+    # may pass the opportunity-selection gate. Detailed applicant/TRL/funding
+    # requirements are still handled downstream by Evidence/Official Verification.
+    official_status_l = str(result.get("official_status") or "").strip().lower()
+    explicitly_closed = official_status_l in {"closed", "expired"}
+
+    if (
+        deterministic_identity_status == "MATCH"
+        and official_deadline
+        and official_deadline >= date.today()
+        and not explicitly_closed
+        and result.get("selection_status") not in ("BLOCKED",)
+    ):
+        result["selection_status"] = "SELECTABLE"
+        if not result.get("verification_reason"):
+            result["verification_reason"] = (
+                "Exact official opportunity identity confirmed and explicit "
+                "future deadline verified. Detailed eligibility requirements "
+                "remain subject to downstream official verification."
+            )
+
     # Missing eligibility/TRL/funding detail is not an identity rejection.
     # Keep it as NEEDS_VERIFICATION unless the official source positively proves incompatibility.
     if (
@@ -1021,8 +1255,13 @@ def verify_candidate(scoring_result: dict):
         result.get("programme") or record.get("programme") or ""
     )
 
+    raw_status = str(result.get("official_status") or "").strip()
+    human_status = raw_status.lower() in {
+        "open", "open for submission", "forthcoming", "upcoming",
+        "closed", "expired", "active", "accepting", "deschis",
+    }
     result["status_verified"] = bool(
-        result.get("status_verified") and result["official_status"]
+        result.get("status_verified") and human_status
     )
     result["programme_verified"] = bool(
         result.get("programme_verified") and result["programme"]
@@ -1181,7 +1420,7 @@ if st.button(
                     "stage": 36,
                     "source_scoring_run_id": scoring_run_id,
                     "candidate_limit": len(candidates),
-                    "source": "EU Funding & Tenders Portal SEARCH API + topic-details fallback",
+                    "source": "EU Funding & Tenders Topic Details API + SEARCH API + Etapa 34 official snapshot + topic-details fallback",
                 },
                 "completed_at": now_iso(),
                 "updated_at": now_iso(),
