@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -435,6 +436,99 @@ def pick(d: dict, names):
     return None
 
 
+
+def normalize_topic_code(value: Any) -> str:
+    """Normalize Funding & Tenders topic identities for deterministic comparison."""
+    text = norm(value).upper().strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def find_expected_identity_in_obj(obj: Any, expected_identity: str) -> str:
+    """
+    Return the exact expected topic identity if it occurs anywhere in an official
+    result object. This deliberately ignores numeric/internal EC identifiers.
+    """
+    expected = normalize_topic_code(expected_identity)
+    if not expected:
+        return ""
+
+    for node in walk(obj):
+        if not isinstance(node, dict):
+            continue
+        for value in node.values():
+            if isinstance(value, (str, int, float)):
+                candidate = normalize_topic_code(value)
+                if candidate == expected:
+                    return expected_identity.strip()
+                # Some API fields may contain the topic code inside a longer string.
+                if expected and expected in candidate:
+                    return expected_identity.strip()
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, (str, int, float)):
+                        candidate = normalize_topic_code(item)
+                        if candidate == expected or (expected and expected in candidate):
+                            return expected_identity.strip()
+    return ""
+
+
+def extract_topic_identity(d: dict, expected_identity: str = "") -> str:
+    """
+    Prefer real topic/call codes. Never use generic numeric `id` as official identity.
+    """
+    preferred_fields = [
+        "identifier", "topicIdentifier", "topicId", "topic_id",
+        "reference", "callIdentifier", "callCode", "topicCode",
+    ]
+    expected = normalize_topic_code(expected_identity)
+
+    # Exact expected code wins, regardless of which official field contains it.
+    if expected:
+        found = find_expected_identity_in_obj(d, expected_identity)
+        if found:
+            return found
+
+    # Otherwise accept only values that look like EU opportunity/topic codes.
+    for field in preferred_fields:
+        value = norm(pick(d, [field]))
+        if not value:
+            continue
+        upper = value.upper()
+        if (
+            upper.startswith(("HORIZON-", "ERASMUS-", "EMFAF-", "SMP-", "LIFE-",
+                              "DIGITAL-", "CEF-", "EU4H-", "CREA-", "AMIF-",
+                              "ISF-", "BMVI-", "EDF-", "EIC-", "ERC-"))
+            or ("-" in upper and not upper.isdigit())
+        ):
+            return value
+    return ""
+
+
+def extract_deadline_from_obj(obj: Any):
+    """Find a usable explicit deadline recursively without treating arbitrary dates as deadlines."""
+    deadline_keys = {
+        "deadlinedate", "deadline", "submissiondeadline", "closingdate",
+        "deadline_date", "submissionenddate", "endofsubmission",
+    }
+    candidates = []
+    for node in walk(obj):
+        if not isinstance(node, dict):
+            continue
+        for key, value in node.items():
+            if str(key).lower() in deadline_keys:
+                raw = unwrap_value(value)
+                parsed = parse_date(raw)
+                if parsed:
+                    candidates.append((parsed, norm(raw)))
+    if not candidates:
+        return ""
+    # Prefer the latest explicit deadline when the API exposes several cut-offs.
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
 def looks_like_record(d: dict):
     keys = {str(k).lower() for k in d.keys()}
     useful = {
@@ -444,7 +538,7 @@ def looks_like_record(d: dict):
     return len(keys & useful) >= 2
 
 
-def extract_official_records(raw):
+def extract_official_records(raw, expected_identity: str = ""):
     records = []
     seen = set()
 
@@ -452,19 +546,14 @@ def extract_official_records(raw):
         if not isinstance(d, dict) or not looks_like_record(d):
             continue
 
-        identity = norm(
-            pick(d, [
-                "identifier", "reference", "topicId", "topic_id",
-                "callIdentifier", "id",
-            ])
-        )
+        identity = extract_topic_identity(d, expected_identity)
         title = norm(pick(d, ["title", "name", "topicTitle", "callTitle"]))
         deadline = norm(
             pick(d, [
                 "deadlineDate", "deadline", "submissionDeadline",
-                "closingDate", "endDate",
+                "closingDate",
             ])
-        )
+        ) or extract_deadline_from_obj(d)
         status = norm(pick(d, ["status", "callStatus", "topicStatus"]))
         programme = norm(
             pick(d, [
@@ -500,23 +589,28 @@ def extract_official_records(raw):
 
 
 def choose_best_official_record(records: list[dict], expected_identity: str):
-    expected = expected_identity.strip().lower()
+    expected = normalize_topic_code(expected_identity)
 
     exact = [
         r for r in records
-        if str(r.get("identity") or "").strip().lower() == expected
+        if normalize_topic_code(r.get("identity")) == expected
     ]
     if exact:
+        exact[0]["identity"] = expected_identity.strip()
         return exact[0], "MATCH"
 
-    # Some EC records expose the topic code under another field in raw.
+    # The EC SEARCH API may expose a numeric internal identifier in `identifier`
+    # while the real HORIZON/... topic code lives in another field/nested object.
     for r in records:
-        raw_text = json.dumps(r.get("raw") or {}, ensure_ascii=False).lower()
-        if expected and expected in raw_text:
+        found = find_expected_identity_in_obj(r.get("raw") or {}, expected_identity)
+        if found:
+            r["identity"] = expected_identity.strip()
             return r, "MATCH"
 
+    # Search results for a text query are not proof of mismatch. A different first
+    # hit must remain UNVERIFIED rather than causing a false REJECTED verdict.
     if records:
-        return records[0], "MISMATCH"
+        return records[0], "UNVERIFIED"
 
     return None, "UNVERIFIED"
 
@@ -595,7 +689,7 @@ def verify_candidate(scoring_result: dict):
     title = str(scoring_result.get("opportunity_title") or "")
 
     raw_response, api_url = fetch_official_records(identity, title, 10)
-    records = extract_official_records(raw_response)
+    records = extract_official_records(raw_response, identity)
     record, deterministic_identity_status = choose_best_official_record(
         records,
         identity,
@@ -701,6 +795,17 @@ def verify_candidate(scoring_result: dict):
         if result.get("selection_status") == "SELECTABLE":
             result["selection_status"] = "NEEDS_VERIFICATION"
 
+    # Missing eligibility/TRL/funding detail is not an identity rejection.
+    # Keep it as NEEDS_VERIFICATION unless the official source positively proves incompatibility.
+    if (
+        deterministic_identity_status == "MATCH"
+        and official_deadline
+        and official_deadline >= date.today()
+        and result.get("selection_status") == "REJECTED"
+        and not result.get("rejection_reason")
+    ):
+        result["selection_status"] = "NEEDS_VERIFICATION"
+
     allowed_selection = {
         "SELECTABLE", "REJECTED", "NEEDS_VERIFICATION", "BLOCKED"
     }
@@ -720,8 +825,10 @@ def verify_candidate(scoring_result: dict):
         result["official_source_reference"] = identity
 
     # Preserve official values even if AI omitted them.
-    result["official_identity"] = str(
-        result.get("official_identity") or record.get("identity") or ""
+    result["official_identity"] = (
+        identity.strip()
+        if deterministic_identity_status == "MATCH"
+        else str(record.get("identity") or "")
     )
     result["official_title"] = str(
         result.get("official_title") or record.get("title") or ""
