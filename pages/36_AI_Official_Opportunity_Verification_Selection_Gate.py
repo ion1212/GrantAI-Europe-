@@ -323,14 +323,17 @@ def _multipart_json_files(parts: dict):
 
 def fetch_official_records(identity: str, title: str, limit: int = 10):
     """
-    Search exact opportunity identity first. The title is included as fallback text
-    only if identity is absent.
-    """
-    search_text = identity.strip() or title.strip()
+    Query the EU Funding & Tenders SEARCH API by exact topic code first
+    and by title second.
 
+    Important:
+    - the API can expose internal numeric EC IDs;
+    - numeric IDs are never accepted as the opportunity identity;
+    - all returned official responses are merged and checked later for the
+      exact expected HORIZON/ERASMUS/etc. topic code.
+    """
     endpoint = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
 
-    # Do not constrain status here; Etapa 36 must be able to detect closed/expired.
     query_data = {
         "bool": {
             "must": [
@@ -362,58 +365,78 @@ def fetch_official_records(identity: str, title: str, limit: int = 10):
         "destinationId",
     ]
 
-    params = {
-        "apiKey": "SEDIA",
-        "text": search_text,
-        "pageSize": str(int(limit)),
-        "pageNumber": "1",
-    }
-    url = endpoint + "?" + urllib.parse.urlencode(params)
+    search_terms = []
+    for value in (identity.strip(), title.strip()):
+        if value and value not in search_terms:
+            search_terms.append(value)
 
-    body, content_type = _multipart_json_files({
-        "sort": sort_data,
-        "query": query_data,
-        "languages": ["en"],
-        "displayFields": display_fields,
-    })
+    if not search_terms:
+        raise ValueError(
+            "Oportunitatea nu are identity sau title pentru verificarea oficială."
+        )
 
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"
-            ),
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": content_type,
-            "Origin": "https://ec.europa.eu",
-            "Referer": "https://ec.europa.eu/",
-            "Accept-Language": "en-GB,en;q=0.9",
-        },
-    )
+    official_responses = []
+    source_urls = []
 
-    try:
-        with urllib.request.urlopen(req, timeout=40) as resp:
-            response_body = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"EU Funding & Tenders API HTTP {exc.code}: "
-            f"{details[:1200] or exc.reason}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(
-            f"Nu s-a putut conecta la EU Funding & Tenders API: {exc.reason}"
-        ) from exc
+    for search_text in search_terms:
+        params = {
+            "apiKey": "SEDIA",
+            "text": search_text,
+            "pageSize": str(max(int(limit), 20)),
+            "pageNumber": "1",
+        }
+        url = endpoint + "?" + urllib.parse.urlencode(params)
 
-    try:
-        return json.loads(response_body), url
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "EU Funding & Tenders API nu a returnat JSON valid."
-        ) from exc
+        body, content_type = _multipart_json_files({
+            "sort": sort_data,
+            "query": query_data,
+            "languages": ["en"],
+            "displayFields": display_fields,
+        })
+
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/136.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": content_type,
+                "Origin": "https://ec.europa.eu",
+                "Referer": "https://ec.europa.eu/",
+                "Accept-Language": "en-GB,en;q=0.9",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=40) as resp:
+                response_body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"EU Funding & Tenders API HTTP {exc.code}: "
+                f"{details[:1200] or exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"Nu s-a putut conecta la EU Funding & Tenders API: {exc.reason}"
+            ) from exc
+
+        try:
+            official_responses.append(json.loads(response_body))
+            source_urls.append(url)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "EU Funding & Tenders API nu a returnat JSON valid."
+            ) from exc
+
+    return {
+        "official_search_responses": official_responses
+    }, " | ".join(source_urls)
 
 
 def walk(obj):
@@ -438,18 +461,41 @@ def pick(d: dict, names):
 
 
 def normalize_topic_code(value: Any) -> str:
-    """Normalize Funding & Tenders topic identities for deterministic comparison."""
+    """Normalize EU topic identities for deterministic comparison."""
     text = norm(value).upper().strip()
     if not text:
         return ""
+    text = urllib.parse.unquote(text)
     text = re.sub(r"\s+", "", text)
     return text
 
 
+def topic_code_occurs(value: Any, expected_identity: str) -> bool:
+    """
+    Return True only when the expected topic code occurs as a complete token.
+    This allows codes embedded in official URLs/strings but rejects numeric IDs.
+    """
+    candidate = normalize_topic_code(value)
+    expected = normalize_topic_code(expected_identity)
+
+    if not candidate or not expected:
+        return False
+
+    if candidate == expected:
+        return True
+
+    pattern = (
+        r"(?<![A-Z0-9_-])"
+        + re.escape(expected)
+        + r"(?![A-Z0-9_-])"
+    )
+    return re.search(pattern, candidate) is not None
+
+
 def find_expected_identity_in_obj(obj: Any, expected_identity: str) -> str:
     """
-    Return the exact expected topic identity if it occurs anywhere in an official
-    result object. This deliberately ignores numeric/internal EC identifiers.
+    Confirm identity only when the exact expected topic code is actually present
+    in the official response object.
     """
     expected = normalize_topic_code(expected_identity)
     if not expected:
@@ -458,20 +504,18 @@ def find_expected_identity_in_obj(obj: Any, expected_identity: str) -> str:
     for node in walk(obj):
         if not isinstance(node, dict):
             continue
+
         for value in node.values():
             if isinstance(value, (str, int, float)):
-                candidate = normalize_topic_code(value)
-                if candidate == expected:
+                if topic_code_occurs(value, expected_identity):
                     return expected_identity.strip()
-                # Some API fields may contain the topic code inside a longer string.
-                if expected and expected in candidate:
-                    return expected_identity.strip()
+
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, (str, int, float)):
-                        candidate = normalize_topic_code(item)
-                        if candidate == expected or (expected and expected in candidate):
+                        if topic_code_occurs(item, expected_identity):
                             return expected_identity.strip()
+
     return ""
 
 
@@ -595,20 +639,22 @@ def choose_best_official_record(records: list[dict], expected_identity: str):
         r for r in records
         if normalize_topic_code(r.get("identity")) == expected
     ]
+
     if exact:
         exact[0]["identity"] = expected_identity.strip()
         return exact[0], "MATCH"
 
-    # The EC SEARCH API may expose a numeric internal identifier in `identifier`
-    # while the real HORIZON/... topic code lives in another field/nested object.
     for r in records:
-        found = find_expected_identity_in_obj(r.get("raw") or {}, expected_identity)
+        found = find_expected_identity_in_obj(
+            r.get("raw") or {},
+            expected_identity,
+        )
         if found:
             r["identity"] = expected_identity.strip()
             return r, "MATCH"
 
-    # Search results for a text query are not proof of mismatch. A different first
-    # hit must remain UNVERIFIED rather than causing a false REJECTED verdict.
+    # A search hit that does not contain the expected exact topic code is NOT
+    # evidence of mismatch. Keep it UNVERIFIED instead of rejecting the candidate.
     if records:
         return records[0], "UNVERIFIED"
 
@@ -1201,6 +1247,11 @@ else:
             st.warning(
                 "Niciun candidat nu este încă SELECTABLE. "
                 "Completează verificările oficiale lipsă înainte de selectare."
+            )
+            st.info(
+                "Dacă Identity rămâne UNVERIFIED, SEARCH API nu a returnat "
+                "codul exact HORIZON/ERASMUS/etc. în datele oficiale. "
+                "Etapa 36 nu acceptă un ID numeric intern EC ca identitate."
             )
 
 
