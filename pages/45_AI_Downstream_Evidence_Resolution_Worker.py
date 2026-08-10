@@ -2095,3 +2095,535 @@ st.caption(
     "v7.3 păstrează diagnosticul persistent și folosește resolution_method canonic OFFICIAL_DOCUMENTATION. "
     "Doar persistă excepțiile pentru diagnostic și reparare controlată."
 )
+
+
+
+# =====================================================================
+# STAGE 45 v7.4 — OFFICIAL DISCOVERY TRACE + FALLBACK
+# =====================================================================
+
+def s45v74_extract_search_hits(payload):
+    """Extract likely EC search hits with titles/snippets/URLs from arbitrary Search API JSON."""
+    hits = []
+    if not isinstance(payload, (dict, list)):
+        return hits
+
+    def walk(node):
+        if isinstance(node, dict):
+            # Generic extraction across varying EC Search API shapes.
+            url = None
+            title = None
+            snippet = None
+            identity_hit = False
+
+            for k, v in node.items():
+                kl = str(k).lower()
+                if isinstance(v, str):
+                    if kl in {"url", "link", "href", "uri"} and v.startswith("http"):
+                        url = v
+                    elif "title" in kl or kl in {"name", "label"}:
+                        title = title or v
+                    elif any(x in kl for x in ("summary", "snippet", "description", "content", "text")):
+                        snippet = snippet or v
+
+                    if identity and identity.lower() in v.lower():
+                        identity_hit = True
+
+            if url or title or snippet:
+                hits.append({
+                    "url": url,
+                    "title": title,
+                    "snippet": snippet,
+                    "identity_hit": identity_hit,
+                    "raw": node,
+                })
+
+            for v in node.values():
+                walk(v)
+
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(payload)
+
+    # Deduplicate by URL/title/snippet tuple.
+    dedup = []
+    seen = set()
+    for h in hits:
+        key = (
+            normalize_text(h.get("url")),
+            normalize_text(h.get("title")),
+            normalize_text(h.get("snippet"))[:500],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(h)
+
+    return dedup[:100]
+
+def s45v74_candidate_urls_from_hit(hit):
+    urls = []
+    for field in ("url", "title", "snippet"):
+        val = normalize_text(hit.get(field))
+        for u in re.findall(r'https?://[^\s|<>"\']+', val):
+            u = u.rstrip(".,;)")
+            host = urlparse(u).netloc.lower()
+            if host.endswith("europa.eu") or host.endswith("ec.europa.eu"):
+                if u not in urls:
+                    urls.append(u)
+    return urls
+
+def s45v74_discovery_probe():
+    """Probe search/discovery only. No task verdict changes."""
+    probes = []
+    search_urls = s45v7_search_urls()
+
+    for url in search_urls:
+        fetched = s45v7_fetch_any(url)
+        rec = {
+            "url": url,
+            "ok": fetched.get("ok"),
+            "attempts": fetched.get("attempts", []),
+            "json_type": type(fetched.get("json")).__name__ if fetched.get("json") is not None else None,
+            "text_len": len(fetched.get("text") or ""),
+            "hits": [],
+        }
+
+        payload = fetched.get("json")
+        if payload is not None:
+            rec["hits"] = s45v74_extract_search_hits(payload)
+
+        probes.append(rec)
+
+    return probes
+
+def s45v74_discovery_summary(probes):
+    out = []
+    for p in probes:
+        out.append({
+            "Search URL": p.get("url"),
+            "OK": p.get("ok"),
+            "JSON": p.get("json_type"),
+            "Text bytes": p.get("text_len"),
+            "Hits": len(p.get("hits") or []),
+            "Identity hits": sum(1 for h in (p.get("hits") or []) if h.get("identity_hit")),
+        })
+    return out
+
+def s45v74_expand_queue_from_probes(probes):
+    queue = []
+    for p in probes:
+        for h in p.get("hits") or []:
+            if h.get("identity_hit") or s45v7_exact_topic(h.get("title")) or s45v7_exact_topic(h.get("snippet")):
+                for u in s45v74_candidate_urls_from_hit(h):
+                    if u not in queue:
+                        queue.append(u)
+
+            raw = h.get("raw")
+            for u in s45v7_collect_urls(raw):
+                if s45v7_exact_topic(u) or h.get("identity_hit"):
+                    if u not in queue:
+                        queue.append(u)
+
+    return queue[:30]
+
+def s45v74_run_task(task, worker_run_id, probes):
+    item = (
+        supabase.table("locked_evidence_worker_items")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "worker_run_id": worker_run_id,
+            "execution_task_id": task["id"],
+            "requirement_id": task.get("requirement_id"),
+            "opportunity_identity": identity,
+            "requirement_key": task.get("requirement_key"),
+            "requirement_category": task.get("requirement_category"),
+            "requirement_label": task.get("requirement_label"),
+            "route_type": task.get("route_type"),
+            "destination_module": task.get("destination_module"),
+            "worker_action": "OFFICIAL_DISCOVERY_TRACE_FALLBACK",
+            "worker_status": "WAITING_OFFICIAL",
+            "topic_identity": identity,
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+            "official_document_status": "SEARCHING",
+            "metadata": {"stage": 45, "version": "v7.4"},
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not item:
+        raise RuntimeError("Could not create v7.4 worker item.")
+    worker_item_id = str(item[0]["id"])
+
+    evidence = []
+    visited = set()
+    trace = []
+    queue = []
+
+    # Start with exact-topic URLs discovered from Search API payloads.
+    queue.extend(s45v74_expand_queue_from_probes(probes))
+
+    # Also include original official source parts.
+    for u in s45v3_urls(official_url):
+        if u not in queue:
+            queue.append(u)
+
+    # Finally include exact-topic Search API URLs themselves so their JSON can be used as evidence.
+    for u in s45v7_search_urls():
+        if u not in queue:
+            queue.append(u)
+
+    while queue and len(visited) < 40:
+        url = queue.pop(0)
+        if not url or url in visited:
+            continue
+        visited.add(url)
+
+        fetched = s45v7_fetch_any(url)
+        trace.extend(fetched.get("attempts", []))
+        if not fetched.get("ok"):
+            continue
+
+        payload = fetched.get("json")
+        body = fetched.get("text") or ""
+        source_obj = payload if payload is not None else body
+
+        local = s45v7_extract_explicit(source_obj, task, fetched.get("url") or url)
+        evidence.extend(local)
+
+        # Persist every successfully fetched official resource.
+        best_excerpt = local[0]["excerpt"] if local else ""
+        s45v6_save_document(
+            task,
+            worker_run_id,
+            worker_item_id,
+            fetched.get("url") or url,
+            best_excerpt,
+            status="FETCHED",
+            payload={
+                "version": "v7.4",
+                "source_kind": "SEARCH_API_JSON" if payload is not None else "OFFICIAL_RESOURCE",
+                "evidence_candidates": len(local),
+            },
+        )
+
+        # Follow any official URLs discovered in JSON/text.
+        if payload is not None:
+            next_urls = s45v7_collect_urls(payload)
+        else:
+            next_urls = []
+            for u in re.findall(r'https?://[^\s|<>"\']+', body):
+                host = urlparse(u).netloc.lower()
+                if host.endswith("europa.eu") or host.endswith("ec.europa.eu"):
+                    next_urls.append(u.rstrip(".,;)"))
+
+        for u in next_urls:
+            if u not in visited and u not in queue:
+                queue.append(u)
+
+        if len(evidence) >= 12:
+            break
+
+    exact_evidence = [
+        e for e in evidence
+        if e.get("exact_topic")
+        or s45v7_exact_topic(e.get("url"))
+        or s45v7_exact_topic(e.get("excerpt"))
+    ]
+
+    if exact_evidence:
+        official_blob = "\n\n".join(
+            f"[SOURCE {e.get('url')} | REF {e.get('reference')}]\n{e.get('excerpt')}"
+            for e in exact_evidence[:10]
+        )
+
+        evaluation = ai_evaluate(
+            task,
+            collect_snapshot_evidence(task, sources),
+            official_blob,
+            exact_evidence[0].get("url") or official_url,
+        )
+
+        if evaluation.get("status") == "RESOLVED":
+            worker_result = {
+                "resolved_value": evaluation.get("resolved_value") or {},
+                "evidence_source": "OFFICIAL_DOCUMENTATION",
+                "evidence_reference": evaluation.get("evidence_reference") or exact_evidence[0].get("reference") or task.get("requirement_label"),
+                "evidence_url": evaluation.get("evidence_url") or exact_evidence[0].get("url"),
+                "evidence_excerpt": evaluation.get("evidence_excerpt") or exact_evidence[0].get("excerpt", "")[:5000],
+                "confidence": evaluation.get("confidence") or "High",
+                "reason": evaluation.get("reason") or "Explicit official evidence verified by v7.4.",
+            }
+
+            update_execution_task_completed(task, worker_result, "VERIFIED")
+
+            supabase.table("locked_evidence_worker_items").update({
+                "worker_status": "RESOLVED",
+                "resolved_value": worker_result["resolved_value"],
+                "evidence_source": worker_result["evidence_source"],
+                "evidence_reference": worker_result["evidence_reference"],
+                "evidence_url": worker_result["evidence_url"],
+                "evidence_excerpt": worker_result["evidence_excerpt"],
+                "confidence": worker_result["confidence"],
+                "official_verified": True,
+                "reason": worker_result["reason"],
+                "next_action": "RETURN_TO_STAGE_44",
+                "documents_checked": list(visited),
+                "searches_attempted": s45v7_search_urls(),
+                "transport_attempts": trace,
+                "resolution_method": "OFFICIAL_DOCUMENTATION",
+                "retrieved_at": now_iso(),
+                "exact_topic_verified": True,
+                "authoritative_source_verified": True,
+                "explicit_evidence_verified": True,
+                "official_document_status": "VERIFIED",
+                "official_document_payload": {
+                    "version": "v7.4",
+                    "evidence_candidates": exact_evidence[:10],
+                    "evaluation": evaluation,
+                },
+                "resolved_at": now_iso(),
+                "updated_at": now_iso(),
+            }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+            return "RESOLVED"
+
+    supabase.table("locked_evidence_worker_items").update({
+        "worker_status": "WAITING_OFFICIAL",
+        "documents_checked": list(visited),
+        "searches_attempted": s45v7_search_urls(),
+        "transport_attempts": trace,
+        "missing_evidence_reason": (
+            "v7.4 inspected Search API payloads and discovered official resources, "
+            "but no explicit exact-topic rule was sufficient to resolve this requirement."
+        ),
+        "next_action": "Remain WAITING_OFFICIAL; review discovery trace and official resources.",
+        "resolution_method": "OFFICIAL_DOCUMENTATION",
+        "retrieved_at": now_iso(),
+        "authoritative_source_verified": bool(evidence),
+        "exact_topic_verified": bool(exact_evidence),
+        "explicit_evidence_verified": False,
+        "official_document_status": "WAITING_OFFICIAL",
+        "official_document_payload": {
+            "version": "v7.4",
+            "visited_count": len(visited),
+            "candidate_count": len(evidence),
+            "exact_candidate_count": len(exact_evidence),
+        },
+        "updated_at": now_iso(),
+    }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+    return "WAITING_OFFICIAL"
+
+
+st.divider()
+st.subheader("Stage 45 v7.4 — Official Discovery Trace + Fallback")
+st.info(
+    "v7.4 diagnostichează mai întâi Search API-ul, afișează hit-urile și apoi urmărește "
+    "resursele oficiale găsite. Nu schimbă verdictul fără dovadă explicită."
+)
+
+v74_probes = s45v74_discovery_probe()
+
+if v74_probes:
+    st.subheader("Search API discovery trace")
+    st.dataframe(
+        s45v74_discovery_summary(v74_probes),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    total_hits = sum(len(p.get("hits") or []) for p in v74_probes)
+    total_identity_hits = sum(
+        sum(1 for h in (p.get("hits") or []) if h.get("identity_hit"))
+        for p in v74_probes
+    )
+    c74a, c74b, c74c = st.columns(3)
+    c74a.metric("Search probes", len(v74_probes))
+    c74b.metric("Search hits", total_hits)
+    c74c.metric("Exact identity hits", total_identity_hits)
+
+    with st.expander("Discovery hit details", expanded=False):
+        details = []
+        for p in v74_probes:
+            for h in p.get("hits") or []:
+                details.append({
+                    "Search URL": p.get("url"),
+                    "Identity hit": h.get("identity_hit"),
+                    "Title": h.get("title"),
+                    "URL": h.get("url"),
+                    "Snippet": normalize_text(h.get("snippet"))[:1200],
+                })
+        if details:
+            st.dataframe(details, use_container_width=True, hide_index=True)
+        else:
+            st.info("Search API responded, but no structured hits were extracted.")
+
+v74_tasks = [
+    t for t in current_tasks
+    if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION"
+    and normalize_text(t.get("task_status")).upper() != "COMPLETED"
+]
+
+if v74_tasks and st.button(
+    "🧪 Run Stage 45 v7.4 discovery + resolution",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v74_run",
+):
+    run = (
+        supabase.table("locked_evidence_worker_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "total_tasks": len(v74_tasks),
+            "worker_status": "RUNNING",
+            "deep_resolution_version": "v7.4",
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "diagnostics": [],
+            "started_at": now_iso(),
+            "summary": {"stage": 45, "version": "v7.4"},
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not run:
+        st.error("Nu am putut crea Stage 45 v7.4 run.")
+    else:
+        run_id = str(run[0]["id"])
+        resolved = waiting = failed = 0
+        bar = st.progress(0)
+
+        for idx, task in enumerate(v74_tasks, 1):
+            try:
+                state = s45v74_run_task(task, run_id, v74_probes)
+                if normalize_text(state).upper() == "RESOLVED":
+                    resolved += 1
+                else:
+                    waiting += 1
+            except Exception as exc:
+                failed += 1
+                diagnostic = s45v71_log_error(
+                    task=task,
+                    worker_run_id=run_id,
+                    worker_item_id=None,
+                    error_stage="V74_TASK_EXECUTION",
+                    exc=exc,
+                    error_url=official_url,
+                    request_payload={
+                        "identity": identity,
+                        "requirement": task.get("requirement_label"),
+                    },
+                    diagnostic_payload={
+                        "stage": 45,
+                        "version": "v7.4",
+                        "function": "s45v74_run_task",
+                    },
+                )
+                s45v71_update_run_diagnostics(run_id, task, diagnostic)
+                st.error(
+                    f"{task.get('requirement_label')} — "
+                    f"{diagnostic['error_type']}: {diagnostic['error_message']}"
+                )
+
+            bar.progress(idx / len(v74_tasks))
+
+        final = (
+            "FAILED" if failed and resolved == 0 and waiting == 0
+            else "PARTIAL_FAILURE" if failed
+            else "COMPLETED" if resolved == len(v74_tasks)
+            else "WAITING"
+        )
+
+        docs_saved = rows(
+            "locked_evidence_official_documents",
+            {
+                "user_id": user_id,
+                "project_id": project_id,
+                "opportunity_lock_id": lock_id,
+                "worker_run_id": run_id,
+            },
+            "created_at",
+            5000,
+        )
+
+        supabase.table("locked_evidence_worker_runs").update({
+            "resolved_tasks": resolved,
+            "waiting_tasks": waiting,
+            "failed_tasks": failed,
+            "worker_status": "FAILED" if final == "FAILED" else ("COMPLETED" if final == "COMPLETED" else "WAITING"),
+            "diagnostic_status": (
+                "FAILED" if final == "FAILED"
+                else "PARTIAL_FAILURE" if final == "PARTIAL_FAILURE"
+                else "CLEAN"
+            ),
+            "official_documents_checked": len(docs_saved),
+            "official_sources_found": len(docs_saved),
+            "official_tasks_resolved": resolved,
+            "official_tasks_waiting": waiting,
+            "deep_resolution_version": "v7.4",
+            "provenance_summary": {
+                "documents_saved": len(docs_saved),
+                "resolved": resolved,
+                "waiting": waiting,
+                "failed": failed,
+                "search_probes": len(v74_probes),
+            },
+            "completed_at": now_iso() if final in {"COMPLETED", "FAILED"} else None,
+            "updated_at": now_iso(),
+        }).eq("id", run_id).eq("user_id", user_id).execute()
+
+        st.success(
+            f"Stage 45 v7.4: {final} — Resolved {resolved}, Waiting {waiting}, "
+            f"Failed {failed}, Documents {len(docs_saved)}."
+        )
+        st.rerun()
+
+v74_runs = rows(
+    "locked_evidence_worker_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    50,
+)
+v74_runs = [
+    r for r in v74_runs
+    if normalize_text(r.get("deep_resolution_version")).lower() == "v7.4"
+]
+
+if v74_runs:
+    latest_v74 = v74_runs[0]
+    st.subheader("Latest Stage 45 v7.4 Result")
+
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Status", latest_v74.get("worker_status") or "—")
+    r2.metric("Official resolved", latest_v74.get("official_tasks_resolved") or 0)
+    r3.metric("Official waiting", latest_v74.get("official_tasks_waiting") or 0)
+    r4.metric("Documents", latest_v74.get("official_documents_checked") or 0)
+
+    rr1, rr2, rr3 = st.columns(3)
+    rr1.metric("Diagnostic status", latest_v74.get("diagnostic_status") or "—")
+    rr2.metric("Error count", latest_v74.get("error_count") or 0)
+    rr3.metric("Search probes", (latest_v74.get("provenance_summary") or {}).get("search_probes", 0))
+
+st.caption(
+    "v7.4 invariant: discovery trace is diagnostic evidence only. "
+    "A task becomes COMPLETED only with explicit authoritative evidence."
+)
+# =====================================================================
+# END STAGE 45 v7.4
+# =====================================================================
