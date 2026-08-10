@@ -1220,6 +1220,11 @@ if v6_tasks and st.button(
             "waiting_tasks": waiting,
             "failed_tasks": failed,
             "worker_status": final,
+            "diagnostic_status": (
+                "FAILED" if failed and resolved == 0 and waiting == 0
+                else "PARTIAL_FAILURE" if failed
+                else "CLEAN"
+            ),
             "official_documents_checked": len(docs_saved),
             "official_sources_found": len(docs_saved),
             "official_tasks_resolved": resolved,
@@ -1275,6 +1280,7 @@ st.caption(
 # =====================================================================
 
 from urllib.parse import quote_plus, urlparse, parse_qs
+import traceback
 
 def s45v7_norm(value):
     return re.sub(r"[^a-z0-9]+", "", normalize_text(value).lower())
@@ -1633,6 +1639,151 @@ def s45v7_resolve_task(task, worker_run_id):
     return "WAITING_OFFICIAL"
 
 
+
+# ===== Stage 45 v7.1 — Persistent Error Diagnostics =====
+
+def s45v71_safe_json(value):
+    try:
+        json.dumps(value, ensure_ascii=False, default=str)
+        return value
+    except Exception:
+        return {"repr": repr(value)}
+
+def s45v71_log_error(
+    *,
+    task,
+    worker_run_id,
+    worker_item_id=None,
+    error_stage,
+    exc,
+    error_url=None,
+    error_document=None,
+    request_payload=None,
+    response_payload=None,
+    diagnostic_payload=None,
+):
+    error_type = type(exc).__name__
+    error_message = str(exc)[:12000]
+    tb = traceback.format_exc()[-30000:]
+
+    row = {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+        "execution_run_id": execution_run_id,
+        "worker_run_id": worker_run_id,
+        "worker_item_id": worker_item_id,
+        "execution_task_id": task.get("id"),
+        "requirement_id": task.get("requirement_id"),
+        "opportunity_identity": identity,
+        "requirement_key": task.get("requirement_key"),
+        "requirement_category": task.get("requirement_category"),
+        "requirement_label": task.get("requirement_label"),
+        "route_type": task.get("route_type"),
+        "destination_module": task.get("destination_module"),
+        "deep_resolution_version": "v7.1",
+        "error_stage": error_stage,
+        "error_type": error_type,
+        "error_message": error_message,
+        "error_url": error_url,
+        "error_document": error_document,
+        "error_traceback": tb,
+        "request_payload": s45v71_safe_json(request_payload or {}),
+        "response_payload": s45v71_safe_json(response_payload or {}),
+        "diagnostic_payload": s45v71_safe_json(diagnostic_payload or {}),
+        "retryable": True,
+        "resolved": False,
+        "updated_at": now_iso(),
+    }
+
+    try:
+        supabase.table("locked_evidence_worker_errors").insert(row).execute()
+    except Exception as log_exc:
+        st.warning(
+            f"Diagnostic logging failed for {task.get('requirement_label')}: "
+            f"{type(log_exc).__name__}: {str(log_exc)[:600]}"
+        )
+
+    if worker_item_id:
+        try:
+            supabase.table("locked_evidence_worker_items").update({
+                "worker_status": "FAILED",
+                "error_type": error_type,
+                "error_message": error_message,
+                "error_stage": error_stage,
+                "error_url": error_url,
+                "error_document": error_document,
+                "error_traceback": tb,
+                "diagnostic_payload": s45v71_safe_json(diagnostic_payload or {}),
+                "failed_at": now_iso(),
+                "official_document_status": "FAILED",
+                "updated_at": now_iso(),
+            }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+        except Exception:
+            pass
+
+    return {
+        "error_type": error_type,
+        "error_message": error_message,
+        "error_stage": error_stage,
+        "traceback": tb,
+    }
+
+def s45v71_update_run_diagnostics(worker_run_id, task, diagnostic):
+    try:
+        current = (
+            supabase.table("locked_evidence_worker_runs")
+            .select("diagnostics,error_count")
+            .eq("id", worker_run_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        ).data or []
+
+        existing = current[0] if current else {}
+        diagnostics = existing.get("diagnostics") or []
+        if not isinstance(diagnostics, list):
+            diagnostics = []
+
+        diagnostics.append({
+            "requirement": task.get("requirement_label"),
+            "task_id": task.get("id"),
+            "error_type": diagnostic.get("error_type"),
+            "error_message": diagnostic.get("error_message"),
+            "error_stage": diagnostic.get("error_stage"),
+            "recorded_at": now_iso(),
+        })
+
+        supabase.table("locked_evidence_worker_runs").update({
+            "diagnostic_status": "FAILED",
+            "last_error_type": diagnostic.get("error_type"),
+            "last_error_message": diagnostic.get("error_message"),
+            "last_error_stage": diagnostic.get("error_stage"),
+            "last_error_task": task.get("requirement_label"),
+            "error_count": int(existing.get("error_count") or 0) + 1,
+            "diagnostics": diagnostics[-50:],
+            "updated_at": now_iso(),
+        }).eq("id", worker_run_id).eq("user_id", user_id).execute()
+    except Exception:
+        pass
+
+def s45v71_latest_errors(limit=20):
+    try:
+        return (
+            supabase.table("locked_evidence_worker_errors")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("project_id", project_id)
+            .eq("opportunity_lock_id", lock_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        ).data or []
+    except Exception:
+        return []
+
+# ===== End Stage 45 v7.1 diagnostics =====
+
 st.divider()
 st.subheader("Stage 45 v7 — Official Topic-Aware Deep Resolver")
 st.info(
@@ -1664,9 +1815,12 @@ if v7_tasks and st.button(
             "opportunity_identity": identity,
             "total_tasks": len(v7_tasks),
             "worker_status": "RUNNING",
-            "deep_resolution_version": "v7",
+            "deep_resolution_version": "v7.1",
             "started_at": now_iso(),
-            "summary": {"stage": 45, "version": "v7"},
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "diagnostics": [],
+            "summary": {"stage": 45, "version": "v7.1"},
             "updated_at": now_iso(),
         })
         .execute()
@@ -1688,7 +1842,29 @@ if v7_tasks and st.button(
                     waiting += 1
             except Exception as exc:
                 failed += 1
-                st.warning(f"{task.get('requirement_label')}: {str(exc)[:700]}")
+                diagnostic = s45v71_log_error(
+                    task=task,
+                    worker_run_id=run_id,
+                    worker_item_id=None,
+                    error_stage="V7_TASK_EXECUTION",
+                    exc=exc,
+                    error_url=official_url,
+                    request_payload={
+                        "identity": identity,
+                        "requirement": task.get("requirement_label"),
+                        "route_type": task.get("route_type"),
+                    },
+                    diagnostic_payload={
+                        "stage": 45,
+                        "version": "v7.1",
+                        "function": "s45v7_resolve_task",
+                    },
+                )
+                s45v71_update_run_diagnostics(run_id, task, diagnostic)
+                st.error(
+                    f"{task.get('requirement_label')} — "
+                    f"{diagnostic['error_type']}: {diagnostic['error_message']}"
+                )
             bar.progress(idx / len(v7_tasks))
 
         final = (
@@ -1747,12 +1923,12 @@ v7_runs = rows(
 )
 v7_runs = [
     r for r in v7_runs
-    if normalize_text(r.get("deep_resolution_version")).lower() == "v7"
+    if normalize_text(r.get("deep_resolution_version")).lower() in {"v7", "v7.1"}
 ]
 
 if v7_runs:
     latest_v7 = v7_runs[0]
-    st.subheader("Latest Stage 45 v7 Result")
+    st.subheader("Latest Stage 45 v7.1 Result")
     y1, y2, y3, y4 = st.columns(4)
     y1.metric("Status", latest_v7.get("worker_status") or "—")
     y2.metric("Official resolved", latest_v7.get("official_tasks_resolved") or 0)
@@ -1766,3 +1942,51 @@ st.caption(
 # =====================================================================
 # END STAGE 45 v7
 # =====================================================================
+
+
+st.divider()
+st.subheader("Stage 45 v7.1 — Persistent Error Diagnostics")
+
+diagnostic_errors = s45v71_latest_errors(30)
+
+if diagnostic_errors:
+    st.error(f"Persisted errors: {len(diagnostic_errors)}")
+    st.dataframe(
+        [
+            {
+                "Time": e.get("created_at"),
+                "Requirement": e.get("requirement_label"),
+                "Stage": e.get("error_stage"),
+                "Type": e.get("error_type"),
+                "Message": e.get("error_message"),
+                "URL": e.get("error_url"),
+                "Retryable": e.get("retryable"),
+                "Resolved": e.get("resolved"),
+            }
+            for e in diagnostic_errors
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("Diagnostic details")
+    for e in diagnostic_errors[:10]:
+        with st.expander(
+            f"{e.get('requirement_label') or 'Unknown requirement'} — "
+            f"{e.get('error_type') or 'Error'}"
+        ):
+            st.write(f"**Stage:** {e.get('error_stage') or '—'}")
+            st.write(f"**Message:** {e.get('error_message') or '—'}")
+            st.write(f"**URL:** {e.get('error_url') or '—'}")
+            st.write(f"**Document:** {e.get('error_document') or '—'}")
+            if e.get("error_traceback"):
+                st.code(e.get("error_traceback"), language="text")
+            if e.get("diagnostic_payload"):
+                st.json(e.get("diagnostic_payload"))
+else:
+    st.success("Nu există încă erori persistente pentru lock-ul curent.")
+
+st.caption(
+    "v7.1 nu modifică verdictul factual al resolverului. "
+    "Doar persistă excepțiile pentru diagnostic și reparare controlată."
+)
