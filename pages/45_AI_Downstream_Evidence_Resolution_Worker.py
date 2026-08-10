@@ -5751,8 +5751,8 @@ def s45v79_run_task(task, worker_run_id, graph, fetch_cache):
         "requirement_category": task.get("requirement_category"), "requirement_label": task.get("requirement_label"),
         "route_type": task.get("route_type"), "destination_module": task.get("destination_module"),
         "worker_action": "REFERENCE_CHAIN_EVIDENCE_RESOLUTION", "worker_status": "WAITING_OFFICIAL",
-        "topic_identity": identity, "resolution_method": "OFFICIAL_REFERENCE_CHAIN",
-        "official_document_status": "SEARCHING", "metadata": {"stage": 45, "version": "v7.9"},
+        "topic_identity": identity, "resolution_method": "OFFICIAL_DOCUMENTATION",
+        "official_document_status": "SEARCHING", "metadata": {"stage": 45, "version": "v7.9.1"},
         "updated_at": now_iso(),
     }).execute()).data or []
     if not inserted:
@@ -5783,12 +5783,12 @@ def s45v79_run_task(task, worker_run_id, graph, fetch_cache):
             "evidence_url": worker_result["evidence_url"], "evidence_excerpt": worker_result["evidence_excerpt"],
             "confidence": worker_result["confidence"], "official_verified": True, "reason": worker_result["reason"],
             "next_action": "RETURN_TO_STAGE_44", "documents_checked": inspected,
-            "resolution_method": "OFFICIAL_REFERENCE_CHAIN", "retrieved_at": now_iso(),
+            "resolution_method": "OFFICIAL_DOCUMENTATION", "retrieved_at": now_iso(),
             "exact_topic_verified": any(c.get("exact_topic") for c in used),
             "authoritative_source_verified": True, "explicit_evidence_verified": True,
             "official_document_status": "VERIFIED",
             "provenance_chain": [c.get("reference_chain") for c in used[:12]],
-            "official_document_payload": {"version": "v7.9", "inspected": inspected, "candidate_count": len(candidates), "top_candidates": candidates[:12], "evaluation": ev},
+            "official_document_payload": {"version": "v7.9.1", "inspected": inspected, "candidate_count": len(candidates), "top_candidates": candidates[:12], "evaluation": ev},
             "resolved_at": now_iso(), "updated_at": now_iso(),
         }).eq("id", item_id).eq("user_id", user_id).execute()
         return "RESOLVED"
@@ -5797,21 +5797,21 @@ def s45v79_run_task(task, worker_run_id, graph, fetch_cache):
         "worker_status": "WAITING_OFFICIAL", "documents_checked": inspected,
         "missing_evidence_reason": wrap.get("reason") or "No explicit authoritative evidence was established through the reference chain.",
         "next_action": "Remain WAITING_OFFICIAL; authoritative reference traversal found no sufficient explicit passage.",
-        "resolution_method": "OFFICIAL_REFERENCE_CHAIN", "retrieved_at": now_iso(),
+        "resolution_method": "OFFICIAL_DOCUMENTATION", "retrieved_at": now_iso(),
         "authoritative_source_verified": bool(candidates),
         "exact_topic_verified": any(c.get("exact_topic") for c in candidates),
         "explicit_evidence_verified": False, "official_document_status": "WAITING_OFFICIAL",
         "provenance_chain": [c.get("reference_chain") for c in candidates[:12]],
-        "official_document_payload": {"version": "v7.9", "inspected": inspected, "candidate_count": len(candidates), "top_candidates": candidates[:12], "evaluation": wrap},
+        "official_document_payload": {"version": "v7.9.1", "inspected": inspected, "candidate_count": len(candidates), "top_candidates": candidates[:12], "evaluation": wrap},
         "updated_at": now_iso(),
     }).eq("id", item_id).eq("user_id", user_id).execute()
     return "WAITING_OFFICIAL"
 
 
 st.divider()
-st.subheader("Stage 45 v7.9 — Reference Chain Evidence Resolver")
+st.subheader("Stage 45 v7.9.1 — Reference Chain Evidence Resolver")
 st.info(
-    "v7.9 pornește de la documentul oficial al topicului blocat, urmărește recursiv referințele oficiale până la 3 niveluri, "
+    "v7.9.1 folosește resolution_method canonic OFFICIAL_DOCUMENTATION și pornește de la documentul oficial al topicului blocat, urmărește recursiv referințele oficiale până la 3 niveluri, "
     "extrage conținutul documentelor referite și caută pasajul explicit pentru fiecare cerință. Rămâne fail-closed."
 )
 
@@ -5836,12 +5836,12 @@ with st.expander("v7.9 reference graph", expanded=False):
     else:
         st.info("No authoritative reference graph is currently available.")
 
-if v79_tasks and st.button("🧬 Run Stage 45 v7.9 reference-chain resolution", type="primary", use_container_width=True, key="stage45_v79_run"):
+if v79_tasks and st.button("🧬 Run Stage 45 v7.9.1 reference-chain resolution", type="primary", use_container_width=True, key="stage45_v79_run"):
     run = (supabase.table("locked_evidence_worker_runs").insert({
         "user_id": user_id, "project_id": project_id, "opportunity_lock_id": lock_id,
         "execution_run_id": execution_run_id, "opportunity_identity": identity,
-        "total_tasks": len(v79_tasks), "worker_status": "RUNNING", "deep_resolution_version": "v7.9",
-        "started_at": now_iso(), "summary": {"stage": 45, "version": "v7.9", "reference_graph_nodes": len(v79_graph)},
+        "total_tasks": len(v79_tasks), "worker_status": "RUNNING", "deep_resolution_version": "v7.9.1",
+        "started_at": now_iso(), "summary": {"stage": 45, "version": "v7.9.1", "reference_graph_nodes": len(v79_graph)},
         "updated_at": now_iso(),
     }).execute()).data or []
     if not run:
@@ -5858,7 +5858,7 @@ if v79_tasks and st.button("🧬 Run Stage 45 v7.9 reference-chain resolution", 
             except Exception as exc:
                 failed += 1
                 try:
-                    diagnostic = s45v71_log_error(task=task, worker_run_id=run_id, worker_item_id=None, error_stage="V79_TASK_EXECUTION", exc=exc, error_url=None, request_payload={"identity": identity, "requirement": task.get("requirement_label")}, diagnostic_payload={"stage": 45, "version": "v7.9", "function": "s45v79_run_task"})
+                    diagnostic = s45v71_log_error(task=task, worker_run_id=run_id, worker_item_id=None, error_stage="V79_TASK_EXECUTION", exc=exc, error_url=None, request_payload={"identity": identity, "requirement": task.get("requirement_label")}, diagnostic_payload={"stage": 45, "version": "v7.9.1", "function": "s45v79_run_task"})
                     s45v71_update_run_diagnostics(run_id, task, diagnostic)
                 except Exception:
                     pass
@@ -5874,7 +5874,7 @@ if v79_tasks and st.button("🧬 Run Stage 45 v7.9 reference-chain resolution", 
             "worker_status": final, "diagnostic_status": "FAILED" if final == "FAILED" else "PARTIAL_FAILURE" if failed else "CLEAN",
             "official_documents_checked": total_inspected, "official_sources_found": len(v79_graph),
             "official_tasks_resolved": resolved, "official_tasks_waiting": waiting,
-            "deep_resolution_version": "v7.9",
+            "deep_resolution_version": "v7.9.1",
             "provenance_summary": {"reference_graph_nodes": len(v79_graph), "documents_inspected": total_inspected, "evidence_candidates": total_candidates, "resolved": resolved, "waiting": waiting, "failed": failed},
             "completed_at": now_iso() if final in {"COMPLETED", "FAILED"} else None, "updated_at": now_iso(),
         }).eq("id", run_id).eq("user_id", user_id).execute()
@@ -5882,10 +5882,10 @@ if v79_tasks and st.button("🧬 Run Stage 45 v7.9 reference-chain resolution", 
         st.rerun()
 
 v79_runs = rows("locked_evidence_worker_runs", {"user_id": user_id, "project_id": project_id, "opportunity_lock_id": lock_id}, "created_at", 50)
-v79_runs = [r for r in v79_runs if normalize_text(r.get("deep_resolution_version")).lower() == "v7.9"]
+v79_runs = [r for r in v79_runs if normalize_text(r.get("deep_resolution_version")).lower() in {"v7.9", "v7.9.1"}]
 if v79_runs:
     latest = v79_runs[0]
-    st.subheader("Latest Stage 45 v7.9 Result")
+    st.subheader("Latest Stage 45 v7.9.1 Result")
     q1, q2, q3, q4 = st.columns(4)
     q1.metric("Status", latest.get("worker_status") or "—")
     q2.metric("Official resolved", latest.get("official_tasks_resolved") or 0)
