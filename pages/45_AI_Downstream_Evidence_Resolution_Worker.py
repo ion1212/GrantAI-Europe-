@@ -2627,3 +2627,678 @@ st.caption(
 # =====================================================================
 # END STAGE 45 v7.4
 # =====================================================================
+
+
+
+# =====================================================================
+# STAGE 45 v7.5 — SEARCH API RAW RESPONSE DIAGNOSTICS + ADAPTIVE PARSER
+# =====================================================================
+
+def s45v75_response_preview(value, limit=5000):
+    if value is None:
+        return ""
+    try:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, default=str)[:limit]
+        return normalize_text(value)[:limit]
+    except Exception:
+        return repr(value)[:limit]
+
+def s45v75_probe_url(url, timeout=35):
+    record = {
+        "url": url,
+        "ok": False,
+        "http_status": None,
+        "content_type": "",
+        "response_bytes": 0,
+        "final_url": url,
+        "json_type": None,
+        "json_keys": [],
+        "preview": "",
+        "attempts": [],
+        "error": "",
+    }
+
+    try:
+        result = s45v3_fetch(url, timeout=timeout)
+        record["attempts"] = result.get("attempts", [])
+
+        response = result.get("response")
+        record["ok"] = bool(result.get("ok"))
+
+        if response is not None:
+            record["http_status"] = getattr(response, "status_code", None)
+            record["content_type"] = normalize_text(
+                getattr(response, "headers", {}).get("content-type", "")
+            )
+            record["final_url"] = normalize_text(getattr(response, "url", "")) or url
+            content = getattr(response, "content", b"") or b""
+            record["response_bytes"] = len(content)
+
+            try:
+                payload = response.json()
+                record["json_type"] = type(payload).__name__
+                if isinstance(payload, dict):
+                    record["json_keys"] = list(payload.keys())[:100]
+                record["preview"] = s45v75_response_preview(payload)
+            except Exception:
+                record["preview"] = s45v75_response_preview(result.get("text", ""))
+
+        else:
+            record["preview"] = s45v75_response_preview(result.get("text", ""))
+
+        return record
+
+    except Exception as exc:
+        record["error"] = f"{type(exc).__name__}: {str(exc)}"
+        return record
+
+def s45v75_all_probes():
+    out = []
+    seen = set()
+    for u in s45v7_search_urls():
+        if u and u not in seen:
+            seen.add(u)
+            out.append(s45v75_probe_url(u))
+    return out
+
+def s45v75_adaptive_hits_from_json(payload, source_url):
+    """
+    Adaptive extractor for unknown Search API shapes.
+    It treats any dict containing topic identity/title/url/description-like fields
+    as a candidate hit and recursively descends.
+    """
+    hits = []
+
+    def walk(node, path=""):
+        if isinstance(node, dict):
+            lower_map = {str(k).lower(): v for k, v in node.items()}
+
+            text_parts = []
+            candidate_url = None
+            candidate_title = None
+
+            for k, v in node.items():
+                kl = str(k).lower()
+                if isinstance(v, (str, int, float, bool)):
+                    sv = normalize_text(v)
+                    text_parts.append(f"{k}: {sv}")
+
+                    if not candidate_url and (
+                        kl in {"url", "link", "href", "uri", "weburl", "web_url"}
+                        or "url" in kl
+                        or "link" in kl
+                    ) and sv.startswith("http"):
+                        candidate_url = sv
+
+                    if not candidate_title and any(
+                        x in kl for x in ("title", "name", "label", "subject", "topic")
+                    ):
+                        candidate_title = sv
+
+            joined = " | ".join(text_parts)
+            identity_hit = s45v7_exact_topic(joined)
+
+            if identity_hit or candidate_url or candidate_title:
+                hits.append({
+                    "path": path or "$",
+                    "url": candidate_url,
+                    "title": candidate_title,
+                    "text": joined[:10000],
+                    "identity_hit": identity_hit,
+                    "raw": node,
+                })
+
+            for k, v in node.items():
+                child = f"{path}.{k}" if path else str(k)
+                walk(v, child)
+
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                child = f"{path}[{i}]"
+                walk(v, child)
+
+    walk(payload)
+
+    dedup = []
+    seen = set()
+    for h in hits:
+        key = (
+            normalize_text(h.get("url")),
+            normalize_text(h.get("title")),
+            normalize_text(h.get("text"))[:1000],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(h)
+
+    return dedup[:200]
+
+def s45v75_probe_with_payload(url, timeout=35):
+    result = s45v3_fetch(url, timeout=timeout)
+    response = result.get("response")
+    payload = None
+    if response is not None:
+        try:
+            payload = response.json()
+        except Exception:
+            pass
+    return result, payload
+
+def s45v75_extract_candidate_urls_from_payload(payload):
+    urls = []
+    if payload is None:
+        return urls
+
+    for _, value in s45v7_flatten_strings(payload):
+        for u in re.findall(r'https?://[^\s|<>"\']+', value):
+            u = u.rstrip(".,;)")
+            host = urlparse(u).netloc.lower()
+            if (
+                host.endswith("europa.eu")
+                or host.endswith("ec.europa.eu")
+                or host.endswith("funding-tenders.ec.europa.eu")
+            ) and u not in urls:
+                urls.append(u)
+
+    return urls[:100]
+
+def s45v75_discovery_diagnostics():
+    diagnostics = []
+    for url in s45v7_search_urls():
+        result, payload = s45v75_probe_with_payload(url)
+
+        response = result.get("response")
+        status = getattr(response, "status_code", None) if response is not None else None
+        ctype = ""
+        final_url = url
+        byte_count = 0
+        if response is not None:
+            try:
+                ctype = normalize_text(response.headers.get("content-type"))
+            except Exception:
+                pass
+            try:
+                final_url = normalize_text(response.url) or url
+            except Exception:
+                pass
+            try:
+                byte_count = len(response.content or b"")
+            except Exception:
+                pass
+
+        adaptive_hits = s45v75_adaptive_hits_from_json(payload, final_url) if payload is not None else []
+        candidate_urls = s45v75_extract_candidate_urls_from_payload(payload)
+
+        diagnostics.append({
+            "url": url,
+            "final_url": final_url,
+            "ok": bool(result.get("ok")),
+            "http_status": status,
+            "content_type": ctype,
+            "response_bytes": byte_count,
+            "json_type": type(payload).__name__ if payload is not None else None,
+            "json_keys": list(payload.keys())[:100] if isinstance(payload, dict) else [],
+            "preview": s45v75_response_preview(payload if payload is not None else result.get("text", "")),
+            "adaptive_hits": adaptive_hits,
+            "candidate_urls": candidate_urls,
+            "attempts": result.get("attempts", []),
+        })
+
+    return diagnostics
+
+def s45v75_summarize_probe_rows(diags):
+    rows_out = []
+    for d in diags:
+        rows_out.append({
+            "HTTP": d.get("http_status"),
+            "OK": d.get("ok"),
+            "Content-Type": d.get("content_type"),
+            "Bytes": d.get("response_bytes"),
+            "JSON type": d.get("json_type"),
+            "Top-level keys": ", ".join(d.get("json_keys") or [])[:1000],
+            "Adaptive hits": len(d.get("adaptive_hits") or []),
+            "Candidate URLs": len(d.get("candidate_urls") or []),
+            "Final URL": d.get("final_url"),
+        })
+    return rows_out
+
+def s45v75_run_task(task, worker_run_id, discovery_diags):
+    item_insert = (
+        supabase.table("locked_evidence_worker_items")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "worker_run_id": worker_run_id,
+            "execution_task_id": task["id"],
+            "requirement_id": task.get("requirement_id"),
+            "opportunity_identity": identity,
+            "requirement_key": task.get("requirement_key"),
+            "requirement_category": task.get("requirement_category"),
+            "requirement_label": task.get("requirement_label"),
+            "route_type": task.get("route_type"),
+            "destination_module": task.get("destination_module"),
+            "worker_action": "SEARCH_API_RAW_DIAGNOSTICS_ADAPTIVE_RESOLUTION",
+            "worker_status": "WAITING_OFFICIAL",
+            "topic_identity": identity,
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+            "official_document_status": "SEARCHING",
+            "metadata": {"stage": 45, "version": "v7.5"},
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not item_insert:
+        raise RuntimeError("Could not create v7.5 worker item.")
+
+    worker_item_id = str(item_insert[0]["id"])
+
+    queue = []
+    visited = set()
+    trace = []
+    evidence = []
+
+    # 1. Seed from every Search API endpoint.
+    for d in discovery_diags:
+        u = normalize_text(d.get("final_url") or d.get("url"))
+        if u and u not in queue:
+            queue.append(u)
+
+        for h in d.get("adaptive_hits") or []:
+            hu = normalize_text(h.get("url"))
+            if hu and hu not in queue:
+                queue.append(hu)
+
+        for cu in d.get("candidate_urls") or []:
+            if cu and cu not in queue:
+                queue.append(cu)
+
+    # 2. Preserve upstream official URL(s).
+    for u in s45v3_urls(official_url):
+        if u not in queue:
+            queue.append(u)
+
+    while queue and len(visited) < 50:
+        url = queue.pop(0)
+        if not url or url in visited:
+            continue
+
+        visited.add(url)
+        result = s45v3_fetch(url, timeout=35)
+        trace.extend(result.get("attempts", []))
+
+        if not result.get("ok"):
+            continue
+
+        response = result.get("response")
+        payload = None
+        if response is not None:
+            try:
+                payload = response.json()
+            except Exception:
+                pass
+
+        source_obj = payload if payload is not None else result.get("text", "")
+        fetched_url = normalize_text(result.get("url")) or url
+
+        local_evidence = s45v7_extract_explicit(source_obj, task, fetched_url)
+        evidence.extend(local_evidence)
+
+        # Persist each successfully fetched official resource.
+        best_excerpt = local_evidence[0]["excerpt"] if local_evidence else ""
+        s45v6_save_document(
+            task,
+            worker_run_id,
+            worker_item_id,
+            fetched_url,
+            best_excerpt,
+            status="FETCHED",
+            payload={
+                "version": "v7.5",
+                "payload_type": type(payload).__name__ if payload is not None else "text",
+                "evidence_candidates": len(local_evidence),
+                "response_preview": s45v75_response_preview(
+                    payload if payload is not None else result.get("text", ""),
+                    4000,
+                ),
+            },
+        )
+
+        # Follow recursively discovered official URLs.
+        next_urls = []
+        if payload is not None:
+            next_urls.extend(s45v75_extract_candidate_urls_from_payload(payload))
+            for hit in s45v75_adaptive_hits_from_json(payload, fetched_url):
+                hu = normalize_text(hit.get("url"))
+                if hu:
+                    next_urls.append(hu)
+        else:
+            for u in re.findall(r'https?://[^\s|<>"\']+', result.get("text", "")):
+                host = urlparse(u).netloc.lower()
+                if host.endswith("europa.eu") or host.endswith("ec.europa.eu"):
+                    next_urls.append(u.rstrip(".,;)"))
+
+        for u in next_urls:
+            if u and u not in visited and u not in queue:
+                queue.append(u)
+
+        if len(evidence) >= 20:
+            break
+
+    exact_evidence = [
+        e for e in evidence
+        if e.get("exact_topic")
+        or s45v7_exact_topic(e.get("url"))
+        or s45v7_exact_topic(e.get("excerpt"))
+    ]
+
+    if exact_evidence:
+        official_blob = "\n\n".join(
+            f"[SOURCE {e.get('url')} | REF {e.get('reference')}]\n{e.get('excerpt')}"
+            for e in exact_evidence[:12]
+        )
+
+        evaluation = ai_evaluate(
+            task,
+            collect_snapshot_evidence(task, sources),
+            official_blob,
+            exact_evidence[0].get("url") or official_url,
+        )
+
+        if evaluation.get("status") == "RESOLVED":
+            worker_result = {
+                "resolved_value": evaluation.get("resolved_value") or {},
+                "evidence_source": "OFFICIAL_DOCUMENTATION",
+                "evidence_reference": evaluation.get("evidence_reference") or exact_evidence[0].get("reference") or task.get("requirement_label"),
+                "evidence_url": evaluation.get("evidence_url") or exact_evidence[0].get("url"),
+                "evidence_excerpt": evaluation.get("evidence_excerpt") or exact_evidence[0].get("excerpt", "")[:5000],
+                "confidence": evaluation.get("confidence") or "High",
+                "reason": evaluation.get("reason") or "Explicit official evidence verified by v7.5.",
+            }
+
+            update_execution_task_completed(task, worker_result, "VERIFIED")
+
+            supabase.table("locked_evidence_worker_items").update({
+                "worker_status": "RESOLVED",
+                "resolved_value": worker_result["resolved_value"],
+                "evidence_source": worker_result["evidence_source"],
+                "evidence_reference": worker_result["evidence_reference"],
+                "evidence_url": worker_result["evidence_url"],
+                "evidence_excerpt": worker_result["evidence_excerpt"],
+                "confidence": worker_result["confidence"],
+                "official_verified": True,
+                "reason": worker_result["reason"],
+                "next_action": "RETURN_TO_STAGE_44",
+                "documents_checked": list(visited),
+                "searches_attempted": s45v7_search_urls(),
+                "transport_attempts": trace,
+                "resolution_method": "OFFICIAL_DOCUMENTATION",
+                "retrieved_at": now_iso(),
+                "exact_topic_verified": True,
+                "authoritative_source_verified": True,
+                "explicit_evidence_verified": True,
+                "official_document_status": "VERIFIED",
+                "official_document_payload": {
+                    "version": "v7.5",
+                    "evidence_candidates": exact_evidence[:12],
+                    "evaluation": evaluation,
+                },
+                "resolved_at": now_iso(),
+                "updated_at": now_iso(),
+            }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+            return "RESOLVED"
+
+    supabase.table("locked_evidence_worker_items").update({
+        "worker_status": "WAITING_OFFICIAL",
+        "documents_checked": list(visited),
+        "searches_attempted": s45v7_search_urls(),
+        "transport_attempts": trace,
+        "missing_evidence_reason": (
+            "v7.5 successfully diagnosed Search API responses and followed official resources, "
+            "but no explicit exact-topic evidence was sufficient to resolve this requirement."
+        ),
+        "next_action": "Remain WAITING_OFFICIAL and review raw Search API response diagnostics.",
+        "resolution_method": "OFFICIAL_DOCUMENTATION",
+        "retrieved_at": now_iso(),
+        "authoritative_source_verified": bool(evidence),
+        "exact_topic_verified": bool(exact_evidence),
+        "explicit_evidence_verified": False,
+        "official_document_status": "WAITING_OFFICIAL",
+        "official_document_payload": {
+            "version": "v7.5",
+            "visited_count": len(visited),
+            "candidate_count": len(evidence),
+            "exact_candidate_count": len(exact_evidence),
+        },
+        "updated_at": now_iso(),
+    }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+    return "WAITING_OFFICIAL"
+
+
+st.divider()
+st.subheader("Stage 45 v7.5 — Search API Raw Diagnostics + Adaptive Parser")
+st.info(
+    "v7.5 afișează exact ce răspunde Search API: HTTP status, content-type, bytes, "
+    "tip JSON, chei top-level și preview. Parserul se adaptează recursiv la structura reală."
+)
+
+v75_diags = s45v75_discovery_diagnostics()
+
+st.subheader("Raw Search API diagnostics")
+if v75_diags:
+    st.dataframe(
+        s45v75_summarize_probe_rows(v75_diags),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    with st.expander("Raw response previews", expanded=False):
+        for idx, d in enumerate(v75_diags, 1):
+            st.markdown(f"### Probe {idx}")
+            st.write(f"**Requested URL:** {d.get('url')}")
+            st.write(f"**Final URL:** {d.get('final_url')}")
+            st.write(f"**HTTP:** {d.get('http_status')}")
+            st.write(f"**Content-Type:** {d.get('content_type') or '—'}")
+            st.write(f"**Bytes:** {d.get('response_bytes')}")
+            st.write(f"**JSON type:** {d.get('json_type') or '—'}")
+            st.write(f"**Top-level keys:** {d.get('json_keys') or []}")
+            st.write(f"**Adaptive hits:** {len(d.get('adaptive_hits') or [])}")
+            st.write(f"**Candidate URLs:** {len(d.get('candidate_urls') or [])}")
+            st.code(d.get("preview") or "—", language="json")
+
+    with st.expander("Adaptive hit details", expanded=False):
+        adaptive_rows = []
+        for idx, d in enumerate(v75_diags, 1):
+            for h in d.get("adaptive_hits") or []:
+                adaptive_rows.append({
+                    "Probe": idx,
+                    "Path": h.get("path"),
+                    "Identity hit": h.get("identity_hit"),
+                    "Title": h.get("title"),
+                    "URL": h.get("url"),
+                    "Text": normalize_text(h.get("text"))[:1500],
+                })
+
+        if adaptive_rows:
+            st.dataframe(adaptive_rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("No adaptive hits extracted from current Search API responses.")
+else:
+    st.warning("No Search API diagnostics were produced.")
+
+v75_tasks = [
+    t for t in current_tasks
+    if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION"
+    and normalize_text(t.get("task_status")).upper() != "COMPLETED"
+]
+
+if v75_tasks and st.button(
+    "🧬 Run Stage 45 v7.5 adaptive discovery + resolution",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v75_run",
+):
+    run = (
+        supabase.table("locked_evidence_worker_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "total_tasks": len(v75_tasks),
+            "worker_status": "RUNNING",
+            "deep_resolution_version": "v7.5",
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "diagnostics": [],
+            "started_at": now_iso(),
+            "summary": {
+                "stage": 45,
+                "version": "v7.5",
+                "search_probe_count": len(v75_diags),
+            },
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not run:
+        st.error("Nu am putut crea Stage 45 v7.5 run.")
+    else:
+        run_id = str(run[0]["id"])
+        resolved = waiting = failed = 0
+        bar = st.progress(0)
+
+        for idx, task in enumerate(v75_tasks, 1):
+            try:
+                state = s45v75_run_task(task, run_id, v75_diags)
+                if normalize_text(state).upper() == "RESOLVED":
+                    resolved += 1
+                else:
+                    waiting += 1
+
+            except Exception as exc:
+                failed += 1
+                diagnostic = s45v71_log_error(
+                    task=task,
+                    worker_run_id=run_id,
+                    worker_item_id=None,
+                    error_stage="V75_TASK_EXECUTION",
+                    exc=exc,
+                    error_url=official_url,
+                    request_payload={
+                        "identity": identity,
+                        "requirement": task.get("requirement_label"),
+                    },
+                    diagnostic_payload={
+                        "stage": 45,
+                        "version": "v7.5",
+                        "function": "s45v75_run_task",
+                    },
+                )
+                s45v71_update_run_diagnostics(run_id, task, diagnostic)
+                st.error(
+                    f"{task.get('requirement_label')} — "
+                    f"{diagnostic['error_type']}: {diagnostic['error_message']}"
+                )
+
+            bar.progress(idx / len(v75_tasks))
+
+        final = (
+            "FAILED" if failed and resolved == 0 and waiting == 0
+            else "PARTIAL_FAILURE" if failed
+            else "COMPLETED" if resolved == len(v75_tasks)
+            else "WAITING"
+        )
+
+        docs_saved = rows(
+            "locked_evidence_official_documents",
+            {
+                "user_id": user_id,
+                "project_id": project_id,
+                "opportunity_lock_id": lock_id,
+                "worker_run_id": run_id,
+            },
+            "created_at",
+            5000,
+        )
+
+        supabase.table("locked_evidence_worker_runs").update({
+            "resolved_tasks": resolved,
+            "waiting_tasks": waiting,
+            "failed_tasks": failed,
+            "worker_status": "FAILED" if final == "FAILED" else ("COMPLETED" if final == "COMPLETED" else "WAITING"),
+            "diagnostic_status": (
+                "FAILED" if final == "FAILED"
+                else "PARTIAL_FAILURE" if final == "PARTIAL_FAILURE"
+                else "CLEAN"
+            ),
+            "official_documents_checked": len(docs_saved),
+            "official_sources_found": len(docs_saved),
+            "official_tasks_resolved": resolved,
+            "official_tasks_waiting": waiting,
+            "deep_resolution_version": "v7.5",
+            "provenance_summary": {
+                "documents_saved": len(docs_saved),
+                "resolved": resolved,
+                "waiting": waiting,
+                "failed": failed,
+                "search_probes": len(v75_diags),
+                "http_statuses": [d.get("http_status") for d in v75_diags],
+                "response_bytes": [d.get("response_bytes") for d in v75_diags],
+            },
+            "completed_at": now_iso() if final in {"COMPLETED", "FAILED"} else None,
+            "updated_at": now_iso(),
+        }).eq("id", run_id).eq("user_id", user_id).execute()
+
+        st.success(
+            f"Stage 45 v7.5: {final} — Resolved {resolved}, Waiting {waiting}, "
+            f"Failed {failed}, Documents {len(docs_saved)}."
+        )
+        st.rerun()
+
+v75_runs = rows(
+    "locked_evidence_worker_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    50,
+)
+
+v75_runs = [
+    r for r in v75_runs
+    if normalize_text(r.get("deep_resolution_version")).lower() == "v7.5"
+]
+
+if v75_runs:
+    latest_v75 = v75_runs[0]
+
+    st.subheader("Latest Stage 45 v7.5 Result")
+    z1, z2, z3, z4 = st.columns(4)
+    z1.metric("Status", latest_v75.get("worker_status") or "—")
+    z2.metric("Official resolved", latest_v75.get("official_tasks_resolved") or 0)
+    z3.metric("Official waiting", latest_v75.get("official_tasks_waiting") or 0)
+    z4.metric("Documents", latest_v75.get("official_documents_checked") or 0)
+
+    zz1, zz2, zz3 = st.columns(3)
+    zz1.metric("Diagnostic status", latest_v75.get("diagnostic_status") or "—")
+    zz2.metric("Error count", latest_v75.get("error_count") or 0)
+    zz3.metric("Search probes", (latest_v75.get("provenance_summary") or {}).get("search_probes", 0))
+
+st.caption(
+    "v7.5 invariant: raw Search API diagnostics never count as substantive evidence. "
+    "COMPLETED still requires explicit authoritative evidence traceable to the exact locked topic."
+)
+# =====================================================================
+# END STAGE 45 v7.5
+# =====================================================================
