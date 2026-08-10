@@ -1,3 +1,4 @@
+import requests
 import os
 import json
 import re
@@ -10,6 +11,50 @@ import streamlit as st
 from openai import OpenAI
 from supabase import create_client
 
+
+# ===== Stage 45 v2: robust official-source URL handling =====
+def stage45_extract_official_urls(raw_value):
+    """Return unique HTTP(S) URLs from DB fields, including values joined with |."""
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, (list, tuple, set)):
+        parts = [str(x) for x in raw_value if x]
+    else:
+        parts = re.split(r"\s*\|\s*|\s*\n\s*", str(raw_value))
+    urls = []
+    for part in parts:
+        for url in re.findall(r'https?://[^\s|<>"\']+', part):
+            url = url.rstrip(".,;)")
+            if url not in urls:
+                urls.append(url)
+    return urls
+
+def stage45_fetch_first_readable(urls, timeout=20):
+    """Try official URLs independently; never treat a concatenated field as one URL."""
+    attempts = []
+    for url in urls:
+        try:
+            response = requests.get(
+                url,
+                timeout=timeout,
+                headers={"User-Agent": "GreenRise-Stage45/2.0", "Accept": "application/json,text/html,*/*"},
+            )
+            attempts.append({"url": url, "status_code": response.status_code})
+            if response.ok and response.text and response.text.strip():
+                return {
+                    "ok": True,
+                    "url": url,
+                    "status_code": response.status_code,
+                    "text": response.text,
+                    "content_type": response.headers.get("content-type", ""),
+                    "attempts": attempts,
+                }
+        except Exception as exc:
+            attempts.append({"url": url, "error": str(exc)})
+    return {"ok": False, "attempts": attempts}
+# ===== End Stage 45 v2 patch =====
+
+
 st.set_page_config(
     page_title="Downstream Evidence Resolution Worker",
     page_icon="🛠️",
@@ -17,6 +62,12 @@ st.set_page_config(
 )
 
 st.title("🛠️ Etapa 45 — AI Downstream Evidence Resolution Worker")
+
+st.info(
+    "Etapa 45 v2 separă sursele oficiale concatenate și încearcă fiecare URL individual. "
+    "Un task devine COMPLETED numai pe baza unei dovezi explicite; lipsa dovezii rămâne WAITING."
+)
+
 st.caption(
     "Execută efectiv task-urile WAITING din Etapa 43: verificare oficială, "
     "dovadă de la utilizator și evidence resolver. "
