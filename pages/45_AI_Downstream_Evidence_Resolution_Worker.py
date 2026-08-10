@@ -10,6 +10,16 @@ from typing import Any
 import streamlit as st
 from openai import OpenAI
 from supabase import create_client
+from io import BytesIO
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
 
 
 # ===== Stage 45 v3 official-source transport =====
@@ -4433,4 +4443,1073 @@ st.caption(
 )
 # =====================================================================
 # END STAGE 45 v7.7
+# =====================================================================
+
+
+
+# =====================================================================
+# STAGE 45 v7.8 — OFFICIAL DOCUMENT CONTENT EXTRACTOR
+# =====================================================================
+
+def s45v78_safe_text(value):
+    return re.sub(r"\s+", " ", normalize_text(value)).strip()
+
+def s45v78_requirement_profile(task):
+    family = s45v7_requirement_family(task)
+
+    profiles = {
+        "applicant": {
+            "strong": [
+                "eligible applicants",
+                "eligible entities",
+                "eligible participants",
+                "legal entities eligible",
+                "eligibility conditions",
+                "conditions for participation",
+                "eligible for funding",
+                "beneficiaries are eligible",
+                "applicants must",
+            ],
+            "supporting": [
+                "applicant",
+                "beneficiary",
+                "legal entity",
+                "legal entities",
+                "member states",
+                "associated countries",
+                "third countries",
+                "sme",
+                "for-profit",
+                "non-profit",
+                "eligible countries",
+            ],
+        },
+        "consortium": {
+            "strong": [
+                "at least three independent legal entities",
+                "minimum number of participants",
+                "minimum consortium",
+                "consortium must",
+                "consortium shall",
+                "independent legal entities",
+                "consortium composition",
+                "single beneficiary",
+            ],
+            "supporting": [
+                "consortium",
+                "beneficiaries",
+                "participants",
+                "partners",
+                "legal entities",
+                "member states",
+                "associated countries",
+                "independent",
+            ],
+        },
+        "trl": {
+            "strong": [
+                "technology readiness level",
+                "starting trl",
+                "target trl",
+                "expected trl",
+                "trl 3",
+                "trl 4",
+                "trl 5",
+                "trl 6",
+                "trl 7",
+                "trl 8",
+                "trl 9",
+            ],
+            "supporting": [
+                "trl",
+                "technology maturity",
+                "readiness level",
+                "maturity level",
+                "demonstration",
+                "prototype",
+            ],
+        },
+        "funding": {
+            "strong": [
+                "funding rate",
+                "reimbursement rate",
+                "maximum grant amount",
+                "eligible costs",
+                "funding conditions",
+            ],
+            "supporting": [
+                "budget",
+                "grant",
+                "funding",
+                "reimbursement",
+                "eligible costs",
+            ],
+        },
+        "geographic": {
+            "strong": [
+                "eligible countries",
+                "eligible for funding",
+                "member states",
+                "associated countries",
+                "geographical eligibility",
+            ],
+            "supporting": [
+                "country",
+                "countries",
+                "member state",
+                "associated country",
+                "region",
+            ],
+        },
+    }
+
+    return family, profiles.get(
+        family,
+        {
+            "strong": s45v7_needles(family),
+            "supporting": s45v7_needles(family),
+        },
+    )
+
+def s45v78_fetch_raw(url, timeout=40):
+    result = {
+        "ok": False,
+        "url": url,
+        "final_url": url,
+        "status": None,
+        "content_type": "",
+        "content": b"",
+        "text": "",
+        "error": "",
+    }
+
+    try:
+        response = requests.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={
+                "User-Agent": "GreenRise/Stage45-v7.8",
+                "Accept": "application/pdf,application/json,text/html,text/plain,*/*",
+                "Accept-Language": "en-GB,en;q=0.9",
+                "Connection": "close",
+            },
+        )
+
+        result["status"] = response.status_code
+        result["final_url"] = normalize_text(getattr(response, "url", "")) or url
+        result["content_type"] = normalize_text(response.headers.get("content-type", ""))
+        result["content"] = response.content or b""
+
+        try:
+            result["text"] = response.text or ""
+        except Exception:
+            result["text"] = ""
+
+        result["ok"] = bool(response.ok and result["content"])
+        if not response.ok:
+            result["error"] = f"HTTP {response.status_code}"
+
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {str(exc)}"
+
+    return result
+
+def s45v78_extract_pdf_text(content, max_pages=250, max_chars=1200000):
+    if not content or PdfReader is None:
+        return ""
+
+    try:
+        reader = PdfReader(BytesIO(content))
+        parts = []
+        total = 0
+
+        for idx, page in enumerate(reader.pages):
+            if idx >= max_pages:
+                break
+
+            try:
+                page_text = page.extract_text() or ""
+            except Exception:
+                page_text = ""
+
+            if page_text:
+                parts.append(f"\n[PDF PAGE {idx + 1}]\n{page_text}")
+                total += len(page_text)
+
+            if total >= max_chars:
+                break
+
+        return "\n".join(parts)[:max_chars]
+
+    except Exception:
+        return ""
+
+def s45v78_extract_html_text(html_text, max_chars=1200000):
+    if not html_text:
+        return ""
+
+    if BeautifulSoup is None:
+        # conservative fallback
+        text_only = re.sub(r"<script.*?</script>", " ", html_text, flags=re.I | re.S)
+        text_only = re.sub(r"<style.*?</style>", " ", text_only, flags=re.I | re.S)
+        text_only = re.sub(r"<[^>]+>", " ", text_only)
+        return re.sub(r"\s+", " ", text_only)[:max_chars]
+
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
+            tag.decompose()
+
+        chunks = []
+
+        # Preserve useful structural breaks.
+        for node in soup.find_all(["h1", "h2", "h3", "h4", "p", "li", "td", "th"]):
+            txt = " ".join(node.stripped_strings).strip()
+            if txt:
+                chunks.append(txt)
+
+        if not chunks:
+            chunks = list(soup.stripped_strings)
+
+        return "\n".join(chunks)[:max_chars]
+
+    except Exception:
+        return ""
+
+def s45v78_extract_json_text(content, fallback_text="", max_chars=1200000):
+    payload = None
+
+    try:
+        if isinstance(content, bytes):
+            payload = json.loads(content.decode("utf-8", errors="ignore"))
+        elif isinstance(content, str):
+            payload = json.loads(content)
+    except Exception:
+        try:
+            payload = json.loads(fallback_text)
+        except Exception:
+            payload = None
+
+    if payload is None:
+        return ""
+
+    flattened = s45v7_flatten_strings(payload)
+    lines = [f"{path}: {value}" for path, value in flattened]
+    return "\n".join(lines)[:max_chars]
+
+def s45v78_extract_document_text(fetch_result):
+    ctype = normalize_text(fetch_result.get("content_type")).lower()
+    content = fetch_result.get("content") or b""
+    raw_text = fetch_result.get("text") or ""
+
+    if "pdf" in ctype or normalize_text(fetch_result.get("final_url")).lower().endswith(".pdf"):
+        extracted = s45v78_extract_pdf_text(content)
+        return extracted, "PDF"
+
+    if "json" in ctype:
+        extracted = s45v78_extract_json_text(content, raw_text)
+        return extracted, "JSON"
+
+    if "html" in ctype or "<html" in raw_text[:5000].lower():
+        extracted = s45v78_extract_html_text(raw_text)
+        return extracted, "HTML"
+
+    if raw_text:
+        return raw_text[:1200000], "TEXT"
+
+    return "", "UNKNOWN"
+
+def s45v78_chunk_text(text, chunk_size=3500, overlap=500):
+    text = text or ""
+    if not text.strip():
+        return []
+
+    # Prefer paragraphs/lines, then pack them into bounded chunks.
+    units = [u.strip() for u in re.split(r"\n{1,}", text) if u.strip()]
+    chunks = []
+    current = []
+    current_len = 0
+
+    for unit in units:
+        if current and current_len + len(unit) + 1 > chunk_size:
+            chunk = "\n".join(current)
+            chunks.append(chunk)
+
+            # Overlap: retain a suffix of previous chunk.
+            suffix = chunk[-overlap:] if overlap else ""
+            current = [suffix, unit] if suffix else [unit]
+            current_len = len(suffix) + len(unit)
+
+        else:
+            current.append(unit)
+            current_len += len(unit) + 1
+
+    if current:
+        chunks.append("\n".join(current))
+
+    # Large unbroken text fallback.
+    if not chunks:
+        step = max(1, chunk_size - overlap)
+        chunks = [text[i:i + chunk_size] for i in range(0, len(text), step)]
+
+    return chunks[:600]
+
+def s45v78_topic_context_score(text, source_url="", doc=None):
+    score = 0
+    hay = " ".join([
+        normalize_text(text),
+        normalize_text(source_url),
+        normalize_text((doc or {}).get("source_title")),
+        normalize_text((doc or {}).get("evidence_excerpt")),
+    ])
+
+    if s45v7_exact_topic(hay):
+        score += 100
+
+    if doc and doc.get("exact_topic_verified"):
+        score += 50
+
+    return score
+
+def s45v78_requirement_score(chunk, task):
+    family, profile = s45v78_requirement_profile(task)
+    low = chunk.lower()
+
+    strong_hits = [term for term in profile["strong"] if term.lower() in low]
+    supporting_hits = [term for term in profile["supporting"] if term.lower() in low]
+
+    score = (len(strong_hits) * 20) + (len(supporting_hits) * 4)
+
+    # Numeric TRL patterns carry strong signal.
+    if family == "trl":
+        trl_nums = re.findall(r"\btrl\s*[-:]?\s*([1-9])\b", low, flags=re.I)
+        if trl_nums:
+            score += 35
+
+    return score, strong_hits, supporting_hits
+
+def s45v78_exact_topic_reference_map(ranked_docs):
+    """
+    Build a map of official generic documents explicitly referenced from
+    exact-topic documents. This allows a traceable topic -> general rule chain.
+    """
+    exact_docs = []
+    for doc in ranked_docs:
+        hay = " ".join([
+            normalize_text(doc.get("source_url")),
+            normalize_text(doc.get("source_title")),
+            normalize_text(doc.get("evidence_excerpt")),
+        ])
+        if doc.get("exact_topic_verified") or s45v7_exact_topic(hay):
+            exact_docs.append(doc)
+
+    reference_map = {}
+
+    for topic_doc in exact_docs[:10]:
+        fetched = s45v78_fetch_raw(topic_doc.get("source_url"))
+        if not fetched.get("ok"):
+            continue
+
+        text, _ = s45v78_extract_document_text(fetched)
+        low = text.lower()
+
+        for candidate in ranked_docs[:120]:
+            candidate_url = normalize_text(candidate.get("source_url"))
+            if not candidate_url:
+                continue
+
+            # Direct URL mention.
+            if candidate_url.lower() in low:
+                reference_map[s45v77_normalize_url(candidate_url)] = {
+                    "topic_source_url": topic_doc.get("source_url"),
+                    "reason": "Exact-topic official document explicitly references this official source URL.",
+                }
+                continue
+
+            # Title mention (only when reasonably distinctive).
+            title = s45v78_safe_text(candidate.get("source_title"))
+            if len(title) >= 30 and title.lower() in low:
+                reference_map[s45v77_normalize_url(candidate_url)] = {
+                    "topic_source_url": topic_doc.get("source_url"),
+                    "reason": "Exact-topic official document explicitly references this official document title.",
+                }
+
+    return reference_map
+
+def s45v78_is_authoritative_url(url):
+    host = urlparse(normalize_text(url)).netloc.lower()
+    return (
+        host.endswith("europa.eu")
+        or host.endswith("ec.europa.eu")
+        or host.endswith("funding-tenders.ec.europa.eu")
+    )
+
+def s45v78_extract_candidates_for_task(task, ranked_docs, reference_map):
+    candidates = []
+    inspected = []
+
+    for doc in ranked_docs[:80]:
+        url = normalize_text(doc.get("source_url"))
+        if not url or not s45v78_is_authoritative_url(url):
+            continue
+
+        fetched = s45v78_fetch_raw(url)
+        if not fetched.get("ok"):
+            inspected.append({
+                "url": url,
+                "fetch_ok": False,
+                "status": fetched.get("status"),
+                "error": fetched.get("error"),
+                "document_score": doc.get("_score"),
+            })
+            continue
+
+        content_text, content_kind = s45v78_extract_document_text(fetched)
+        chunks = s45v78_chunk_text(content_text)
+
+        exact_doc = bool(doc.get("exact_topic_verified")) or s45v7_exact_topic(
+            " ".join([
+                url,
+                normalize_text(doc.get("source_title")),
+                normalize_text(doc.get("evidence_excerpt")),
+                content_text[:25000],
+            ])
+        )
+
+        ref = reference_map.get(s45v77_normalize_url(url))
+        applicable_by_reference = bool(ref)
+
+        doc_candidate_count = 0
+
+        for chunk_index, chunk in enumerate(chunks):
+            req_score, strong_hits, supporting_hits = s45v78_requirement_score(chunk, task)
+            if req_score <= 0:
+                continue
+
+            topic_score = s45v78_topic_context_score(chunk, url, doc)
+            exact_chunk = topic_score >= 100
+
+            applicable = exact_doc or exact_chunk or applicable_by_reference
+            if not applicable:
+                continue
+
+            score = (
+                req_score
+                + topic_score
+                + int(doc.get("_score") or 0)
+                + (40 if applicable_by_reference else 0)
+            )
+
+            candidates.append({
+                "source_url": fetched.get("final_url") or url,
+                "source_title": doc.get("source_title"),
+                "document_type": content_kind or doc.get("document_type"),
+                "document_id": doc.get("id"),
+                "chunk_index": chunk_index,
+                "excerpt": chunk[:6000],
+                "score": score,
+                "requirement_score": req_score,
+                "topic_score": topic_score,
+                "exact_topic": bool(exact_doc or exact_chunk),
+                "applicable_by_reference": applicable_by_reference,
+                "reference_source_url": ref.get("topic_source_url") if ref else None,
+                "applicability_reason": (
+                    "Exact-topic official document."
+                    if exact_doc or exact_chunk
+                    else ref.get("reason") if ref
+                    else ""
+                ),
+                "strong_hits": strong_hits,
+                "supporting_hits": supporting_hits,
+            })
+
+            doc_candidate_count += 1
+
+        inspected.append({
+            "url": url,
+            "fetch_ok": True,
+            "status": fetched.get("status"),
+            "content_type": fetched.get("content_type"),
+            "content_kind": content_kind,
+            "text_chars": len(content_text),
+            "chunks": len(chunks),
+            "candidate_count": doc_candidate_count,
+            "exact_doc": exact_doc,
+            "applicable_by_reference": applicable_by_reference,
+            "document_score": doc.get("_score"),
+        })
+
+    candidates.sort(key=lambda x: x.get("score") or 0, reverse=True)
+
+    # Deduplicate near-identical excerpts.
+    dedup = []
+    seen = set()
+
+    for c in candidates:
+        excerpt_key = s45v78_safe_text(c.get("excerpt"))[:1800].lower()
+        key = (s45v77_normalize_url(c.get("source_url")), excerpt_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(c)
+
+    return dedup[:40], inspected
+
+def s45v78_evaluate_candidates(task, candidates):
+    if not candidates:
+        return {
+            "status": "WAITING_OFFICIAL",
+            "reason": "No authoritative applicable content passage matched this requirement.",
+            "used_candidates": [],
+        }
+
+    # Require either exact-topic evidence or an explicit reference chain.
+    usable = [
+        c for c in candidates
+        if c.get("exact_topic") or c.get("applicable_by_reference")
+    ][:12]
+
+    if not usable:
+        return {
+            "status": "WAITING_OFFICIAL",
+            "reason": "Candidate passages were found, but exact-topic applicability was not established.",
+            "used_candidates": [],
+        }
+
+    official_blob = "\n\n".join(
+        (
+            f"[SOURCE {c.get('source_url')} | TITLE {c.get('source_title')} | "
+            f"TYPE {c.get('document_type')} | CHUNK {c.get('chunk_index')} | "
+            f"APPLICABILITY {c.get('applicability_reason')}]\n"
+            f"{c.get('excerpt')}"
+        )
+        for c in usable
+    )
+
+    evaluation = ai_evaluate(
+        task,
+        collect_snapshot_evidence(task, sources),
+        official_blob,
+        usable[0].get("source_url") or official_url,
+    )
+
+    return {
+        "status": evaluation.get("status"),
+        "evaluation": evaluation,
+        "used_candidates": usable,
+    }
+
+def s45v78_persist_candidate_documents(task, worker_run_id, worker_item_id, candidates):
+    for c in candidates[:12]:
+        try:
+            s45v6_save_document(
+                task,
+                worker_run_id,
+                worker_item_id,
+                c.get("source_url"),
+                c.get("excerpt"),
+                status="VERIFIED" if c.get("exact_topic") else "FETCHED",
+                payload={
+                    "version": "v7.8",
+                    "chunk_index": c.get("chunk_index"),
+                    "score": c.get("score"),
+                    "requirement_score": c.get("requirement_score"),
+                    "topic_score": c.get("topic_score"),
+                    "exact_topic": c.get("exact_topic"),
+                    "applicable_by_reference": c.get("applicable_by_reference"),
+                    "reference_source_url": c.get("reference_source_url"),
+                    "applicability_reason": c.get("applicability_reason"),
+                    "strong_hits": c.get("strong_hits"),
+                    "supporting_hits": c.get("supporting_hits"),
+                },
+            )
+        except Exception:
+            pass
+
+def s45v78_run_task(task, worker_run_id, ranked_docs, reference_map):
+    item_insert = (
+        supabase.table("locked_evidence_worker_items")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "worker_run_id": worker_run_id,
+            "execution_task_id": task["id"],
+            "requirement_id": task.get("requirement_id"),
+            "opportunity_identity": identity,
+            "requirement_key": task.get("requirement_key"),
+            "requirement_category": task.get("requirement_category"),
+            "requirement_label": task.get("requirement_label"),
+            "route_type": task.get("route_type"),
+            "destination_module": task.get("destination_module"),
+            "worker_action": "OFFICIAL_DOCUMENT_CONTENT_EXTRACTION",
+            "worker_status": "WAITING_OFFICIAL",
+            "topic_identity": identity,
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+            "official_document_status": "SEARCHING",
+            "metadata": {"stage": 45, "version": "v7.8"},
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not item_insert:
+        raise RuntimeError("Could not create v7.8 worker item.")
+
+    worker_item_id = str(item_insert[0]["id"])
+
+    candidates, inspected = s45v78_extract_candidates_for_task(
+        task,
+        ranked_docs,
+        reference_map,
+    )
+
+    s45v78_persist_candidate_documents(
+        task,
+        worker_run_id,
+        worker_item_id,
+        candidates,
+    )
+
+    evaluation_wrap = s45v78_evaluate_candidates(task, candidates)
+
+    if evaluation_wrap.get("status") == "RESOLVED":
+        evaluation = evaluation_wrap.get("evaluation") or {}
+        used = evaluation_wrap.get("used_candidates") or []
+        best = used[0] if used else {}
+
+        worker_result = {
+            "resolved_value": evaluation.get("resolved_value") or {},
+            "evidence_source": "OFFICIAL_DOCUMENTATION",
+            "evidence_reference": (
+                evaluation.get("evidence_reference")
+                or f"{best.get('document_type')} chunk {best.get('chunk_index')}"
+            ),
+            "evidence_url": evaluation.get("evidence_url") or best.get("source_url"),
+            "evidence_excerpt": (
+                evaluation.get("evidence_excerpt")
+                or normalize_text(best.get("excerpt"))[:5000]
+            ),
+            "confidence": evaluation.get("confidence") or "High",
+            "reason": evaluation.get("reason") or (
+                "Explicit authoritative content passage verified by Stage 45 v7.8."
+            ),
+        }
+
+        update_execution_task_completed(task, worker_result, "VERIFIED")
+
+        provenance = []
+        for c in used[:12]:
+            chain = []
+            if c.get("reference_source_url"):
+                chain.append(c.get("reference_source_url"))
+            chain.append(c.get("source_url"))
+            provenance.append({
+                "chain": chain,
+                "applicability_reason": c.get("applicability_reason"),
+                "chunk_index": c.get("chunk_index"),
+            })
+
+        supabase.table("locked_evidence_worker_items").update({
+            "worker_status": "RESOLVED",
+            "resolved_value": worker_result["resolved_value"],
+            "evidence_source": worker_result["evidence_source"],
+            "evidence_reference": worker_result["evidence_reference"],
+            "evidence_url": worker_result["evidence_url"],
+            "evidence_excerpt": worker_result["evidence_excerpt"],
+            "confidence": worker_result["confidence"],
+            "official_verified": True,
+            "reason": worker_result["reason"],
+            "next_action": "RETURN_TO_STAGE_44",
+            "documents_checked": inspected,
+            "searches_attempted": [],
+            "transport_attempts": [],
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+            "retrieved_at": now_iso(),
+            "exact_topic_verified": any(c.get("exact_topic") for c in used),
+            "authoritative_source_verified": True,
+            "explicit_evidence_verified": True,
+            "official_document_status": "VERIFIED",
+            "provenance_chain": provenance,
+            "official_document_payload": {
+                "version": "v7.8",
+                "inspected": inspected,
+                "candidate_count": len(candidates),
+                "top_candidates": candidates[:12],
+                "evaluation": evaluation,
+            },
+            "resolved_at": now_iso(),
+            "updated_at": now_iso(),
+        }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+        return "RESOLVED"
+
+    supabase.table("locked_evidence_worker_items").update({
+        "worker_status": "WAITING_OFFICIAL",
+        "documents_checked": inspected,
+        "searches_attempted": [],
+        "transport_attempts": [],
+        "missing_evidence_reason": (
+            evaluation_wrap.get("reason")
+            or "No explicit authoritative content passage was sufficient for this requirement."
+        ),
+        "next_action": (
+            "Remain WAITING_OFFICIAL; review extracted content candidates and applicability chain."
+        ),
+        "resolution_method": "OFFICIAL_DOCUMENTATION",
+        "retrieved_at": now_iso(),
+        "authoritative_source_verified": bool(candidates),
+        "exact_topic_verified": any(c.get("exact_topic") for c in candidates),
+        "explicit_evidence_verified": False,
+        "official_document_status": "WAITING_OFFICIAL",
+        "official_document_payload": {
+            "version": "v7.8",
+            "inspected": inspected,
+            "candidate_count": len(candidates),
+            "top_candidates": candidates[:12],
+            "evaluation": evaluation_wrap,
+        },
+        "updated_at": now_iso(),
+    }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+    return "WAITING_OFFICIAL"
+
+
+st.divider()
+st.subheader("Stage 45 v7.8 — Official Document Content Extractor")
+st.info(
+    "v7.8 descarcă efectiv conținutul documentelor oficiale stocate, extrage text din HTML/JSON/PDF, "
+    "îl segmentează, caută semantic cele 3 cerințe și păstrează provenance. "
+    "Nu marchează COMPLETED fără pasaj oficial explicit și aplicabil."
+)
+
+v78_docs = s45v77_load_documents()
+
+v78_reference_map = {}
+try:
+    v78_reference_map = s45v78_exact_topic_reference_map(v78_docs)
+except Exception as ref_exc:
+    st.warning(
+        f"Reference-chain discovery warning: {type(ref_exc).__name__}: {str(ref_exc)[:500]}"
+    )
+
+v78_tasks = [
+    t for t in current_tasks
+    if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION"
+    and normalize_text(t.get("task_status")).upper() != "COMPLETED"
+]
+
+v78a, v78b, v78c, v78d = st.columns(4)
+v78a.metric("Stored official docs", len(v78_docs))
+v78b.metric(
+    "Exact-topic docs",
+    sum(
+        1
+        for d in v78_docs
+        if d.get("exact_topic_verified")
+        or s45v7_exact_topic(
+            " ".join([
+                normalize_text(d.get("source_url")),
+                normalize_text(d.get("source_title")),
+                normalize_text(d.get("evidence_excerpt")),
+            ])
+        )
+    ),
+)
+v78c.metric("Reference-chain docs", len(v78_reference_map))
+v78d.metric("Unresolved OFFICIAL", len(v78_tasks))
+
+with st.expander("Reference-chain mapping", expanded=False):
+    if v78_reference_map:
+        st.dataframe(
+            [
+                {
+                    "Referenced document": url,
+                    "Topic source": data.get("topic_source_url"),
+                    "Reason": data.get("reason"),
+                }
+                for url, data in v78_reference_map.items()
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No explicit topic → general-document reference chain detected yet.")
+
+if v78_tasks and st.button(
+    "🧠 Run Stage 45 v7.8 content extraction + evidence verification",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v78_run",
+):
+    run = (
+        supabase.table("locked_evidence_worker_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "total_tasks": len(v78_tasks),
+            "worker_status": "RUNNING",
+            "deep_resolution_version": "v7.8",
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "diagnostics": [],
+            "started_at": now_iso(),
+            "summary": {
+                "stage": 45,
+                "version": "v7.8",
+                "stored_document_count": len(v78_docs),
+                "reference_chain_count": len(v78_reference_map),
+            },
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not run:
+        st.error("Nu am putut crea Stage 45 v7.8 run.")
+
+    else:
+        run_id = str(run[0]["id"])
+        resolved = waiting = failed = 0
+        bar = st.progress(0)
+
+        for idx, task in enumerate(v78_tasks, 1):
+            try:
+                state = s45v78_run_task(
+                    task,
+                    run_id,
+                    v78_docs,
+                    v78_reference_map,
+                )
+
+                if normalize_text(state).upper() == "RESOLVED":
+                    resolved += 1
+                else:
+                    waiting += 1
+
+            except Exception as exc:
+                failed += 1
+
+                diagnostic = s45v71_log_error(
+                    task=task,
+                    worker_run_id=run_id,
+                    worker_item_id=None,
+                    error_stage="V78_TASK_EXECUTION",
+                    exc=exc,
+                    error_url=None,
+                    request_payload={
+                        "identity": identity,
+                        "requirement": task.get("requirement_label"),
+                    },
+                    diagnostic_payload={
+                        "stage": 45,
+                        "version": "v7.8",
+                        "function": "s45v78_run_task",
+                    },
+                )
+
+                s45v71_update_run_diagnostics(run_id, task, diagnostic)
+
+                st.error(
+                    f"{task.get('requirement_label')} — "
+                    f"{diagnostic['error_type']}: {diagnostic['error_message']}"
+                )
+
+            bar.progress(idx / len(v78_tasks))
+
+        final = (
+            "FAILED"
+            if failed and resolved == 0 and waiting == 0
+            else "PARTIAL_FAILURE"
+            if failed
+            else "COMPLETED"
+            if resolved == len(v78_tasks)
+            else "WAITING"
+        )
+
+        run_items = rows(
+            "locked_evidence_worker_items",
+            {
+                "user_id": user_id,
+                "project_id": project_id,
+                "opportunity_lock_id": lock_id,
+                "worker_run_id": run_id,
+            },
+            "created_at",
+            100,
+        )
+
+        total_candidates = 0
+        total_inspected = 0
+
+        for item in run_items:
+            payload = item.get("official_document_payload") or {}
+            total_candidates += int(payload.get("candidate_count") or 0)
+            total_inspected += len(payload.get("inspected") or [])
+
+        supabase.table("locked_evidence_worker_runs").update({
+            "resolved_tasks": resolved,
+            "waiting_tasks": waiting,
+            "failed_tasks": failed,
+            "worker_status": (
+                "FAILED"
+                if final == "FAILED"
+                else "COMPLETED"
+                if final == "COMPLETED"
+                else "WAITING"
+            ),
+            "diagnostic_status": (
+                "FAILED"
+                if final == "FAILED"
+                else "PARTIAL_FAILURE"
+                if final == "PARTIAL_FAILURE"
+                else "CLEAN"
+            ),
+            "official_documents_checked": total_inspected,
+            "official_sources_found": len(v78_docs),
+            "official_tasks_resolved": resolved,
+            "official_tasks_waiting": waiting,
+            "deep_resolution_version": "v7.8",
+            "provenance_summary": {
+                "stored_documents": len(v78_docs),
+                "documents_inspected": total_inspected,
+                "evidence_candidates": total_candidates,
+                "reference_chains": len(v78_reference_map),
+                "resolved": resolved,
+                "waiting": waiting,
+                "failed": failed,
+            },
+            "completed_at": now_iso() if final in {"COMPLETED", "FAILED"} else None,
+            "updated_at": now_iso(),
+        }).eq("id", run_id).eq("user_id", user_id).execute()
+
+        st.success(
+            f"Stage 45 v7.8: {final} — "
+            f"Resolved {resolved}, Waiting {waiting}, Failed {failed}, "
+            f"Candidates {total_candidates}."
+        )
+
+        st.rerun()
+
+v78_runs = rows(
+    "locked_evidence_worker_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    50,
+)
+
+v78_runs = [
+    r
+    for r in v78_runs
+    if normalize_text(r.get("deep_resolution_version")).lower() == "v7.8"
+]
+
+if v78_runs:
+    latest_v78 = v78_runs[0]
+
+    st.subheader("Latest Stage 45 v7.8 Result")
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Status", latest_v78.get("worker_status") or "—")
+    a2.metric("Official resolved", latest_v78.get("official_tasks_resolved") or 0)
+    a3.metric("Official waiting", latest_v78.get("official_tasks_waiting") or 0)
+    a4.metric(
+        "Documents inspected",
+        (latest_v78.get("provenance_summary") or {}).get("documents_inspected", 0),
+    )
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Diagnostic status", latest_v78.get("diagnostic_status") or "—")
+    b2.metric("Error count", latest_v78.get("error_count") or 0)
+    b3.metric(
+        "Evidence candidates",
+        (latest_v78.get("provenance_summary") or {}).get("evidence_candidates", 0),
+    )
+    b4.metric(
+        "Reference chains",
+        (latest_v78.get("provenance_summary") or {}).get("reference_chains", 0),
+    )
+
+    latest_v78_items = rows(
+        "locked_evidence_worker_items",
+        {
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "worker_run_id": str(latest_v78.get("id")),
+        },
+        "created_at",
+        100,
+    )
+
+    if latest_v78_items:
+        st.subheader("Requirement evidence results")
+
+        st.dataframe(
+            [
+                {
+                    "Requirement": i.get("requirement_label"),
+                    "Status": i.get("worker_status"),
+                    "Exact topic": i.get("exact_topic_verified"),
+                    "Authoritative": i.get("authoritative_source_verified"),
+                    "Explicit evidence": i.get("explicit_evidence_verified"),
+                    "Evidence URL": i.get("evidence_url"),
+                    "Evidence excerpt": normalize_text(i.get("evidence_excerpt"))[:1200],
+                    "Reason": i.get("reason") or i.get("missing_evidence_reason"),
+                }
+                for i in latest_v78_items
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.subheader("Top extracted evidence candidates")
+
+        for item in latest_v78_items:
+            payload = item.get("official_document_payload") or {}
+            top_candidates = payload.get("top_candidates") or []
+
+            with st.expander(
+                f"{item.get('requirement_label') or 'Requirement'} — "
+                f"{item.get('worker_status') or '—'}",
+                expanded=False,
+            ):
+                if not top_candidates:
+                    st.info("No content candidate was retained for this requirement.")
+                else:
+                    st.dataframe(
+                        [
+                            {
+                                "Score": c.get("score"),
+                                "Exact topic": c.get("exact_topic"),
+                                "By reference": c.get("applicable_by_reference"),
+                                "Type": c.get("document_type"),
+                                "Source": c.get("source_url"),
+                                "Chunk": c.get("chunk_index"),
+                                "Strong hits": ", ".join(c.get("strong_hits") or []),
+                                "Excerpt": normalize_text(c.get("excerpt"))[:1800],
+                            }
+                            for c in top_candidates[:12]
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+st.caption(
+    "v7.8 invariant: content extraction and semantic matching are not sufficient by themselves. "
+    "COMPLETED requires an explicit authoritative passage plus exact-topic applicability "
+    "or a traceable exact-topic → official-rule reference chain."
+)
+# =====================================================================
+# END STAGE 45 v7.8
 # =====================================================================
