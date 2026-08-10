@@ -162,13 +162,62 @@ opportunities = []
 source_table = None
 
 for table in candidate_tables:
-    data = rows(table, {"user_id": user_id}, "created_at", 500)
+    data = rows(table, {"user_id": user_id}, "updated_at", 500)
     if data:
         opportunities = data
         source_table = table
         break
 
 # Fallback: derive unique opportunity identities already used by projects/workflow.
+# Prefer the clean opportunity set produced by the latest successful Etapa 34 run.
+latest_refresh_runs = rows(
+    "opportunity_refresh_runs",
+    {"user_id": user_id},
+    "created_at",
+    100,
+)
+
+if project_id:
+    latest_refresh_runs = [
+        r for r in latest_refresh_runs
+        if str(r.get("project_id") or "") == project_id
+    ]
+
+latest_refresh_run = next(
+    (
+        r for r in latest_refresh_runs
+        if str(r.get("run_status") or "") == "Completed"
+        and int(r.get("saved_opportunities") or 0) > 0
+    ),
+    None,
+)
+
+latest_refresh_identities = set()
+if latest_refresh_run:
+    refresh_items = rows(
+        "opportunity_refresh_items",
+        {
+            "user_id": user_id,
+            "refresh_run_id": latest_refresh_run["id"],
+        },
+        "created_at",
+        1000,
+    )
+    latest_refresh_identities = {
+        str(r.get("opportunity_identity") or "").strip()
+        for r in refresh_items
+        if str(r.get("refresh_status") or "") in ("Candidate", "Saved")
+        and str(r.get("opportunity_identity") or "").strip()
+    }
+
+    if latest_refresh_identities and opportunities:
+        by_identity = {}
+        for row in opportunities:
+            identity = str(row.get("identity") or "").strip()
+            if identity in latest_refresh_identities and identity not in by_identity:
+                by_identity[identity] = row
+        opportunities = list(by_identity.values())
+
 if not opportunities:
     seen = set()
     fallback_tables = (
@@ -209,6 +258,11 @@ if not opportunities:
 
 st.write(f"**Sursă oportunități:** {source_table}")
 st.write(f"**Oportunități găsite:** {len(opportunities)}")
+if latest_refresh_run and latest_refresh_identities:
+    st.success(
+        f"Set activ din Etapa 34: {len(opportunities)} oportunități curate "
+        f"(refresh {str(latest_refresh_run.get('id'))[:8]})."
+    )
 
 
 # ---------------------------------------------------------------------
@@ -442,9 +496,14 @@ def classify(row: dict):
         deadline_verified = deadline is not None
         status_verified = True
 
-    elif deadline and deadline >= today and any(x in status_l for x in ("open", "active", "accepting")):
+    elif deadline and deadline >= today and any(
+        x in status_l
+        for x in ("open", "active", "accepting", "deschis", "forthcoming", "upcoming")
+    ):
         validity = "VALID"
-        reason = "Deadline-ul este în viitor și statusul stocat indică un apel deschis."
+        reason = (
+            "Deadline-ul este în viitor și statusul stocat indică un apel deschis/activ."
+        )
         confidence = "Medium"
         eligible = True
         deadline_verified = True
@@ -619,11 +678,23 @@ if st.button(
 st.divider()
 st.subheader("Latest Guard Results")
 
+guard_run_filters = {"user_id": user_id}
+if project_id:
+    guard_run_filters["project_id"] = project_id
+
+latest_guard_runs = rows(
+    "opportunity_engine_guard_runs",
+    guard_run_filters,
+    "created_at",
+    20,
+)
+latest_guard_run = latest_guard_runs[0] if latest_guard_runs else None
+
 saved_checks = rows(
     "opportunity_engine_validity_checks",
     {"user_id": user_id},
     "created_at",
-    500,
+    1000,
 )
 
 if project_id:
@@ -632,13 +703,14 @@ if project_id:
         if str(r.get("project_id") or "") == project_id
     ]
 
-latest_by_identity = {}
-for row in saved_checks:
-    identity = str(row.get("opportunity_identity") or "")
-    if identity and identity not in latest_by_identity:
-        latest_by_identity[identity] = row
+if latest_guard_run:
+    latest_run_id = str(latest_guard_run.get("id") or "")
+    saved_checks = [
+        r for r in saved_checks
+        if str((r.get("metadata") or {}).get("guard_run_id") or "") == latest_run_id
+    ]
 
-if latest_by_identity:
+if saved_checks:
     st.dataframe(
         [
             {
@@ -651,13 +723,13 @@ if latest_by_identity:
                 "Confidence": r.get("confidence"),
                 "Reason": r.get("verification_reason"),
             }
-            for r in latest_by_identity.values()
+            for r in saved_checks
         ],
         use_container_width=True,
         hide_index=True,
     )
 else:
-    st.caption("Nu există încă rezultate salvate.")
+    st.caption("Nu există încă rezultate pentru cel mai recent Guard run.")
 
 
 # ---------------------------------------------------------------------
