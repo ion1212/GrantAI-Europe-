@@ -3874,3 +3874,563 @@ st.caption(
 # =====================================================================
 # END STAGE 45 v7.6
 # =====================================================================
+
+
+
+# =====================================================================
+# STAGE 45 v7.7 — AUTHORITATIVE EVIDENCE EXTRACTOR
+# =====================================================================
+
+def s45v77_normalize_url(url):
+    return normalize_text(url).split("#", 1)[0].rstrip("/")
+
+def s45v77_score_document(doc):
+    """
+    Rank already-discovered official documents for the exact locked topic.
+    This is ranking only; it never creates factual evidence.
+    """
+    score = 0
+    url = normalize_text(doc.get("source_url"))
+    title = normalize_text(doc.get("source_title"))
+    excerpt = normalize_text(doc.get("evidence_excerpt"))
+    doc_type = normalize_text(doc.get("document_type"))
+    authority = normalize_text(doc.get("source_authority")).upper()
+
+    hay = " ".join([url, title, excerpt, doc_type])
+
+    if s45v7_exact_topic(hay):
+        score += 100
+    if authority == "EUROPEAN_COMMISSION":
+        score += 25
+    if "funding-tenders" in url.lower():
+        score += 25
+    if "work programme" in hay.lower():
+        score += 15
+    if "general annex" in hay.lower() or "general annexes" in hay.lower():
+        score += 12
+    if doc.get("evidence_found"):
+        score += 10
+    if doc.get("applicability_verified"):
+        score += 15
+    if doc.get("exact_topic_verified"):
+        score += 20
+    if normalize_text(doc.get("retrieval_status")).upper() == "VERIFIED":
+        score += 20
+
+    return score
+
+def s45v77_load_documents():
+    docs = rows(
+        "locked_evidence_official_documents",
+        {
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+        },
+        "created_at",
+        5000,
+    )
+
+    # Deduplicate by source URL while retaining strongest row.
+    best = {}
+    for d in docs:
+        url = s45v77_normalize_url(d.get("source_url"))
+        if not url:
+            continue
+        score = s45v77_score_document(d)
+        current = best.get(url)
+        if current is None or score > current["_score"]:
+            clone = dict(d)
+            clone["_score"] = score
+            best[url] = clone
+
+    out = list(best.values())
+    out.sort(key=lambda x: (x["_score"], x.get("created_at") or ""), reverse=True)
+    return out
+
+def s45v77_requirement_needles(task):
+    family = s45v7_requirement_family(task)
+    return s45v7_needles(family)
+
+def s45v77_fetch_document_for_extraction(doc):
+    url = normalize_text(doc.get("source_url"))
+    if not url:
+        return {"ok": False, "url": "", "text": "", "json": None, "reason": "missing_url"}
+
+    fetched = s45v7_fetch_any(url, timeout=35)
+    if not fetched.get("ok"):
+        return {
+            "ok": False,
+            "url": url,
+            "text": "",
+            "json": None,
+            "reason": "transport_failed",
+            "attempts": fetched.get("attempts", []),
+        }
+
+    return {
+        "ok": True,
+        "url": fetched.get("url") or url,
+        "text": fetched.get("text") or "",
+        "json": fetched.get("json"),
+        "attempts": fetched.get("attempts", []),
+    }
+
+def s45v77_extract_from_document(doc, task):
+    fetched = s45v77_fetch_document_for_extraction(doc)
+
+    source_url = fetched.get("url") or normalize_text(doc.get("source_url"))
+    candidates = []
+
+    # Stored excerpt first.
+    stored_excerpt = normalize_text(doc.get("evidence_excerpt"))
+    if stored_excerpt:
+        stored = s45v7_extract_explicit(stored_excerpt, task, source_url)
+        for c in stored:
+            c["origin"] = "stored_excerpt"
+        candidates.extend(stored)
+
+    # Fresh source content.
+    if fetched.get("ok"):
+        source_obj = fetched.get("json") if fetched.get("json") is not None else fetched.get("text", "")
+        fresh = s45v7_extract_explicit(source_obj, task, source_url)
+        for c in fresh:
+            c["origin"] = "fresh_fetch"
+        candidates.extend(fresh)
+
+    # Remove duplicates.
+    dedup = []
+    seen = set()
+    for c in candidates:
+        key = (
+            s45v77_normalize_url(c.get("url")),
+            normalize_text(c.get("reference")),
+            normalize_text(c.get("excerpt"))[:1500],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(c)
+
+    return {
+        "document": doc,
+        "fetch": fetched,
+        "candidates": dedup[:20],
+    }
+
+def s45v77_candidate_is_authoritative(candidate, doc):
+    url = normalize_text(candidate.get("url") or doc.get("source_url"))
+    host = urlparse(url).netloc.lower()
+
+    official_host = (
+        host.endswith("europa.eu")
+        or host.endswith("ec.europa.eu")
+        or host.endswith("funding-tenders.ec.europa.eu")
+    )
+
+    exact_topic = (
+        candidate.get("exact_topic")
+        or s45v7_exact_topic(candidate.get("excerpt"))
+        or s45v7_exact_topic(url)
+        or bool(doc.get("exact_topic_verified"))
+    )
+
+    authority = normalize_text(doc.get("source_authority")).upper()
+    authoritative = official_host and authority in {"EUROPEAN_COMMISSION", ""}
+
+    return authoritative, exact_topic
+
+def s45v77_build_evidence_packet(task, ranked_docs):
+    packet = []
+    inspected = []
+
+    for doc in ranked_docs[:40]:
+        result = s45v77_extract_from_document(doc, task)
+        inspected.append({
+            "source_url": doc.get("source_url"),
+            "score": doc.get("_score"),
+            "candidate_count": len(result.get("candidates") or []),
+            "fetch_ok": bool(result.get("fetch", {}).get("ok")),
+        })
+
+        for candidate in result.get("candidates") or []:
+            authoritative, exact_topic = s45v77_candidate_is_authoritative(candidate, doc)
+
+            if not authoritative:
+                continue
+
+            packet.append({
+                "source_url": candidate.get("url") or doc.get("source_url"),
+                "source_title": doc.get("source_title"),
+                "document_type": doc.get("document_type"),
+                "reference": candidate.get("reference"),
+                "excerpt": candidate.get("excerpt"),
+                "exact_topic": bool(exact_topic),
+                "authoritative": True,
+                "origin": candidate.get("origin"),
+                "document_score": doc.get("_score"),
+                "document_id": doc.get("id"),
+            })
+
+        if len(packet) >= 25:
+            break
+
+    # Prefer exact-topic candidates, but keep authoritative generic candidates
+    # for evaluator context; generic text alone still cannot complete.
+    packet.sort(
+        key=lambda x: (
+            1 if x.get("exact_topic") else 0,
+            x.get("document_score") or 0,
+        ),
+        reverse=True,
+    )
+
+    return packet[:25], inspected
+
+def s45v77_evaluate_packet(task, packet):
+    exact_packet = [p for p in packet if p.get("exact_topic")]
+
+    if not exact_packet:
+        return {
+            "status": "WAITING_OFFICIAL",
+            "reason": "No exact-topic authoritative evidence candidate was found.",
+            "exact_candidates": 0,
+        }
+
+    official_blob = "\n\n".join(
+        (
+            f"[SOURCE {p.get('source_url')} | TITLE {p.get('source_title')} | "
+            f"TYPE {p.get('document_type')} | REF {p.get('reference')}]\n"
+            f"{p.get('excerpt')}"
+        )
+        for p in exact_packet[:12]
+    )
+
+    evaluation = ai_evaluate(
+        task,
+        collect_snapshot_evidence(task, sources),
+        official_blob,
+        exact_packet[0].get("source_url") or official_url,
+    )
+
+    return {
+        "status": evaluation.get("status"),
+        "evaluation": evaluation,
+        "exact_candidates": len(exact_packet),
+        "used_candidates": exact_packet[:12],
+    }
+
+def s45v77_run_task(task, worker_run_id, ranked_docs):
+    item_insert = (
+        supabase.table("locked_evidence_worker_items")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "worker_run_id": worker_run_id,
+            "execution_task_id": task["id"],
+            "requirement_id": task.get("requirement_id"),
+            "opportunity_identity": identity,
+            "requirement_key": task.get("requirement_key"),
+            "requirement_category": task.get("requirement_category"),
+            "requirement_label": task.get("requirement_label"),
+            "route_type": task.get("route_type"),
+            "destination_module": task.get("destination_module"),
+            "worker_action": "AUTHORITATIVE_EVIDENCE_EXTRACTION",
+            "worker_status": "WAITING_OFFICIAL",
+            "topic_identity": identity,
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+            "official_document_status": "SEARCHING",
+            "metadata": {"stage": 45, "version": "v7.7"},
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not item_insert:
+        raise RuntimeError("Could not create v7.7 worker item.")
+
+    worker_item_id = str(item_insert[0]["id"])
+
+    packet, inspected = s45v77_build_evidence_packet(task, ranked_docs)
+    evaluation_wrap = s45v77_evaluate_packet(task, packet)
+
+    if evaluation_wrap.get("status") == "RESOLVED":
+        evaluation = evaluation_wrap.get("evaluation") or {}
+        used = evaluation_wrap.get("used_candidates") or []
+        best = used[0] if used else {}
+
+        worker_result = {
+            "resolved_value": evaluation.get("resolved_value") or {},
+            "evidence_source": "OFFICIAL_DOCUMENTATION",
+            "evidence_reference": evaluation.get("evidence_reference") or best.get("reference") or task.get("requirement_label"),
+            "evidence_url": evaluation.get("evidence_url") or best.get("source_url"),
+            "evidence_excerpt": evaluation.get("evidence_excerpt") or normalize_text(best.get("excerpt"))[:5000],
+            "confidence": evaluation.get("confidence") or "High",
+            "reason": evaluation.get("reason") or "Explicit authoritative evidence verified by v7.7.",
+        }
+
+        update_execution_task_completed(task, worker_result, "VERIFIED")
+
+        supabase.table("locked_evidence_worker_items").update({
+            "worker_status": "RESOLVED",
+            "resolved_value": worker_result["resolved_value"],
+            "evidence_source": worker_result["evidence_source"],
+            "evidence_reference": worker_result["evidence_reference"],
+            "evidence_url": worker_result["evidence_url"],
+            "evidence_excerpt": worker_result["evidence_excerpt"],
+            "confidence": worker_result["confidence"],
+            "official_verified": True,
+            "reason": worker_result["reason"],
+            "next_action": "RETURN_TO_STAGE_44",
+            "documents_checked": inspected,
+            "searches_attempted": [],
+            "transport_attempts": [],
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+            "retrieved_at": now_iso(),
+            "exact_topic_verified": True,
+            "authoritative_source_verified": True,
+            "explicit_evidence_verified": True,
+            "official_document_status": "VERIFIED",
+            "official_document_payload": {
+                "version": "v7.7",
+                "inspected": inspected,
+                "evidence_packet": packet,
+                "evaluation": evaluation,
+            },
+            "resolved_at": now_iso(),
+            "updated_at": now_iso(),
+        }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+        return "RESOLVED"
+
+    supabase.table("locked_evidence_worker_items").update({
+        "worker_status": "WAITING_OFFICIAL",
+        "documents_checked": inspected,
+        "searches_attempted": [],
+        "transport_attempts": [],
+        "missing_evidence_reason": (
+            "Authoritative documents were ranked and inspected, but no explicit exact-topic "
+            "evidence was sufficient to resolve this requirement."
+        ),
+        "next_action": "Remain WAITING_OFFICIAL; review ranked documents and extracted evidence packet.",
+        "resolution_method": "OFFICIAL_DOCUMENTATION",
+        "retrieved_at": now_iso(),
+        "authoritative_source_verified": bool(packet),
+        "exact_topic_verified": any(p.get("exact_topic") for p in packet),
+        "explicit_evidence_verified": False,
+        "official_document_status": "WAITING_OFFICIAL",
+        "official_document_payload": {
+            "version": "v7.7",
+            "inspected": inspected,
+            "evidence_packet": packet,
+            "evaluation": evaluation_wrap,
+        },
+        "updated_at": now_iso(),
+    }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+    return "WAITING_OFFICIAL"
+
+
+st.divider()
+st.subheader("Stage 45 v7.7 — Authoritative Evidence Extractor")
+st.info(
+    "v7.7 nu mai repară transportul. Procesează documentele oficiale deja descoperite, "
+    "le clasează după relevanță și caută pasaje explicite pentru cele 3 cerințe OFFICIAL."
+)
+
+v77_docs = s45v77_load_documents()
+
+d77a, d77b, d77c = st.columns(3)
+d77a.metric("Stored official rows", len(v77_docs))
+d77b.metric("Exact-topic ranked docs", sum(1 for d in v77_docs if s45v7_exact_topic(
+    " ".join([
+        normalize_text(d.get("source_url")),
+        normalize_text(d.get("source_title")),
+        normalize_text(d.get("evidence_excerpt")),
+    ])
+)))
+d77c.metric("Verified document rows", sum(
+    1 for d in v77_docs
+    if normalize_text(d.get("retrieval_status")).upper() == "VERIFIED"
+))
+
+with st.expander("Top authoritative document ranking", expanded=False):
+    st.dataframe(
+        [
+            {
+                "Score": d.get("_score"),
+                "Exact topic": bool(d.get("exact_topic_verified")) or s45v7_exact_topic(
+                    " ".join([
+                        normalize_text(d.get("source_url")),
+                        normalize_text(d.get("source_title")),
+                        normalize_text(d.get("evidence_excerpt")),
+                    ])
+                ),
+                "Authority": d.get("source_authority"),
+                "Status": d.get("retrieval_status"),
+                "Type": d.get("document_type"),
+                "Title": d.get("source_title"),
+                "URL": d.get("source_url"),
+                "Evidence": normalize_text(d.get("evidence_excerpt"))[:1200],
+            }
+            for d in v77_docs[:60]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+v77_tasks = [
+    t for t in current_tasks
+    if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION"
+    and normalize_text(t.get("task_status")).upper() != "COMPLETED"
+]
+
+if v77_tasks and st.button(
+    "📚 Run Stage 45 v7.7 authoritative evidence extraction",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v77_run",
+):
+    run = (
+        supabase.table("locked_evidence_worker_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "total_tasks": len(v77_tasks),
+            "worker_status": "RUNNING",
+            "deep_resolution_version": "v7.7",
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "diagnostics": [],
+            "started_at": now_iso(),
+            "summary": {
+                "stage": 45,
+                "version": "v7.7",
+                "stored_document_count": len(v77_docs),
+            },
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not run:
+        st.error("Nu am putut crea Stage 45 v7.7 run.")
+    else:
+        run_id = str(run[0]["id"])
+        resolved = waiting = failed = 0
+        bar = st.progress(0)
+
+        for idx, task in enumerate(v77_tasks, 1):
+            try:
+                state = s45v77_run_task(task, run_id, v77_docs)
+                if normalize_text(state).upper() == "RESOLVED":
+                    resolved += 1
+                else:
+                    waiting += 1
+
+            except Exception as exc:
+                failed += 1
+                diagnostic = s45v71_log_error(
+                    task=task,
+                    worker_run_id=run_id,
+                    worker_item_id=None,
+                    error_stage="V77_TASK_EXECUTION",
+                    exc=exc,
+                    error_url=None,
+                    request_payload={
+                        "identity": identity,
+                        "requirement": task.get("requirement_label"),
+                    },
+                    diagnostic_payload={
+                        "stage": 45,
+                        "version": "v7.7",
+                        "function": "s45v77_run_task",
+                    },
+                )
+                s45v71_update_run_diagnostics(run_id, task, diagnostic)
+                st.error(
+                    f"{task.get('requirement_label')} — "
+                    f"{diagnostic['error_type']}: {diagnostic['error_message']}"
+                )
+
+            bar.progress(idx / len(v77_tasks))
+
+        final = (
+            "FAILED" if failed and resolved == 0 and waiting == 0
+            else "PARTIAL_FAILURE" if failed
+            else "COMPLETED" if resolved == len(v77_tasks)
+            else "WAITING"
+        )
+
+        supabase.table("locked_evidence_worker_runs").update({
+            "resolved_tasks": resolved,
+            "waiting_tasks": waiting,
+            "failed_tasks": failed,
+            "worker_status": "FAILED" if final == "FAILED" else ("COMPLETED" if final == "COMPLETED" else "WAITING"),
+            "diagnostic_status": (
+                "FAILED" if final == "FAILED"
+                else "PARTIAL_FAILURE" if final == "PARTIAL_FAILURE"
+                else "CLEAN"
+            ),
+            "official_documents_checked": len(v77_docs),
+            "official_sources_found": len(v77_docs),
+            "official_tasks_resolved": resolved,
+            "official_tasks_waiting": waiting,
+            "deep_resolution_version": "v7.7",
+            "provenance_summary": {
+                "stored_documents": len(v77_docs),
+                "resolved": resolved,
+                "waiting": waiting,
+                "failed": failed,
+            },
+            "completed_at": now_iso() if final in {"COMPLETED", "FAILED"} else None,
+            "updated_at": now_iso(),
+        }).eq("id", run_id).eq("user_id", user_id).execute()
+
+        st.success(
+            f"Stage 45 v7.7: {final} — Resolved {resolved}, Waiting {waiting}, Failed {failed}."
+        )
+        st.rerun()
+
+v77_runs = rows(
+    "locked_evidence_worker_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    50,
+)
+
+v77_runs = [
+    r for r in v77_runs
+    if normalize_text(r.get("deep_resolution_version")).lower() == "v7.7"
+]
+
+if v77_runs:
+    latest_v77 = v77_runs[0]
+
+    st.subheader("Latest Stage 45 v7.7 Result")
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Status", latest_v77.get("worker_status") or "—")
+    q2.metric("Official resolved", latest_v77.get("official_tasks_resolved") or 0)
+    q3.metric("Official waiting", latest_v77.get("official_tasks_waiting") or 0)
+    q4.metric("Documents ranked", latest_v77.get("official_documents_checked") or 0)
+
+    q5, q6 = st.columns(2)
+    q5.metric("Diagnostic status", latest_v77.get("diagnostic_status") or "—")
+    q6.metric("Error count", latest_v77.get("error_count") or 0)
+
+st.caption(
+    "v7.7 invariant: document ranking is not evidence. COMPLETED requires an explicit "
+    "authoritative passage applicable to the exact locked topic and requirement."
+)
+# =====================================================================
+# END STAGE 45 v7.7
+# =====================================================================
