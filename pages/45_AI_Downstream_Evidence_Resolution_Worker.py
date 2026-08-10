@@ -1481,7 +1481,7 @@ def s45v7_resolve_task(task, worker_run_id):
             "worker_action": "OFFICIAL_TOPIC_AWARE_DEEP_RESOLUTION",
             "worker_status": "WAITING_OFFICIAL",
             "topic_identity": identity,
-            "resolution_method": "OFFICIAL_TOPIC_AWARE_DOCUMENTATION",
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
             "official_document_status": "SEARCHING",
             "metadata": {"stage": 45, "version": "v7"},
             "updated_at": now_iso(),
@@ -1594,7 +1594,7 @@ def s45v7_resolve_task(task, worker_run_id):
                 "documents_checked": list(visited),
                 "searches_attempted": s45v7_search_urls(),
                 "transport_attempts": trace,
-                "resolution_method": "OFFICIAL_TOPIC_AWARE_DOCUMENTATION",
+                "resolution_method": "OFFICIAL_DOCUMENTATION",
                 "retrieved_at": now_iso(),
                 "exact_topic_verified": True,
                 "authoritative_source_verified": True,
@@ -1621,7 +1621,7 @@ def s45v7_resolve_task(task, worker_run_id):
         "transport_attempts": trace,
         "missing_evidence_reason": reason,
         "next_action": "Keep WAITING_OFFICIAL; do not infer a missing call condition.",
-        "resolution_method": "OFFICIAL_TOPIC_AWARE_DOCUMENTATION",
+        "resolution_method": "OFFICIAL_DOCUMENTATION",
         "retrieved_at": now_iso(),
         "authoritative_source_verified": bool(evidence),
         "exact_topic_verified": bool(exact_evidence),
@@ -1674,7 +1674,7 @@ def s45v72_log_result_failure(
         "requirement_label": task.get("requirement_label"),
         "route_type": task.get("route_type"),
         "destination_module": task.get("destination_module"),
-        "deep_resolution_version": "v7.2",
+        "deep_resolution_version": "v7.3",
         "error_stage": error_stage,
         "error_type": "RESULT_FAILED",
         "error_message": message[:12000],
@@ -1689,7 +1689,7 @@ def s45v72_log_result_failure(
         "response_payload": s45v71_safe_json(result_payload),
         "diagnostic_payload": {
             "stage": 45,
-            "version": "v7.2",
+            "version": "v7.3",
             "result_status": result_status,
             "function": "s45v7_resolve_task",
         },
@@ -1748,7 +1748,7 @@ def s45v71_log_error(
         "requirement_label": task.get("requirement_label"),
         "route_type": task.get("route_type"),
         "destination_module": task.get("destination_module"),
-        "deep_resolution_version": "v7.2",
+        "deep_resolution_version": "v7.3",
         "error_stage": error_stage,
         "error_type": error_type,
         "error_message": error_message,
@@ -1887,7 +1887,7 @@ if v7_tasks and st.button(
             "diagnostic_status": "CLEAN",
             "error_count": 0,
             "diagnostics": [],
-            "summary": {"stage": 45, "version": "v7.2"},
+            "summary": {"stage": 45, "version": "v7.3"},
             "updated_at": now_iso(),
         })
         .execute()
@@ -1948,7 +1948,7 @@ if v7_tasks and st.button(
                     },
                     diagnostic_payload={
                         "stage": 45,
-                        "version": "v7.2",
+                        "version": "v7.3",
                         "function": "s45v7_resolve_task",
                     },
                 )
@@ -2021,7 +2021,7 @@ v7_runs = [
 
 if v7_runs:
     latest_v7 = v7_runs[0]
-    st.subheader("Latest Stage 45 v7.2 Result")
+    st.subheader("Latest Stage 45 v7.3 Result")
     y1, y2, y3, y4 = st.columns(4)
     y1.metric("Status", latest_v7.get("worker_status") or "—")
     y2.metric("Official resolved", latest_v7.get("official_tasks_resolved") or 0)
@@ -2050,7 +2050,7 @@ st.caption(
 
 
 st.divider()
-st.subheader("Stage 45 v7.2 — Persistent Error Diagnostics")
+st.subheader("Stage 45 v7.3 — Persistent Error Diagnostics")
 
 diagnostic_errors = s45v71_latest_errors(30)
 
@@ -2092,6 +2092,6 @@ else:
     st.success("Nu există încă erori persistente pentru lock-ul curent.")
 
 st.caption(
-    "v7.2 persistă atât excepțiile Python, cât și rezultatele terminale/neașteptate ale resolverului. "
+    "v7.3 păstrează diagnosticul persistent și folosește resolution_method canonic OFFICIAL_DOCUMENTATION. "
     "Doar persistă excepțiile pentru diagnostic și reparare controlată."
 )
