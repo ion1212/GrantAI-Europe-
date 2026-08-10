@@ -439,6 +439,127 @@ def fetch_official_records(identity: str, title: str, limit: int = 10):
     }, " | ".join(source_urls)
 
 
+
+def fetch_official_topic_page(identity: str):
+    """
+    Fallback to the official Funding & Tenders topic-details page.
+
+    Safety rule:
+    HTTP 200 alone is NOT proof that a topic exists because the Portal is an SPA.
+    Identity is confirmed only when the exact expected topic code is present in
+    the returned official page content.
+    """
+    code = (identity or "").strip()
+    if not code:
+        return None
+
+    encoded = urllib.parse.quote(code.lower(), safe="-_")
+    url = (
+        "https://ec.europa.eu/info/funding-tenders/opportunities/portal/"
+        f"screen/opportunities/topic-details/{encoded}"
+    )
+
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-GB,en;q=0.9",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+            final_url = resp.geturl()
+            http_status = getattr(resp, "status", 200)
+    except (urllib.error.HTTPError, urllib.error.URLError):
+        return None
+
+    # Normalize visible/raw HTML for deterministic exact-code confirmation.
+    decoded = urllib.parse.unquote(html)
+    expected = normalize_topic_code(code)
+    body_upper = normalize_topic_code(decoded)
+
+    identity_match = bool(expected and expected in body_upper)
+
+    if not identity_match:
+        return {
+            "identity": "",
+            "title": "",
+            "deadline": "",
+            "status": "",
+            "programme": "",
+            "description": "",
+            "action_type": "",
+            "topic_conditions": None,
+            "raw": {
+                "fallback_url": final_url,
+                "http_status": http_status,
+                "identity_present_in_page": False,
+            },
+            "_fallback_verified": False,
+            "_fallback_url": final_url,
+        }
+
+    # Extract conservative metadata only when explicitly present in the official HTML.
+    plain = re.sub(r"<script\b[^>]*>.*?</script>", " ", decoded, flags=re.I | re.S)
+    plain = re.sub(r"<style\b[^>]*>.*?</style>", " ", plain, flags=re.I | re.S)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    plain = re.sub(r"\s+", " ", plain).strip()
+
+    deadline = ""
+    date_patterns = [
+        r"(?:deadline|submission deadline|closing date)[^0-9]{0,80}"
+        r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})",
+        r"(?:deadline|submission deadline|closing date)[^0-9]{0,80}"
+        r"(\d{4}-\d{2}-\d{2})",
+        r"(?:deadline|submission deadline|closing date)[^A-Za-z0-9]{0,80}"
+        r"(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|"
+        r"September|October|November|December)\s+\d{4})",
+    ]
+    for pat in date_patterns:
+        m = re.search(pat, plain, flags=re.I)
+        if m:
+            deadline = m.group(1)
+            break
+
+    status = ""
+    for label in ("Open for submission", "Forthcoming", "Closed", "Expired", "Open"):
+        if re.search(r"\b" + re.escape(label) + r"\b", plain, flags=re.I):
+            status = label
+            break
+
+    title = ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", decoded, flags=re.I | re.S)
+    if title_match:
+        title = re.sub(r"\s+", " ", title_match.group(1)).strip()
+
+    return {
+        "identity": code,
+        "title": title,
+        "deadline": deadline,
+        "status": status,
+        "programme": "",
+        "description": "",
+        "action_type": "",
+        "topic_conditions": None,
+        "raw": {
+            "fallback_url": final_url,
+            "http_status": http_status,
+            "identity_present_in_page": True,
+            "page_excerpt": plain[:8000],
+        },
+        "_fallback_verified": True,
+        "_fallback_url": final_url,
+    }
+
+
+
 def walk(obj):
     if isinstance(obj, dict):
         yield obj
@@ -741,6 +862,20 @@ def verify_candidate(scoring_result: dict):
         identity,
     )
 
+    source_title = "EU Funding & Tenders Portal SEARCH API"
+    source_url = api_url
+
+    # v4 fallback: if SEARCH API cannot prove the exact identity, inspect the
+    # official topic-details page. HTTP 200 is not enough; the exact code must
+    # occur in the returned official page content.
+    if deterministic_identity_status != "MATCH":
+        fallback_record = fetch_official_topic_page(identity)
+        if fallback_record and fallback_record.get("_fallback_verified"):
+            record = fallback_record
+            deterministic_identity_status = "MATCH"
+            source_title = "EU Funding & Tenders Portal topic-details"
+            source_url = fallback_record.get("_fallback_url") or source_url
+
     if not record:
         return {
             "official_identity": "",
@@ -863,9 +998,9 @@ def verify_candidate(scoring_result: dict):
         confidence = "Low"
     result["confidence"] = confidence
 
-    # The API URL is the source reference for this verification run.
-    result["official_source_title"] = "EU Funding & Tenders Portal SEARCH API"
-    result["official_source_url"] = api_url
+    # Preserve the official source actually used for deterministic verification.
+    result["official_source_title"] = source_title
+    result["official_source_url"] = source_url
 
     if not result.get("official_source_reference"):
         result["official_source_reference"] = identity
@@ -1046,7 +1181,7 @@ if st.button(
                     "stage": 36,
                     "source_scoring_run_id": scoring_run_id,
                     "candidate_limit": len(candidates),
-                    "source": "EU Funding & Tenders Portal SEARCH API",
+                    "source": "EU Funding & Tenders Portal SEARCH API + topic-details fallback",
                 },
                 "completed_at": now_iso(),
                 "updated_at": now_iso(),
@@ -1280,6 +1415,6 @@ with st.expander("Istoric Etapa 36"):
 
 st.caption(
     "Etapa 36 nu înlocuiește analiza completă a documentației apelului. "
-    "Ea confirmă identitatea/statusul/deadline-ul din sursa oficială disponibilă și "
+    "Ea confirmă identitatea/statusul/deadline-ul din sursele oficiale disponibile și "
     "blochează selectarea automată când cerințele critice nu sunt încă verificate."
 )
