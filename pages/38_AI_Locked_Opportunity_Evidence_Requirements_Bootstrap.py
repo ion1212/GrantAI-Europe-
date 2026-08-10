@@ -171,28 +171,75 @@ workflow_allowed = bool(lock.get("workflow_allowed"))
 
 # Matching READY handoff is mandatory.
 try:
+    # V2: citește toate handoff-urile aferente ACELUIAȘI lock/proiect.
+    # Nu relaxăm identitatea lock-ului; tolerăm doar variații de denumire/status.
     handoffs = rows(
         "selected_opportunity_handoffs",
         {
             "user_id": user_id,
             "project_id": project_id,
             "opportunity_lock_id": lock_id,
-            "destination_module": DESTINATION_MODULE,
-            "handoff_status": "READY",
         },
         "created_at",
-        20,
+        100,
     )
 except Exception as exc:
-    st.error(f"Nu pot citi handoff-ul Etapei 37: {exc}")
+    st.error(f"Nu pot citi handoff-urile Etapei 37: {exc}")
     st.stop()
 
-handoff = handoffs[0] if handoffs else None
+def norm_module(value):
+    return " ".join(
+        normalize_text(value).lower()
+        .replace("_", " ")
+        .replace("-", " ")
+        .split()
+    )
+
+target_module = norm_module(DESTINATION_MODULE)
+accepted_statuses = {"READY", "CREATED", "PENDING", "AVAILABLE"}
+
+handoff = None
+
+# 1. Preferință strictă: destinația exactă + READY.
+for h in handoffs:
+    if (
+        norm_module(h.get("destination_module")) == target_module
+        and normalize_text(h.get("handoff_status")).upper() == "READY"
+    ):
+        handoff = h
+        break
+
+# 2. Compatibilitate cu Etapa 37: aceeași destinație, status neconsumat.
+if handoff is None:
+    for h in handoffs:
+        if (
+            norm_module(h.get("destination_module")) == target_module
+            and normalize_text(h.get("handoff_status")).upper() in accepted_statuses
+        ):
+            handoff = h
+            break
+
+# 3. Unele versiuni ale Etapei 37 au salvat numele modulului în payload.
+if handoff is None:
+    for h in handoffs:
+        payload = as_dict(h.get("payload"))
+        candidates = [
+            h.get("destination_module"),
+            h.get("module_name"),
+            payload.get("destination_module"),
+            payload.get("module"),
+            payload.get("target_module"),
+        ]
+        if any(norm_module(x) == target_module for x in candidates):
+            status = normalize_text(h.get("handoff_status")).upper()
+            if status not in {"CONSUMED", "CANCELLED", "SUPERSEDED", "BLOCKED"}:
+                handoff = h
+                break
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Lock", normalize_text(lock.get("lock_status")) or "—")
 c2.metric("Workflow", "ALLOWED" if workflow_allowed else "BLOCKED")
-c3.metric("Handoff", "READY" if handoff else "MISSING")
+c3.metric("Handoff", (normalize_text(handoff.get("handoff_status")).upper() or "FOUND") if handoff else "MISSING")
 c4.metric("Deadline", str(deadline or "—")[:10])
 
 st.write(f"**Locked opportunity:** {identity or '—'}")
@@ -216,7 +263,7 @@ if not hard_gate_ok:
     if not identity:
         reasons.append("identity lipsește")
     if not handoff:
-        reasons.append(f"lipsește handoff READY către {DESTINATION_MODULE}")
+        reasons.append(f"lipsește un handoff neconsumat către {DESTINATION_MODULE} pentru același lock")
     if not future_deadline(deadline):
         reasons.append("deadline-ul oficial lipsește sau nu mai este viitor")
     st.error("Etapa 38 este BLOCKED: " + "; ".join(reasons) + ".")
@@ -472,7 +519,9 @@ if st.button(
             supabase.table("selected_opportunity_handoffs").update({
                 "handoff_status": "CONSUMED",
                 "updated_at": now_iso(),
-            }).eq("id", handoff["id"]).eq("user_id", user_id).execute()
+            }).eq("id", handoff["id"]).eq("user_id", user_id).eq(
+                "project_id", project_id
+            ).eq("opportunity_lock_id", lock_id).execute()
 
         st.success(
             "Etapa 38 a creat registrul canonic de requirements/evidence. "
