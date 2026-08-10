@@ -3302,3 +3302,575 @@ st.caption(
 # =====================================================================
 # END STAGE 45 v7.5
 # =====================================================================
+
+
+
+# =====================================================================
+# STAGE 45 v7.6 — TRANSPORT RESOLVER + EXPLICIT NETWORK FAILURE DIAGNOSTICS
+# =====================================================================
+
+def s45v76_transport_probe(url, timeout=20):
+    """
+    Low-level transport probe.
+    Distinguishes:
+      - DNS / connection / SSL / timeout exceptions
+      - HTTP non-2xx responses
+      - empty-body responses
+      - successful responses
+    Never treats transport failure as 'zero search results'.
+    """
+    record = {
+        "url": url,
+        "ok": False,
+        "http_status": None,
+        "content_type": "",
+        "response_bytes": 0,
+        "final_url": url,
+        "transport_error_type": "",
+        "transport_error_message": "",
+        "body_preview": "",
+    }
+
+    try:
+        r = requests.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={
+                "User-Agent": "GreenRise/Stage45-v7.6",
+                "Accept": "application/json,text/html,text/plain,*/*",
+                "Accept-Language": "en-GB,en;q=0.9",
+                "Connection": "close",
+            },
+        )
+
+        record["http_status"] = r.status_code
+        record["content_type"] = normalize_text(r.headers.get("content-type", ""))
+        record["response_bytes"] = len(r.content or b"")
+        record["final_url"] = normalize_text(getattr(r, "url", "")) or url
+        record["body_preview"] = normalize_text(r.text)[:4000]
+        record["ok"] = bool(r.ok and (r.text or "").strip())
+
+        if not r.ok:
+            record["transport_error_type"] = "HTTP_ERROR"
+            record["transport_error_message"] = f"HTTP {r.status_code}"
+
+        elif not (r.text or "").strip():
+            record["transport_error_type"] = "EMPTY_RESPONSE"
+            record["transport_error_message"] = "HTTP response body is empty."
+
+        return record
+
+    except requests.exceptions.Timeout as exc:
+        record["transport_error_type"] = "TIMEOUT"
+        record["transport_error_message"] = str(exc)
+    except requests.exceptions.SSLError as exc:
+        record["transport_error_type"] = "SSL_ERROR"
+        record["transport_error_message"] = str(exc)
+    except requests.exceptions.ConnectionError as exc:
+        msg = str(exc)
+        record["transport_error_type"] = (
+            "DNS_OR_CONNECTION_ERROR"
+            if any(x in msg.lower() for x in ("name resolution", "nodename", "dns", "failed to resolve"))
+            else "CONNECTION_ERROR"
+        )
+        record["transport_error_message"] = msg
+    except Exception as exc:
+        record["transport_error_type"] = type(exc).__name__
+        record["transport_error_message"] = str(exc)
+
+    return record
+
+def s45v76_candidate_transport_urls():
+    urls = []
+    for u in s45v7_search_urls():
+        if u and u not in urls:
+            urls.append(u)
+
+    # Alternative official EC entry points / exact-topic search variants.
+    topic = normalize_text(identity)
+    if topic:
+        q = quote_plus(topic)
+        extras = [
+            f"https://funding-tenders.ec.europa.eu/portal/screen/opportunities/topic-details/{topic.lower()}",
+            f"https://commission.europa.eu/search_en?query={q}",
+            f"https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/topic-search?keywords={q}",
+        ]
+        for u in extras:
+            if u not in urls:
+                urls.append(u)
+
+    for u in s45v3_urls(official_url):
+        if u and u not in urls:
+            urls.append(u)
+
+    return urls[:12]
+
+def s45v76_run_transport_matrix():
+    return [s45v76_transport_probe(u) for u in s45v76_candidate_transport_urls()]
+
+def s45v76_transport_summary(records):
+    return [
+        {
+            "URL": r.get("url"),
+            "OK": r.get("ok"),
+            "HTTP": r.get("http_status"),
+            "Bytes": r.get("response_bytes"),
+            "Content-Type": r.get("content_type"),
+            "Error type": r.get("transport_error_type"),
+            "Error message": r.get("transport_error_message"),
+            "Final URL": r.get("final_url"),
+        }
+        for r in records
+    ]
+
+def s45v76_usable_transport_urls(records):
+    return [
+        r.get("final_url") or r.get("url")
+        for r in records
+        if r.get("ok") and (r.get("final_url") or r.get("url"))
+    ]
+
+def s45v76_run_task(task, worker_run_id, transport_records):
+    item_insert = (
+        supabase.table("locked_evidence_worker_items")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "worker_run_id": worker_run_id,
+            "execution_task_id": task["id"],
+            "requirement_id": task.get("requirement_id"),
+            "opportunity_identity": identity,
+            "requirement_key": task.get("requirement_key"),
+            "requirement_category": task.get("requirement_category"),
+            "requirement_label": task.get("requirement_label"),
+            "route_type": task.get("route_type"),
+            "destination_module": task.get("destination_module"),
+            "worker_action": "TRANSPORT_RESOLVER_OFFICIAL_DOCUMENTATION",
+            "worker_status": "WAITING_OFFICIAL",
+            "topic_identity": identity,
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+            "official_document_status": "SEARCHING",
+            "metadata": {"stage": 45, "version": "v7.6"},
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not item_insert:
+        raise RuntimeError("Could not create v7.6 worker item.")
+
+    worker_item_id = str(item_insert[0]["id"])
+
+    usable_urls = s45v76_usable_transport_urls(transport_records)
+
+    if not usable_urls:
+        supabase.table("locked_evidence_worker_items").update({
+            "worker_status": "WAITING_OFFICIAL",
+            "documents_checked": [],
+            "searches_attempted": s45v76_candidate_transport_urls(),
+            "transport_attempts": transport_records,
+            "missing_evidence_reason": (
+                "No official endpoint returned a usable HTTP response. "
+                "This is a transport failure, not evidence that the requirement is absent."
+            ),
+            "next_action": "Resolve network/endpoint access before official-document evaluation.",
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+            "retrieved_at": now_iso(),
+            "authoritative_source_verified": False,
+            "exact_topic_verified": False,
+            "explicit_evidence_verified": False,
+            "official_document_status": "WAITING_OFFICIAL",
+            "official_document_payload": {
+                "version": "v7.6",
+                "transport_only": True,
+                "transport_records": transport_records,
+            },
+            "updated_at": now_iso(),
+        }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+        return "WAITING_OFFICIAL"
+
+    evidence = []
+    visited = set()
+    trace = []
+
+    queue = list(usable_urls)
+
+    while queue and len(visited) < 40:
+        url = queue.pop(0)
+        if not url or url in visited:
+            continue
+        visited.add(url)
+
+        fetched = s45v3_fetch(url, timeout=35)
+        trace.extend(fetched.get("attempts", []))
+        if not fetched.get("ok"):
+            continue
+
+        response = fetched.get("response")
+        payload = None
+        if response is not None:
+            try:
+                payload = response.json()
+            except Exception:
+                pass
+
+        source_obj = payload if payload is not None else fetched.get("text", "")
+        fetched_url = normalize_text(fetched.get("url")) or url
+
+        local_evidence = s45v7_extract_explicit(source_obj, task, fetched_url)
+        evidence.extend(local_evidence)
+
+        best_excerpt = local_evidence[0]["excerpt"] if local_evidence else ""
+        s45v6_save_document(
+            task,
+            worker_run_id,
+            worker_item_id,
+            fetched_url,
+            best_excerpt,
+            status="FETCHED",
+            payload={
+                "version": "v7.6",
+                "transport_resolved": True,
+                "payload_type": type(payload).__name__ if payload is not None else "text",
+                "evidence_candidates": len(local_evidence),
+            },
+        )
+
+        next_urls = []
+        if payload is not None:
+            next_urls.extend(s45v75_extract_candidate_urls_from_payload(payload))
+        else:
+            body = fetched.get("text", "")
+            for u in re.findall(r'https?://[^\s|<>"\']+', body):
+                host = urlparse(u).netloc.lower()
+                if host.endswith("europa.eu") or host.endswith("ec.europa.eu"):
+                    next_urls.append(u.rstrip(".,;)"))
+
+        for u in next_urls:
+            if u and u not in visited and u not in queue:
+                queue.append(u)
+
+        if len(evidence) >= 20:
+            break
+
+    exact_evidence = [
+        e for e in evidence
+        if e.get("exact_topic")
+        or s45v7_exact_topic(e.get("url"))
+        or s45v7_exact_topic(e.get("excerpt"))
+    ]
+
+    if exact_evidence:
+        official_blob = "\n\n".join(
+            f"[SOURCE {e.get('url')} | REF {e.get('reference')}]\n{e.get('excerpt')}"
+            for e in exact_evidence[:12]
+        )
+
+        evaluation = ai_evaluate(
+            task,
+            collect_snapshot_evidence(task, sources),
+            official_blob,
+            exact_evidence[0].get("url") or official_url,
+        )
+
+        if evaluation.get("status") == "RESOLVED":
+            worker_result = {
+                "resolved_value": evaluation.get("resolved_value") or {},
+                "evidence_source": "OFFICIAL_DOCUMENTATION",
+                "evidence_reference": evaluation.get("evidence_reference") or exact_evidence[0].get("reference") or task.get("requirement_label"),
+                "evidence_url": evaluation.get("evidence_url") or exact_evidence[0].get("url"),
+                "evidence_excerpt": evaluation.get("evidence_excerpt") or exact_evidence[0].get("excerpt", "")[:5000],
+                "confidence": evaluation.get("confidence") or "High",
+                "reason": evaluation.get("reason") or "Explicit official evidence verified by v7.6.",
+            }
+
+            update_execution_task_completed(task, worker_result, "VERIFIED")
+
+            supabase.table("locked_evidence_worker_items").update({
+                "worker_status": "RESOLVED",
+                "resolved_value": worker_result["resolved_value"],
+                "evidence_source": worker_result["evidence_source"],
+                "evidence_reference": worker_result["evidence_reference"],
+                "evidence_url": worker_result["evidence_url"],
+                "evidence_excerpt": worker_result["evidence_excerpt"],
+                "confidence": worker_result["confidence"],
+                "official_verified": True,
+                "reason": worker_result["reason"],
+                "next_action": "RETURN_TO_STAGE_44",
+                "documents_checked": list(visited),
+                "searches_attempted": s45v76_candidate_transport_urls(),
+                "transport_attempts": transport_records + trace,
+                "resolution_method": "OFFICIAL_DOCUMENTATION",
+                "retrieved_at": now_iso(),
+                "exact_topic_verified": True,
+                "authoritative_source_verified": True,
+                "explicit_evidence_verified": True,
+                "official_document_status": "VERIFIED",
+                "official_document_payload": {
+                    "version": "v7.6",
+                    "transport_records": transport_records,
+                    "evidence_candidates": exact_evidence[:12],
+                    "evaluation": evaluation,
+                },
+                "resolved_at": now_iso(),
+                "updated_at": now_iso(),
+            }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+            return "RESOLVED"
+
+    supabase.table("locked_evidence_worker_items").update({
+        "worker_status": "WAITING_OFFICIAL",
+        "documents_checked": list(visited),
+        "searches_attempted": s45v76_candidate_transport_urls(),
+        "transport_attempts": transport_records + trace,
+        "missing_evidence_reason": (
+            "Transport succeeded for at least one official endpoint, but no explicit "
+            "exact-topic evidence was sufficient to resolve this requirement."
+        ),
+        "next_action": "Remain WAITING_OFFICIAL and review fetched official resources.",
+        "resolution_method": "OFFICIAL_DOCUMENTATION",
+        "retrieved_at": now_iso(),
+        "authoritative_source_verified": bool(evidence),
+        "exact_topic_verified": bool(exact_evidence),
+        "explicit_evidence_verified": False,
+        "official_document_status": "WAITING_OFFICIAL",
+        "official_document_payload": {
+            "version": "v7.6",
+            "transport_records": transport_records,
+            "visited_count": len(visited),
+            "candidate_count": len(evidence),
+            "exact_candidate_count": len(exact_evidence),
+        },
+        "updated_at": now_iso(),
+    }).eq("id", worker_item_id).eq("user_id", user_id).execute()
+
+    return "WAITING_OFFICIAL"
+
+
+st.divider()
+st.subheader("Stage 45 v7.6 — Transport Resolver")
+st.info(
+    "v7.6 separă explicit transportul de verificarea factuală. "
+    "HTTP None / 0 bytes nu mai este tratat ca zero rezultate."
+)
+
+v76_transport_records = s45v76_run_transport_matrix()
+
+st.subheader("Transport diagnostics")
+st.dataframe(
+    s45v76_transport_summary(v76_transport_records),
+    use_container_width=True,
+    hide_index=True,
+)
+
+with st.expander("Transport response previews", expanded=False):
+    for idx, r in enumerate(v76_transport_records, 1):
+        st.markdown(f"### Transport probe {idx}")
+        st.write(f"**URL:** {r.get('url')}")
+        st.write(f"**Final URL:** {r.get('final_url')}")
+        st.write(f"**HTTP:** {r.get('http_status')}")
+        st.write(f"**OK:** {r.get('ok')}")
+        st.write(f"**Bytes:** {r.get('response_bytes')}")
+        st.write(f"**Content-Type:** {r.get('content_type') or '—'}")
+        st.write(f"**Transport error type:** {r.get('transport_error_type') or '—'}")
+        st.write(f"**Transport error message:** {r.get('transport_error_message') or '—'}")
+        st.code(r.get("body_preview") or "—", language="text")
+
+transport_failures = [r for r in v76_transport_records if not r.get("ok")]
+usable_transports = [r for r in v76_transport_records if r.get("ok")]
+
+m1, m2, m3 = st.columns(3)
+m1.metric("Transport probes", len(v76_transport_records))
+m2.metric("Usable responses", len(usable_transports))
+m3.metric("Transport failures", len(transport_failures))
+
+if transport_failures:
+    st.warning(
+        "Există probe de transport nereușite. Acestea sunt probleme de acces/endpoint, "
+        "nu dovadă că apelul sau cerința nu există."
+    )
+
+v76_tasks = [
+    t for t in current_tasks
+    if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION"
+    and normalize_text(t.get("task_status")).upper() != "COMPLETED"
+]
+
+if v76_tasks and st.button(
+    "🛰️ Run Stage 45 v7.6 transport + resolution",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v76_run",
+):
+    run = (
+        supabase.table("locked_evidence_worker_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "total_tasks": len(v76_tasks),
+            "worker_status": "RUNNING",
+            "deep_resolution_version": "v7.6",
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "diagnostics": [],
+            "started_at": now_iso(),
+            "summary": {
+                "stage": 45,
+                "version": "v7.6",
+                "transport_probe_count": len(v76_transport_records),
+                "usable_transport_count": len(usable_transports),
+                "transport_failure_count": len(transport_failures),
+            },
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not run:
+        st.error("Nu am putut crea Stage 45 v7.6 run.")
+    else:
+        run_id = str(run[0]["id"])
+        resolved = waiting = failed = 0
+        bar = st.progress(0)
+
+        for idx, task in enumerate(v76_tasks, 1):
+            try:
+                state = s45v76_run_task(task, run_id, v76_transport_records)
+                if normalize_text(state).upper() == "RESOLVED":
+                    resolved += 1
+                else:
+                    waiting += 1
+
+            except Exception as exc:
+                failed += 1
+                diagnostic = s45v71_log_error(
+                    task=task,
+                    worker_run_id=run_id,
+                    worker_item_id=None,
+                    error_stage="V76_TASK_EXECUTION",
+                    exc=exc,
+                    error_url=official_url,
+                    request_payload={
+                        "identity": identity,
+                        "requirement": task.get("requirement_label"),
+                    },
+                    diagnostic_payload={
+                        "stage": 45,
+                        "version": "v7.6",
+                        "function": "s45v76_run_task",
+                    },
+                )
+                s45v71_update_run_diagnostics(run_id, task, diagnostic)
+                st.error(
+                    f"{task.get('requirement_label')} — "
+                    f"{diagnostic['error_type']}: {diagnostic['error_message']}"
+                )
+
+            bar.progress(idx / len(v76_tasks))
+
+        final = (
+            "FAILED" if failed and resolved == 0 and waiting == 0
+            else "PARTIAL_FAILURE" if failed
+            else "COMPLETED" if resolved == len(v76_tasks)
+            else "WAITING"
+        )
+
+        docs_saved = rows(
+            "locked_evidence_official_documents",
+            {
+                "user_id": user_id,
+                "project_id": project_id,
+                "opportunity_lock_id": lock_id,
+                "worker_run_id": run_id,
+            },
+            "created_at",
+            5000,
+        )
+
+        diag_status = (
+            "FAILED" if final == "FAILED"
+            else "PARTIAL_FAILURE" if final == "PARTIAL_FAILURE"
+            else "WARNING" if transport_failures and not usable_transports
+            else "CLEAN"
+        )
+
+        supabase.table("locked_evidence_worker_runs").update({
+            "resolved_tasks": resolved,
+            "waiting_tasks": waiting,
+            "failed_tasks": failed,
+            "worker_status": "FAILED" if final == "FAILED" else ("COMPLETED" if final == "COMPLETED" else "WAITING"),
+            "diagnostic_status": diag_status,
+            "official_documents_checked": len(docs_saved),
+            "official_sources_found": len(docs_saved),
+            "official_tasks_resolved": resolved,
+            "official_tasks_waiting": waiting,
+            "deep_resolution_version": "v7.6",
+            "provenance_summary": {
+                "documents_saved": len(docs_saved),
+                "resolved": resolved,
+                "waiting": waiting,
+                "failed": failed,
+                "transport_probes": len(v76_transport_records),
+                "usable_transports": len(usable_transports),
+                "transport_failures": len(transport_failures),
+                "transport_error_types": [
+                    r.get("transport_error_type")
+                    for r in transport_failures
+                    if r.get("transport_error_type")
+                ],
+            },
+            "completed_at": now_iso() if final in {"COMPLETED", "FAILED"} else None,
+            "updated_at": now_iso(),
+        }).eq("id", run_id).eq("user_id", user_id).execute()
+
+        st.success(
+            f"Stage 45 v7.6: {final} — Resolved {resolved}, Waiting {waiting}, "
+            f"Failed {failed}, Documents {len(docs_saved)}."
+        )
+        st.rerun()
+
+v76_runs = rows(
+    "locked_evidence_worker_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    50,
+)
+
+v76_runs = [
+    r for r in v76_runs
+    if normalize_text(r.get("deep_resolution_version")).lower() == "v7.6"
+]
+
+if v76_runs:
+    latest_v76 = v76_runs[0]
+
+    st.subheader("Latest Stage 45 v7.6 Result")
+    n1, n2, n3, n4 = st.columns(4)
+    n1.metric("Status", latest_v76.get("worker_status") or "—")
+    n2.metric("Official resolved", latest_v76.get("official_tasks_resolved") or 0)
+    n3.metric("Official waiting", latest_v76.get("official_tasks_waiting") or 0)
+    n4.metric("Documents", latest_v76.get("official_documents_checked") or 0)
+
+    nn1, nn2, nn3 = st.columns(3)
+    nn1.metric("Diagnostic status", latest_v76.get("diagnostic_status") or "—")
+    nn2.metric("Transport usable", (latest_v76.get("provenance_summary") or {}).get("usable_transports", 0))
+    nn3.metric("Transport failures", (latest_v76.get("provenance_summary") or {}).get("transport_failures", 0))
+
+st.caption(
+    "v7.6 invariant: transport failure is never interpreted as factual absence. "
+    "COMPLETED still requires explicit authoritative evidence."
+)
+# =====================================================================
+# END STAGE 45 v7.6
+# =====================================================================
