@@ -569,9 +569,121 @@ completed_tasks = [
     if normalize_text(t.get("task_status")).upper() == "COMPLETED"
 ]
 
+# ===== Stage 45 v4 — Official Documentation Resolver =====
+# This layer does NOT fabricate completion. It discovers and inspects official EC
+# documentation references returned by the official Search API response.
+
+from urllib.parse import urljoin
+
+def s45v4_collect_official_documents(payload, base_url="https://ec.europa.eu/"):
+    """Recursively collect plausible official EC document/page URLs from JSON."""
+    found = []
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+        elif isinstance(obj, str):
+            for u in re.findall(r'https?://[^\s|<>"\']+', obj):
+                if any(host in u.lower() for host in (
+                    "ec.europa.eu", "europa.eu", "funding-tenders.ec.europa.eu"
+                )):
+                    u = u.rstrip(".,;)")
+                    if u not in found:
+                        found.append(u)
+    walk(payload)
+    return found
+
+def s45v4_keyword_evidence(text, requirement):
+    """Conservative evidence detector: returns excerpts, never an inferred verdict."""
+    if not text:
+        return []
+    groups = {
+        "applicant": ["eligible applicants", "eligible entities", "eligibility", "legal entities"],
+        "consortium": ["consortium", "beneficiaries", "independent legal entities", "minimum number"],
+        "trl": ["trl", "technology readiness level", "readiness level"],
+        "funding": ["funding rate", "funding rates", "reimbursement rate", "eligible costs"],
+        "geographic": ["eligible countries", "member states", "associated countries", "country eligibility"],
+    }
+    key = str(requirement or "").lower()
+    family = next((k for k in groups if k in key), key)
+    needles = groups.get(family, [])
+    clean = re.sub(r"\s+", " ", text)
+    low = clean.lower()
+    excerpts = []
+    for needle in needles:
+        start = 0
+        while True:
+            idx = low.find(needle, start)
+            if idx < 0:
+                break
+            a, b = max(0, idx-350), min(len(clean), idx+700)
+            excerpt = clean[a:b].strip()
+            if excerpt not in excerpts:
+                excerpts.append(excerpt)
+            start = idx + len(needle)
+            if len(excerpts) >= 5:
+                return excerpts
+    return excerpts
+
+def s45v4_resolve_official_source(raw_source, requirement):
+    """
+    1. Query each official source separately.
+    2. Inspect returned JSON/text.
+    3. Follow only official EC URLs discovered in the response.
+    4. Return traceable excerpts. Caller must decide COMPLETED only if the excerpt
+       explicitly proves the requirement.
+    """
+    trace = []
+    evidence = []
+    first = s45v3_fetch(raw_source)
+    trace.extend(first.get("attempts", []))
+    if not first.get("ok"):
+        return {"status": "WAITING_OFFICIAL", "trace": trace, "evidence": []}
+
+    response = first.get("response")
+    body = first.get("text", "")
+    evidence.extend([{"url": first.get("url"), "excerpt": x}
+                     for x in s45v4_keyword_evidence(body, requirement)])
+
+    docs = []
+    try:
+        payload = response.json()
+        docs = s45v4_collect_official_documents(payload)
+    except Exception:
+        payload = None
+
+    # Limit traversal deliberately: deterministic and safe.
+    for url in docs[:12]:
+        fetched = s45v3_fetch(url)
+        trace.extend(fetched.get("attempts", []))
+        if not fetched.get("ok"):
+            continue
+        for excerpt in s45v4_keyword_evidence(fetched.get("text", ""), requirement):
+            evidence.append({"url": fetched.get("url"), "excerpt": excerpt})
+        if len(evidence) >= 5:
+            break
+
+    return {
+        "status": "EVIDENCE_FOUND" if evidence else "WAITING_OFFICIAL",
+        "trace": trace,
+        "evidence": evidence[:5],
+        "discovered_official_urls": docs[:12],
+    }
+
+st.info(
+    "Stage 45 v5 — Official Documentation Resolver EXECUTION activ. "
+    "Search API este folosit pentru descoperirea documentației EC; "
+    "COMPLETED rămâne interzis fără dovadă explicită și trasabilă."
+)
+# ===== End Stage 45 v4 =====
+
+
 st.subheader("Task workspace")
 
-st.info("Stage 45 v3: official-source transport activ. URL-urile concatenate sunt încercate separat; verdictul rămâne WAITING fără dovadă explicită.")
+st.info("Stage 45 v5: Official Documentation Resolver este conectat la execuția OFFICIAL_VERIFICATION; verdictul rămâne WAITING fără dovadă explicită.")
 
 
 if completed_tasks:
@@ -634,12 +746,47 @@ for task in tasks:
                 use_container_width=True,
             ):
                 with st.spinner("Verific dovezile disponibile..."):
+                    # v5: OFFICIAL_VERIFICATION first uses the v4 documentation resolver.
+                    # Its traceable excerpts are fed into the existing conservative evaluator;
+                    # COMPLETED is still impossible unless ai_evaluate finds explicit evidence.
+                    v4_resolution = None
+                    v4_official_text = official_text
+                    v4_official_url = official_url
+
+                    if route == "OFFICIAL_VERIFICATION" and official_url:
+                        v4_resolution = s45v4_resolve_official_source(
+                            official_url,
+                            task.get("requirement_label") or task.get("requirement_key") or "",
+                        )
+                        if v4_resolution.get("evidence"):
+                            v4_official_text = "\n\n".join(
+                                e.get("excerpt", "")
+                                for e in v4_resolution["evidence"]
+                                if e.get("excerpt")
+                            )
+                            v4_official_url = next(
+                                (
+                                    e.get("url")
+                                    for e in v4_resolution["evidence"]
+                                    if e.get("url")
+                                ),
+                                official_url,
+                            )
+
                     result = ai_evaluate(
                         task,
                         snapshot_evidence,
-                        official_text if route == "OFFICIAL_VERIFICATION" else "",
-                        official_url if route == "OFFICIAL_VERIFICATION" else "",
+                        v4_official_text if route == "OFFICIAL_VERIFICATION" else "",
+                        v4_official_url if route == "OFFICIAL_VERIFICATION" else "",
                     )
+
+                    if v4_resolution is not None:
+                        result["v4_official_resolution"] = {
+                            "status": v4_resolution.get("status"),
+                            "trace": v4_resolution.get("trace", []),
+                            "discovered_official_urls": v4_resolution.get("discovered_official_urls", []),
+                            "evidence_count": len(v4_resolution.get("evidence", [])),
+                        }
 
                 if result["status"] == "RESOLVED":
                     update_execution_task_completed(
@@ -787,114 +934,3 @@ st.caption(
 )
 
 
-
-# ===== Stage 45 v4 — Official Documentation Resolver =====
-# This layer does NOT fabricate completion. It discovers and inspects official EC
-# documentation references returned by the official Search API response.
-
-from urllib.parse import urljoin
-
-def s45v4_collect_official_documents(payload, base_url="https://ec.europa.eu/"):
-    """Recursively collect plausible official EC document/page URLs from JSON."""
-    found = []
-    def walk(obj):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                walk(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                walk(v)
-        elif isinstance(obj, str):
-            for u in re.findall(r'https?://[^\s|<>"\']+', obj):
-                if any(host in u.lower() for host in (
-                    "ec.europa.eu", "europa.eu", "funding-tenders.ec.europa.eu"
-                )):
-                    u = u.rstrip(".,;)")
-                    if u not in found:
-                        found.append(u)
-    walk(payload)
-    return found
-
-def s45v4_keyword_evidence(text, requirement):
-    """Conservative evidence detector: returns excerpts, never an inferred verdict."""
-    if not text:
-        return []
-    groups = {
-        "applicant": ["eligible applicants", "eligible entities", "eligibility", "legal entities"],
-        "consortium": ["consortium", "beneficiaries", "independent legal entities", "minimum number"],
-        "trl": ["trl", "technology readiness level", "readiness level"],
-        "funding": ["funding rate", "funding rates", "reimbursement rate", "eligible costs"],
-        "geographic": ["eligible countries", "member states", "associated countries", "country eligibility"],
-    }
-    key = str(requirement or "").lower()
-    family = next((k for k in groups if k in key), key)
-    needles = groups.get(family, [])
-    clean = re.sub(r"\s+", " ", text)
-    low = clean.lower()
-    excerpts = []
-    for needle in needles:
-        start = 0
-        while True:
-            idx = low.find(needle, start)
-            if idx < 0:
-                break
-            a, b = max(0, idx-350), min(len(clean), idx+700)
-            excerpt = clean[a:b].strip()
-            if excerpt not in excerpts:
-                excerpts.append(excerpt)
-            start = idx + len(needle)
-            if len(excerpts) >= 5:
-                return excerpts
-    return excerpts
-
-def s45v4_resolve_official_source(raw_source, requirement):
-    """
-    1. Query each official source separately.
-    2. Inspect returned JSON/text.
-    3. Follow only official EC URLs discovered in the response.
-    4. Return traceable excerpts. Caller must decide COMPLETED only if the excerpt
-       explicitly proves the requirement.
-    """
-    trace = []
-    evidence = []
-    first = s45v3_fetch(raw_source)
-    trace.extend(first.get("attempts", []))
-    if not first.get("ok"):
-        return {"status": "WAITING_OFFICIAL", "trace": trace, "evidence": []}
-
-    response = first.get("response")
-    body = first.get("text", "")
-    evidence.extend([{"url": first.get("url"), "excerpt": x}
-                     for x in s45v4_keyword_evidence(body, requirement)])
-
-    docs = []
-    try:
-        payload = response.json()
-        docs = s45v4_collect_official_documents(payload)
-    except Exception:
-        payload = None
-
-    # Limit traversal deliberately: deterministic and safe.
-    for url in docs[:12]:
-        fetched = s45v3_fetch(url)
-        trace.extend(fetched.get("attempts", []))
-        if not fetched.get("ok"):
-            continue
-        for excerpt in s45v4_keyword_evidence(fetched.get("text", ""), requirement):
-            evidence.append({"url": fetched.get("url"), "excerpt": excerpt})
-        if len(evidence) >= 5:
-            break
-
-    return {
-        "status": "EVIDENCE_FOUND" if evidence else "WAITING_OFFICIAL",
-        "trace": trace,
-        "evidence": evidence[:5],
-        "discovered_official_urls": docs[:12],
-    }
-
-st.info(
-    "Stage 45 v4 — Official Documentation Resolver activ. "
-    "Search API este folosit pentru descoperirea documentației EC; "
-    "COMPLETED rămâne interzis fără dovadă explicită și trasabilă."
-)
-# ===== End Stage 45 v4 =====
