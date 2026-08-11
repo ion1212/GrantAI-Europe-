@@ -6,6 +6,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone, date
 from typing import Any
+from urllib.parse import urlparse
 
 import streamlit as st
 from openai import OpenAI
@@ -5752,7 +5753,7 @@ def s45v79_run_task(task, worker_run_id, graph, fetch_cache):
         "route_type": task.get("route_type"), "destination_module": task.get("destination_module"),
         "worker_action": "REFERENCE_CHAIN_EVIDENCE_RESOLUTION", "worker_status": "WAITING_OFFICIAL",
         "topic_identity": identity, "resolution_method": "OFFICIAL_DOCUMENTATION",
-        "official_document_status": "SEARCHING", "metadata": {"stage": 45, "version": "v7.9.1"},
+        "official_document_status": "SEARCHING", "metadata": {"stage": 45, "version": "v7.10"},
         "updated_at": now_iso(),
     }).execute()).data or []
     if not inserted:
@@ -5788,7 +5789,7 @@ def s45v79_run_task(task, worker_run_id, graph, fetch_cache):
             "authoritative_source_verified": True, "explicit_evidence_verified": True,
             "official_document_status": "VERIFIED",
             "provenance_chain": [c.get("reference_chain") for c in used[:12]],
-            "official_document_payload": {"version": "v7.9.1", "inspected": inspected, "candidate_count": len(candidates), "top_candidates": candidates[:12], "evaluation": ev},
+            "official_document_payload": {"version": "v7.10", "inspected": inspected, "candidate_count": len(candidates), "top_candidates": candidates[:12], "evaluation": ev},
             "resolved_at": now_iso(), "updated_at": now_iso(),
         }).eq("id", item_id).eq("user_id", user_id).execute()
         return "RESOLVED"
@@ -5802,16 +5803,239 @@ def s45v79_run_task(task, worker_run_id, graph, fetch_cache):
         "exact_topic_verified": any(c.get("exact_topic") for c in candidates),
         "explicit_evidence_verified": False, "official_document_status": "WAITING_OFFICIAL",
         "provenance_chain": [c.get("reference_chain") for c in candidates[:12]],
-        "official_document_payload": {"version": "v7.9.1", "inspected": inspected, "candidate_count": len(candidates), "top_candidates": candidates[:12], "evaluation": wrap},
+        "official_document_payload": {"version": "v7.10", "inspected": inspected, "candidate_count": len(candidates), "top_candidates": candidates[:12], "evaluation": wrap},
         "updated_at": now_iso(),
     }).eq("id", item_id).eq("user_id", user_id).execute()
-    return "WAITING_OFFICIAL"
+    return 
+# ============================================================
+# STAGE 45 v7.10 — TOPIC DOCUMENT & ANNEX RESOLVER
+# ============================================================
+# Adds a stricter evidence layer on top of the v7.9 reference graph:
+#   exact locked topic -> exact official topic document -> official annex /
+#   work programme / call document -> explicit requirement passage.
+#
+# IMPORTANT: this layer remains fail-closed. A source being authoritative is
+# not enough. COMPLETED requires exact-topic applicability + explicit evidence.
+
+S45V710_REQUIREMENT_TERMS = {
+    "APPLICANT_ELIGIBILITY": [
+        "eligible applicants", "eligible applicant", "eligibility conditions",
+        "eligible entities", "legal entities", "applicants must",
+        "beneficiaries must", "eligible for funding", "may apply",
+    ],
+    "CONSORTIUM_REQUIREMENTS": [
+        "consortium", "consortia", "minimum number", "at least three",
+        "independent legal entities", "beneficiaries", "participants",
+        "composition of the consortium", "consortium composition",
+    ],
+    "TRL_REQUIREMENTS": [
+        "technology readiness level", "technology readiness levels",
+        "trl", "starting trl", "target trl", "expected trl",
+        "activities are expected to start at", "reach trl",
+    ],
+}
+
+def s45v710_topic_tokens(topic_identity):
+    raw = normalize_text(topic_identity).upper()
+    if not raw:
+        return []
+    parts = [p for p in re.split(r"[^A-Z0-9]+", raw) if p]
+    return [p for p in parts if len(p) >= 2]
+
+def s45v710_exact_topic_match(text_value, topic_identity):
+    hay = normalize_text(text_value).upper()
+    topic = normalize_text(topic_identity).upper()
+    if not hay or not topic:
+        return False
+    if topic in hay:
+        return True
+    toks = s45v710_topic_tokens(topic)
+    # Require a strong identity match, not merely programme-level overlap.
+    significant = [t for t in toks if len(t) >= 3]
+    if not significant:
+        return False
+    hits = sum(1 for t in significant if t in hay)
+    return hits >= max(3, len(significant) - 1)
+
+def s45v710_document_kind(url, title="", content_type=""):
+    s = " ".join([
+        normalize_text(url).lower(),
+        normalize_text(title).lower(),
+        normalize_text(content_type).lower(),
+    ])
+    if ".pdf" in s or "application/pdf" in s:
+        return "PDF"
+    if "annex" in s:
+        return "ANNEX"
+    if "work programme" in s or "work-programme" in s or "work_programme" in s:
+        return "WORK_PROGRAMME"
+    if "topic" in s or "topic-details" in s or "topic_details" in s:
+        return "TOPIC_PAGE"
+    if "call" in s:
+        return "CALL_DOCUMENT"
+    return "OFFICIAL_DOCUMENT"
+
+def s45v710_official_ec_source(url):
+    host = urlparse(normalize_text(url)).netloc.lower()
+    return bool(
+        host == "ec.europa.eu"
+        or host.endswith(".ec.europa.eu")
+        or host == "commission.europa.eu"
+        or host.endswith(".commission.europa.eu")
+        or host == "funding-tenders.ec.europa.eu"
+        or host.endswith(".funding-tenders.ec.europa.eu")
+    )
+
+def s45v710_extract_requirement_passage(content, requirement_key, topic_identity):
+    body = normalize_text(content)
+    if not body:
+        return None
+
+    key = normalize_text(requirement_key).upper()
+    terms = S45V710_REQUIREMENT_TERMS.get(key, [])
+    lower = body.lower()
+
+    best = None
+    for term in terms:
+        start = 0
+        needle = term.lower()
+        while True:
+            idx = lower.find(needle, start)
+            if idx < 0:
+                break
+            left = max(0, idx - 900)
+            right = min(len(body), idx + len(term) + 1400)
+            excerpt = body[left:right].strip()
+
+            # Topic identity may be established by the root/chain rather than
+            # repeated in every annex paragraph. Score it when locally present.
+            exact_local = s45v710_exact_topic_match(excerpt, topic_identity)
+            score = 10 + (20 if exact_local else 0)
+            score += min(10, sum(1 for t in terms if t.lower() in excerpt.lower()))
+
+            candidate = {
+                "excerpt": excerpt[:5000],
+                "matched_term": term,
+                "local_exact_topic": exact_local,
+                "score": score,
+            }
+            if best is None or candidate["score"] > best["score"]:
+                best = candidate
+            start = idx + len(needle)
+
+    return best
+
+def s45v710_rank_topic_documents(rows, topic_identity):
+    ranked = []
+    for row in rows or []:
+        url = normalize_text(row.get("source_url"))
+        if not url or not s45v710_official_ec_source(url):
+            continue
+        title = normalize_text(row.get("source_title"))
+        payload = row.get("evidence_payload") or {}
+        content = " ".join([
+            title,
+            normalize_text(row.get("evidence_excerpt")),
+            normalize_text(payload.get("text") if isinstance(payload, dict) else ""),
+            normalize_text(payload.get("content") if isinstance(payload, dict) else ""),
+            url,
+        ])
+        exact = bool(row.get("exact_topic_verified")) or s45v710_exact_topic_match(content, topic_identity)
+        kind = s45v710_document_kind(url, title, normalize_text(row.get("content_type")))
+        score = 0
+        score += 100 if exact else 0
+        score += 25 if kind in {"TOPIC_PAGE", "PDF", "ANNEX", "WORK_PROGRAMME", "CALL_DOCUMENT"} else 0
+        score += 10 if bool(row.get("applicability_verified")) else 0
+        ranked.append({
+            **row,
+            "_v710_exact": exact,
+            "_v710_kind": kind,
+            "_v710_score": score,
+        })
+    ranked.sort(key=lambda x: x["_v710_score"], reverse=True)
+    return ranked
+
+def s45v710_resolve_from_documents(requirement_key, topic_identity, rows):
+    ranked = s45v710_rank_topic_documents(rows, topic_identity)
+    exact_roots = [r for r in ranked if r.get("_v710_exact")]
+
+    # No exact-topic root => cannot establish applicability.
+    if not exact_roots:
+        return {
+            "status": "WAITING_OFFICIAL",
+            "exact_topic_verified": False,
+            "authoritative_source_verified": bool(ranked),
+            "explicit_evidence_verified": False,
+            "evidence_url": None,
+            "evidence_excerpt": None,
+            "reason": "No exact official topic document was verified.",
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+        }
+
+    # Once an exact official root exists, inspect exact root and its stored
+    # official descendants/annexes. Never infer the substantive rule.
+    candidates = []
+    for row in ranked:
+        content_parts = [
+            normalize_text(row.get("source_title")),
+            normalize_text(row.get("evidence_excerpt")),
+        ]
+        payload = row.get("evidence_payload") or {}
+        if isinstance(payload, dict):
+            content_parts.extend([
+                normalize_text(payload.get("text")),
+                normalize_text(payload.get("content")),
+                normalize_text(payload.get("raw_text")),
+                normalize_text(payload.get("body")),
+            ])
+        content = "\n".join(p for p in content_parts if p)
+        passage = s45v710_extract_requirement_passage(content, requirement_key, topic_identity)
+        if not passage:
+            continue
+
+        # Applicability is accepted only when this is the exact root itself or
+        # the stored provenance chain traces it to an exact root.
+        chain = row.get("provenance_chain") or []
+        chain_text = json.dumps(chain, ensure_ascii=False) if chain else ""
+        traceable = bool(row.get("_v710_exact")) or s45v710_exact_topic_match(chain_text, topic_identity)
+        if not traceable:
+            continue
+
+        candidates.append((passage["score"], row, passage))
+
+    if not candidates:
+        return {
+            "status": "WAITING_OFFICIAL",
+            "exact_topic_verified": True,
+            "authoritative_source_verified": True,
+            "explicit_evidence_verified": False,
+            "evidence_url": None,
+            "evidence_excerpt": None,
+            "reason": "Exact official topic root verified, but no explicit authoritative passage was found for this requirement.",
+            "resolution_method": "OFFICIAL_DOCUMENTATION",
+        }
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, row, passage = candidates[0]
+    return {
+        "status": "RESOLVED",
+        "exact_topic_verified": True,
+        "authoritative_source_verified": True,
+        "explicit_evidence_verified": True,
+        "evidence_url": normalize_text(row.get("source_url")) or None,
+        "evidence_excerpt": passage["excerpt"],
+        "reason": f'Explicit authoritative passage matched via {row.get("_v710_kind")}: {passage["matched_term"]}.',
+        "resolution_method": "OFFICIAL_DOCUMENTATION",
+    }
+
+
+"WAITING_OFFICIAL"
 
 
 st.divider()
-st.subheader("Stage 45 v7.9.1 — Reference Chain Evidence Resolver")
+st.subheader("Stage 45 v7.10 — Topic Document & Annex Resolver")
 st.info(
-    "v7.9.1 folosește resolution_method canonic OFFICIAL_DOCUMENTATION și pornește de la documentul oficial al topicului blocat, urmărește recursiv referințele oficiale până la 3 niveluri, "
+    "v7.10 folosește resolution_method canonic OFFICIAL_DOCUMENTATION și pornește de la documentul oficial al topicului blocat, urmărește recursiv referințele oficiale până la 3 niveluri, "
     "extrage conținutul documentelor referite și caută pasajul explicit pentru fiecare cerință. Rămâne fail-closed."
 )
 
@@ -5820,7 +6044,7 @@ v79_graph, v79_fetch_cache = {}, {}
 try:
     v79_graph, v79_fetch_cache = s45v79_build_reference_graph(v79_docs, max_depth=3, max_nodes=80)
 except Exception as exc:
-    st.warning(f"v7.9 reference graph warning: {type(exc).__name__}: {str(exc)[:500]}")
+    st.warning(f"v7.10 topic document + annex graph warning: {type(exc).__name__}: {str(exc)[:500]}")
 
 v79_tasks = [t for t in current_tasks if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION" and normalize_text(t.get("task_status")).upper() != "COMPLETED"]
 
@@ -5830,18 +6054,18 @@ m2.metric("Reference graph nodes", len(v79_graph))
 m3.metric("Exact-topic roots", sum(1 for n in v79_graph.values() if n.get("depth") == 0))
 m4.metric("Max reference depth", max([int(n.get("depth") or 0) for n in v79_graph.values()] or [0]))
 
-with st.expander("v7.9 reference graph", expanded=False):
+with st.expander("v7.10 topic document + annex graph", expanded=False):
     if v79_graph:
         st.dataframe([{"Depth": n.get("depth"), "Root": n.get("root_url"), "Parent": n.get("parent_url"), "URL": n.get("url"), "Reason": n.get("reason")} for n in v79_graph.values()], use_container_width=True, hide_index=True)
     else:
         st.info("No authoritative reference graph is currently available.")
 
-if v79_tasks and st.button("🧬 Run Stage 45 v7.9.1 reference-chain resolution", type="primary", use_container_width=True, key="stage45_v79_run"):
+if v79_tasks and st.button("🧬 Run Stage 45 v7.10 reference-chain resolution", type="primary", use_container_width=True, key="stage45_v79_run"):
     run = (supabase.table("locked_evidence_worker_runs").insert({
         "user_id": user_id, "project_id": project_id, "opportunity_lock_id": lock_id,
         "execution_run_id": execution_run_id, "opportunity_identity": identity,
-        "total_tasks": len(v79_tasks), "worker_status": "RUNNING", "deep_resolution_version": "v7.9.1",
-        "started_at": now_iso(), "summary": {"stage": 45, "version": "v7.9.1", "reference_graph_nodes": len(v79_graph)},
+        "total_tasks": len(v79_tasks), "worker_status": "RUNNING", "deep_resolution_version": "v7.10",
+        "started_at": now_iso(), "summary": {"stage": 45, "version": "v7.10", "reference_graph_nodes": len(v79_graph)},
         "updated_at": now_iso(),
     }).execute()).data or []
     if not run:
@@ -5858,7 +6082,7 @@ if v79_tasks and st.button("🧬 Run Stage 45 v7.9.1 reference-chain resolution"
             except Exception as exc:
                 failed += 1
                 try:
-                    diagnostic = s45v71_log_error(task=task, worker_run_id=run_id, worker_item_id=None, error_stage="V79_TASK_EXECUTION", exc=exc, error_url=None, request_payload={"identity": identity, "requirement": task.get("requirement_label")}, diagnostic_payload={"stage": 45, "version": "v7.9.1", "function": "s45v79_run_task"})
+                    diagnostic = s45v71_log_error(task=task, worker_run_id=run_id, worker_item_id=None, error_stage="V79_TASK_EXECUTION", exc=exc, error_url=None, request_payload={"identity": identity, "requirement": task.get("requirement_label")}, diagnostic_payload={"stage": 45, "version": "v7.10", "function": "s45v79_run_task"})
                     s45v71_update_run_diagnostics(run_id, task, diagnostic)
                 except Exception:
                     pass
@@ -5874,7 +6098,7 @@ if v79_tasks and st.button("🧬 Run Stage 45 v7.9.1 reference-chain resolution"
             "worker_status": final, "diagnostic_status": "FAILED" if final == "FAILED" else "PARTIAL_FAILURE" if failed else "CLEAN",
             "official_documents_checked": total_inspected, "official_sources_found": len(v79_graph),
             "official_tasks_resolved": resolved, "official_tasks_waiting": waiting,
-            "deep_resolution_version": "v7.9.1",
+            "deep_resolution_version": "v7.10",
             "provenance_summary": {"reference_graph_nodes": len(v79_graph), "documents_inspected": total_inspected, "evidence_candidates": total_candidates, "resolved": resolved, "waiting": waiting, "failed": failed},
             "completed_at": now_iso() if final in {"COMPLETED", "FAILED"} else None, "updated_at": now_iso(),
         }).eq("id", run_id).eq("user_id", user_id).execute()
@@ -5882,10 +6106,10 @@ if v79_tasks and st.button("🧬 Run Stage 45 v7.9.1 reference-chain resolution"
         st.rerun()
 
 v79_runs = rows("locked_evidence_worker_runs", {"user_id": user_id, "project_id": project_id, "opportunity_lock_id": lock_id}, "created_at", 50)
-v79_runs = [r for r in v79_runs if normalize_text(r.get("deep_resolution_version")).lower() in {"v7.9", "v7.9.1"}]
+v79_runs = [r for r in v79_runs if normalize_text(r.get("deep_resolution_version")).lower() in {"v7.9", "v7.10"}]
 if v79_runs:
     latest = v79_runs[0]
-    st.subheader("Latest Stage 45 v7.9.1 Result")
+    st.subheader("Latest Stage 45 v7.10 Result")
     q1, q2, q3, q4 = st.columns(4)
     q1.metric("Status", latest.get("worker_status") or "—")
     q2.metric("Official resolved", latest.get("official_tasks_resolved") or 0)
@@ -5901,7 +6125,64 @@ if v79_runs:
             "Reason": i.get("reason") or i.get("missing_evidence_reason"),
         } for i in latest_items], use_container_width=True, hide_index=True)
 
-st.caption("v7.9 invariant: a reference chain establishes applicability, not the substantive rule itself. COMPLETED still requires an explicit authoritative passage that answers the locked requirement.")
+st.caption("v7.10 invariant: exact-topic identity plus a traceable official document chain establishes applicability; COMPLETED still requires an explicit authoritative passage. COMPLETED still requires an explicit authoritative passage that answers the locked requirement.")
 # =====================================================================
 # END STAGE 45 v7.9
 # =====================================================================
+
+
+# ============================================================
+# v7.10 TOPIC DOCUMENT + ANNEX DIAGNOSTICS
+# ============================================================
+try:
+    st.divider()
+    st.subheader("Stage 45 v7.10 — Topic Document & Annex Diagnostics")
+    st.caption(
+        "Verifică separat identitatea exactă a topicului și caută pasajele explicite "
+        "în documentele oficiale/annex-urile deja stocate. Acest panou este fail-closed."
+    )
+
+    _v710_docs = []
+    try:
+        _v710_q = (
+            supabase.table("locked_evidence_official_documents")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("project_id", project_id)
+            .eq("opportunity_lock_id", opportunity_lock_id)
+            .order("created_at", desc=True)
+            .limit(500)
+            .execute()
+        )
+        _v710_docs = _v710_q.data or []
+    except Exception as _v710_exc:
+        st.warning(f"v7.10 document diagnostic unavailable: {_v710_exc}")
+
+    _v710_ranked = s45v710_rank_topic_documents(_v710_docs, opportunity_identity)
+    _v710_exact = [d for d in _v710_ranked if d.get("_v710_exact")]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Official documents loaded", len(_v710_docs))
+    c2.metric("Exact-topic documents", len(_v710_exact))
+    c3.metric("Traceable official candidates", len(_v710_ranked))
+
+    _v710_rows = []
+    for _rk, _label in [
+        ("APPLICANT_ELIGIBILITY", "Applicant eligibility"),
+        ("CONSORTIUM_REQUIREMENTS", "Consortium requirements"),
+        ("TRL_REQUIREMENTS", "TRL requirements"),
+    ]:
+        _res = s45v710_resolve_from_documents(_rk, opportunity_identity, _v710_docs)
+        _v710_rows.append({
+            "Requirement": _label,
+            "Status": _res["status"],
+            "Exact topic": _res["exact_topic_verified"],
+            "Authoritative": _res["authoritative_source_verified"],
+            "Explicit evidence": _res["explicit_evidence_verified"],
+            "Evidence URL": _res["evidence_url"],
+            "Reason": _res["reason"],
+        })
+
+    st.dataframe(_v710_rows, use_container_width=True, hide_index=True)
+except Exception as _v710_ui_exc:
+    st.warning(f"Stage 45 v7.10 diagnostics could not be rendered: {_v710_ui_exc}")
