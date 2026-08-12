@@ -6106,7 +6106,7 @@ if v79_tasks and st.button("🧬 Run Stage 45 v7.10.1 reference-chain resolution
         st.rerun()
 
 v79_runs = rows("locked_evidence_worker_runs", {"user_id": user_id, "project_id": project_id, "opportunity_lock_id": lock_id}, "created_at", 50)
-v79_runs = [r for r in v79_runs if normalize_text(r.get("deep_resolution_version")).lower() in {"v7.9", "v7.10"}]
+v79_runs = [r for r in v79_runs if normalize_text(r.get("deep_resolution_version")).lower() in {"v7.9", "v7.10", "v7.10.1"}]
 if v79_runs:
     latest = v79_runs[0]
     st.subheader("Latest Stage 45 v7.10.1 Result")
@@ -6186,3 +6186,660 @@ try:
     st.dataframe(_v710_rows, use_container_width=True, hide_index=True)
 except Exception as _v710_ui_exc:
     st.warning(f"Stage 45 v7.10 diagnostics could not be rendered: {_v710_ui_exc}")
+
+
+
+# =====================================================================
+# STAGE 45 v7.10.2 — EVIDENCE PROVENANCE & FALSE-POSITIVE GUARD
+# =====================================================================
+# Goals:
+#   1) Reject CAS/login/auth/error pages as evidence.
+#   2) Validate the final URL after redirects.
+#   3) Require an official EC/EU final host.
+#   4) Require the cited excerpt to exist in freshly fetched source content.
+#   5) Require exact-topic applicability OR a traceable exact-topic provenance chain.
+#   6) Persist SHA-256 fingerprints for source content and excerpt.
+#   7) Keep fail-closed semantics: no verified provenance => WAITING_OFFICIAL.
+#
+# IMPORTANT:
+#   This layer does not trust an earlier RESOLVED flag by itself.
+#   It revalidates substantive evidence independently.
+
+import hashlib
+
+
+def s45v7102_sha256_text(value):
+    data = normalize_text(value).encode("utf-8", errors="ignore")
+    return hashlib.sha256(data).hexdigest() if data else None
+
+
+def s45v7102_normalize_body(value):
+    return re.sub(r"\s+", " ", normalize_text(value)).strip()
+
+
+def s45v7102_is_auth_or_error_url(url):
+    url_l = normalize_text(url).lower()
+    if not url_l:
+        return True
+
+    bad_markers = (
+        "/cas/",
+        "/login",
+        "/signin",
+        "/sign-in",
+        "/auth",
+        "/oauth",
+        "/sso",
+        "authentication",
+        "access-denied",
+        "access_denied",
+        "error",
+        "logout",
+    )
+    return any(marker in url_l for marker in bad_markers)
+
+
+def s45v7102_is_auth_or_error_content(text, title=""):
+    corpus = " ".join([normalize_text(title), normalize_text(text)]).lower()
+
+    bad_phrases = (
+        "central authentication service",
+        "sign in",
+        "log in",
+        "login",
+        "authentication required",
+        "access denied",
+        "you must authenticate",
+        "session expired",
+        "single sign-on",
+        "single sign on",
+        "an error occurred",
+        "page not found",
+        "404 not found",
+        "403 forbidden",
+    )
+
+    # Require at least one strong auth/error signal.
+    return any(p in corpus for p in bad_phrases)
+
+
+def s45v7102_official_final_url(url):
+    host = urlparse(normalize_text(url)).netloc.lower()
+
+    return bool(
+        host == "ec.europa.eu"
+        or host.endswith(".ec.europa.eu")
+        or host == "commission.europa.eu"
+        or host.endswith(".commission.europa.eu")
+        or host == "funding-tenders.ec.europa.eu"
+        or host.endswith(".funding-tenders.ec.europa.eu")
+        or host == "europa.eu"
+        or host.endswith(".europa.eu")
+    )
+
+
+def s45v7102_fetch_for_verification(url, timeout=45):
+    result = {
+        "ok": False,
+        "requested_url": normalize_text(url),
+        "final_url": normalize_text(url),
+        "status": None,
+        "content_type": "",
+        "text": "",
+        "content_kind": "UNKNOWN",
+        "error": "",
+        "redirected": False,
+    }
+
+    try:
+        r = requests.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={
+                "User-Agent": "GreenRise/Stage45-v7.10.2",
+                "Accept": "application/pdf,application/json,text/html,text/plain,*/*",
+                "Accept-Language": "en-GB,en;q=0.9",
+                "Connection": "close",
+            },
+        )
+
+        result["status"] = r.status_code
+        result["final_url"] = normalize_text(getattr(r, "url", "")) or normalize_text(url)
+        result["redirected"] = (
+            s45v77_normalize_url(result["final_url"])
+            != s45v77_normalize_url(url)
+        )
+        result["content_type"] = normalize_text(r.headers.get("content-type", ""))
+
+        raw = {
+            "ok": bool(r.ok and (r.content or b"")),
+            "url": result["final_url"],
+            "final_url": result["final_url"],
+            "status": r.status_code,
+            "content_type": result["content_type"],
+            "content": r.content or b"",
+            "text": "",
+            "error": "" if r.ok else f"HTTP {r.status_code}",
+        }
+
+        try:
+            raw["text"] = r.text or ""
+        except Exception:
+            raw["text"] = ""
+
+        extracted_text, content_kind = s45v78_extract_document_text(raw)
+        result["text"] = extracted_text or raw["text"] or ""
+        result["content_kind"] = content_kind
+        result["ok"] = bool(r.ok and result["text"].strip())
+
+        if not r.ok:
+            result["error"] = f"HTTP {r.status_code}"
+
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {str(exc)}"
+
+    return result
+
+
+def s45v7102_excerpt_in_source(excerpt, source_text):
+    excerpt_n = s45v7102_normalize_body(excerpt).lower()
+    source_n = s45v7102_normalize_body(source_text).lower()
+
+    if not excerpt_n or not source_n:
+        return False
+
+    if excerpt_n in source_n:
+        return True
+
+    # Conservative fuzzy containment fallback:
+    # require several sizeable exact fragments from the excerpt to exist.
+    words = excerpt_n.split()
+    if len(words) < 16:
+        return False
+
+    fragment_size = 12
+    fragments = []
+
+    for i in range(0, len(words) - fragment_size + 1, fragment_size):
+        frag = " ".join(words[i:i + fragment_size]).strip()
+        if len(frag) >= 60:
+            fragments.append(frag)
+
+    if not fragments:
+        return False
+
+    hits = sum(1 for frag in fragments[:8] if frag in source_n)
+
+    # Strict: at least 2 matching fragments and at least half of sampled fragments.
+    required = max(2, (min(len(fragments), 8) + 1) // 2)
+    return hits >= required
+
+
+def s45v7102_chain_is_traceable(chain, topic_identity):
+    if not chain:
+        return False
+
+    try:
+        chain_text = json.dumps(chain, ensure_ascii=False, default=str)
+    except Exception:
+        chain_text = normalize_text(chain)
+
+    if not s45v710_exact_topic_match(chain_text, topic_identity):
+        return False
+
+    # Every material URL in the chain must remain official.
+    urls = re.findall(r'https?://[^\s"\'<>\]\[(){}]+', chain_text)
+    if not urls:
+        return False
+
+    return all(s45v7102_official_final_url(u.rstrip(".,;:")) for u in urls)
+
+
+def s45v7102_evidence_guard(
+    *,
+    topic_identity,
+    evidence_url,
+    evidence_excerpt,
+    provenance_chain=None,
+    source_title="",
+):
+    requested_url = normalize_text(evidence_url)
+    excerpt = normalize_text(evidence_excerpt)
+
+    verdict = {
+        "guard_status": "REJECTED",
+        "requested_url": requested_url,
+        "final_url": None,
+        "http_status": None,
+        "content_type": None,
+        "content_kind": None,
+        "redirected": False,
+        "official_final_host": False,
+        "auth_or_error_url": False,
+        "auth_or_error_content": False,
+        "excerpt_present_in_source": False,
+        "exact_topic_in_source": False,
+        "traceable_topic_chain": False,
+        "document_sha256": None,
+        "excerpt_sha256": s45v7102_sha256_text(excerpt),
+        "reason": "",
+    }
+
+    if not requested_url or not excerpt:
+        verdict["reason"] = "Missing evidence URL or excerpt."
+        return verdict
+
+    fetched = s45v7102_fetch_for_verification(requested_url)
+
+    verdict["final_url"] = fetched.get("final_url")
+    verdict["http_status"] = fetched.get("status")
+    verdict["content_type"] = fetched.get("content_type")
+    verdict["content_kind"] = fetched.get("content_kind")
+    verdict["redirected"] = bool(fetched.get("redirected"))
+
+    if not fetched.get("ok"):
+        verdict["reason"] = (
+            "Evidence source could not be freshly fetched for provenance verification: "
+            + normalize_text(fetched.get("error"))
+        )
+        return verdict
+
+    final_url = normalize_text(fetched.get("final_url"))
+    source_text = fetched.get("text") or ""
+
+    verdict["official_final_host"] = s45v7102_official_final_url(final_url)
+    verdict["auth_or_error_url"] = s45v7102_is_auth_or_error_url(final_url)
+    verdict["auth_or_error_content"] = s45v7102_is_auth_or_error_content(
+        source_text,
+        source_title,
+    )
+    verdict["excerpt_present_in_source"] = s45v7102_excerpt_in_source(
+        excerpt,
+        source_text,
+    )
+    verdict["exact_topic_in_source"] = s45v710_exact_topic_match(
+        " ".join([final_url, source_title, source_text[:150000]]),
+        topic_identity,
+    )
+    verdict["traceable_topic_chain"] = s45v7102_chain_is_traceable(
+        provenance_chain,
+        topic_identity,
+    )
+
+    verdict["document_sha256"] = s45v7102_sha256_text(
+        s45v7102_normalize_body(source_text)
+    )
+
+    if not verdict["official_final_host"]:
+        verdict["reason"] = "Final URL is not on an allowed official EC/EU host."
+        return verdict
+
+    if verdict["auth_or_error_url"]:
+        verdict["reason"] = "Final URL appears to be CAS/login/auth/error infrastructure, not substantive evidence."
+        return verdict
+
+    if verdict["auth_or_error_content"]:
+        verdict["reason"] = "Fetched page content appears to be authentication/error content."
+        return verdict
+
+    if not verdict["excerpt_present_in_source"]:
+        verdict["reason"] = "The cited evidence excerpt was not found in the freshly fetched source content."
+        return verdict
+
+    if not (
+        verdict["exact_topic_in_source"]
+        or verdict["traceable_topic_chain"]
+    ):
+        verdict["reason"] = "Exact-topic applicability was not proven by the source or provenance chain."
+        return verdict
+
+    verdict["guard_status"] = "VERIFIED"
+    verdict["reason"] = (
+        "Evidence provenance verified: official final host, non-auth substantive content, "
+        "excerpt present in source, and exact-topic applicability established."
+    )
+    return verdict
+
+
+def s45v7102_load_latest_evidence_items():
+    # Load recent items for the current locked opportunity.
+    items = rows(
+        "locked_evidence_worker_items",
+        {
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+        },
+        "created_at",
+        500,
+    )
+
+    # Keep newest item per requirement label/key.
+    newest = {}
+    for item in items:
+        label = (
+            normalize_text(item.get("requirement_key"))
+            or normalize_text(item.get("requirement_label"))
+            or normalize_text(item.get("requirement_id"))
+        )
+        if not label:
+            continue
+        if label not in newest:
+            newest[label] = item
+
+    return list(newest.values())
+
+
+def s45v7102_requirement_guard_rows():
+    guarded = []
+
+    for item in s45v7102_load_latest_evidence_items():
+        route = normalize_text(item.get("route_type")).upper()
+        if route != "OFFICIAL_VERIFICATION":
+            continue
+
+        status = normalize_text(item.get("worker_status")).upper()
+
+        # Only guard rows that already claim substantive evidence or resolution.
+        if status != "RESOLVED" and not item.get("explicit_evidence_verified"):
+            continue
+
+        guard = s45v7102_evidence_guard(
+            topic_identity=identity,
+            evidence_url=item.get("evidence_url"),
+            evidence_excerpt=item.get("evidence_excerpt"),
+            provenance_chain=item.get("provenance_chain"),
+            source_title=item.get("source_title"),
+        )
+
+        guarded.append({
+            "item": item,
+            "guard": guard,
+        })
+
+    return guarded
+
+
+def s45v7102_demote_execution_task_if_unverified(item, guard):
+    """
+    If an earlier Stage 45 worker resolved a task using evidence that fails the
+    new provenance guard, return the execution task to WAITING_OFFICIAL.
+    This is deliberately conservative.
+    """
+    if guard.get("guard_status") == "VERIFIED":
+        return False
+
+    task_id = item.get("execution_task_id")
+    if not task_id:
+        return False
+
+    supabase.table("locked_evidence_execution_tasks").update({
+        "task_status": "WAITING_OFFICIAL",
+        "completion_status": None,
+        "completion_source": None,
+        "completion_reference": None,
+        "completed_at": None,
+        "completion_payload": {
+            "stage": 45,
+            "status": "WAITING_OFFICIAL",
+            "reason": (
+                "Previous evidence resolution was revoked by Stage 45 v7.10.2 "
+                "because provenance verification failed."
+            ),
+            "provenance_guard": guard,
+        },
+        "updated_at": now_iso(),
+    }).eq("id", task_id).eq("user_id", user_id).execute()
+
+    supabase.table("locked_evidence_worker_items").update({
+        "worker_status": "WAITING_OFFICIAL",
+        "official_verified": False,
+        "explicit_evidence_verified": False,
+        "official_document_status": "WAITING_OFFICIAL",
+        "missing_evidence_reason": (
+            "Previous RESOLVED evidence failed Stage 45 v7.10.2 provenance verification."
+        ),
+        "next_action": (
+            "Find a substantive official source whose cited excerpt can be verified in the fetched document."
+        ),
+        "official_document_payload": {
+            **(item.get("official_document_payload") or {}),
+            "v7_10_2_provenance_guard": guard,
+        },
+        "updated_at": now_iso(),
+    }).eq("id", item.get("id")).eq("user_id", user_id).execute()
+
+    return True
+
+
+def s45v7102_mark_worker_item_verified(item, guard):
+    if guard.get("guard_status") != "VERIFIED":
+        return False
+
+    payload = item.get("official_document_payload") or {}
+    payload["v7_10_2_provenance_guard"] = guard
+
+    supabase.table("locked_evidence_worker_items").update({
+        "official_verified": True,
+        "exact_topic_verified": True,
+        "authoritative_source_verified": True,
+        "explicit_evidence_verified": True,
+        "official_document_status": "VERIFIED",
+        "retrieved_at": now_iso(),
+        "official_document_payload": payload,
+        "updated_at": now_iso(),
+    }).eq("id", item.get("id")).eq("user_id", user_id).execute()
+
+    return True
+
+
+st.divider()
+st.subheader("Stage 45 v7.10.2 — Evidence Provenance & False-Positive Guard")
+st.info(
+    "v7.10.2 reverifică dovezile RESOLVED: urmărește redirect-ul final, respinge CAS/login/error pages, "
+    "verifică faptul că pasajul citat există efectiv în document și cere exact-topic sau provenance chain trasabil."
+)
+
+_v7102_guarded = s45v7102_requirement_guard_rows()
+
+g1, g2, g3 = st.columns(3)
+g1.metric("Evidence rows to guard", len(_v7102_guarded))
+g2.metric(
+    "Provenance verified",
+    sum(1 for x in _v7102_guarded if x["guard"].get("guard_status") == "VERIFIED"),
+)
+g3.metric(
+    "Rejected / needs review",
+    sum(1 for x in _v7102_guarded if x["guard"].get("guard_status") != "VERIFIED"),
+)
+
+if _v7102_guarded:
+    st.dataframe(
+        [
+            {
+                "Requirement": x["item"].get("requirement_label"),
+                "Worker status": x["item"].get("worker_status"),
+                "Guard": x["guard"].get("guard_status"),
+                "HTTP": x["guard"].get("http_status"),
+                "Final URL": x["guard"].get("final_url"),
+                "Official final host": x["guard"].get("official_final_host"),
+                "Auth/error URL": x["guard"].get("auth_or_error_url"),
+                "Auth/error content": x["guard"].get("auth_or_error_content"),
+                "Excerpt in source": x["guard"].get("excerpt_present_in_source"),
+                "Exact topic in source": x["guard"].get("exact_topic_in_source"),
+                "Traceable chain": x["guard"].get("traceable_topic_chain"),
+                "Reason": x["guard"].get("reason"),
+            }
+            for x in _v7102_guarded
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    st.info("Nu există încă dovezi RESOLVED care necesită provenance guard.")
+
+if st.button(
+    "🛡️ Run Stage 45 v7.10.2 provenance guard",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v7102_guard",
+):
+    run = (
+        supabase.table("locked_evidence_worker_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "total_tasks": len(_v7102_guarded),
+            "worker_status": "RUNNING",
+            "deep_resolution_version": "v7.10.2",
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "diagnostics": [],
+            "started_at": now_iso(),
+            "summary": {
+                "stage": 45,
+                "version": "v7.10.2",
+                "guarded_items": len(_v7102_guarded),
+            },
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not run:
+        st.error("Nu am putut crea Stage 45 v7.10.2 run.")
+    else:
+        run_id = str(run[0]["id"])
+
+        verified = rejected = failed = 0
+        result_rows = []
+
+        for entry in _v7102_guarded:
+            item = entry["item"]
+
+            try:
+                guard = s45v7102_evidence_guard(
+                    topic_identity=identity,
+                    evidence_url=item.get("evidence_url"),
+                    evidence_excerpt=item.get("evidence_excerpt"),
+                    provenance_chain=item.get("provenance_chain"),
+                    source_title=item.get("source_title"),
+                )
+
+                if guard.get("guard_status") == "VERIFIED":
+                    verified += 1
+                    s45v7102_mark_worker_item_verified(item, guard)
+                else:
+                    rejected += 1
+                    s45v7102_demote_execution_task_if_unverified(item, guard)
+
+                result_rows.append({
+                    "requirement": item.get("requirement_label"),
+                    "worker_item_id": item.get("id"),
+                    "execution_task_id": item.get("execution_task_id"),
+                    "guard": guard,
+                })
+
+            except Exception as exc:
+                failed += 1
+                result_rows.append({
+                    "requirement": item.get("requirement_label"),
+                    "worker_item_id": item.get("id"),
+                    "execution_task_id": item.get("execution_task_id"),
+                    "guard": {
+                        "guard_status": "ERROR",
+                        "reason": f"{type(exc).__name__}: {str(exc)}",
+                    },
+                })
+
+        final = (
+            "FAILED"
+            if failed and not verified and not rejected
+            else "PARTIAL_FAILURE"
+            if failed
+            else "COMPLETED"
+        )
+
+        supabase.table("locked_evidence_worker_runs").update({
+            "resolved_tasks": verified,
+            "waiting_tasks": rejected,
+            "failed_tasks": failed,
+            "worker_status": "FAILED" if final == "FAILED" else "COMPLETED",
+            "diagnostic_status": (
+                "FAILED"
+                if final == "FAILED"
+                else "PARTIAL_FAILURE"
+                if final == "PARTIAL_FAILURE"
+                else "CLEAN"
+            ),
+            "official_tasks_resolved": verified,
+            "official_tasks_waiting": rejected,
+            "deep_resolution_version": "v7.10.2",
+            "provenance_summary": {
+                "verified": verified,
+                "rejected": rejected,
+                "failed": failed,
+                "results": result_rows,
+            },
+            "completed_at": now_iso(),
+            "updated_at": now_iso(),
+        }).eq("id", run_id).eq("user_id", user_id).execute()
+
+        st.success(
+            f"Stage 45 v7.10.2: {final} — provenance verified {verified}, "
+            f"rejected {rejected}, failed {failed}."
+        )
+        st.rerun()
+
+
+_v7102_runs = rows(
+    "locked_evidence_worker_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    50,
+)
+
+_v7102_runs = [
+    r
+    for r in _v7102_runs
+    if normalize_text(r.get("deep_resolution_version")).lower() == "v7.10.2"
+]
+
+if _v7102_runs:
+    _latest_v7102 = _v7102_runs[0]
+
+    st.subheader("Latest Stage 45 v7.10.2 Result")
+
+    z1, z2, z3, z4 = st.columns(4)
+    z1.metric("Status", _latest_v7102.get("worker_status") or "—")
+    z2.metric(
+        "Provenance verified",
+        (_latest_v7102.get("provenance_summary") or {}).get("verified", 0),
+    )
+    z3.metric(
+        "Rejected",
+        (_latest_v7102.get("provenance_summary") or {}).get("rejected", 0),
+    )
+    z4.metric(
+        "Failed",
+        (_latest_v7102.get("provenance_summary") or {}).get("failed", 0),
+    )
+
+    with st.expander("v7.10.2 provenance details", expanded=False):
+        st.json((_latest_v7102.get("provenance_summary") or {}).get("results", []))
+
+st.caption(
+    "v7.10.2 invariant: RESOLVED evidence is trusted only after fresh-source provenance verification. "
+    "CAS/login/auth/error pages, unverifiable excerpts, or non-traceable applicability are rejected."
+)
+# =====================================================================
+# END STAGE 45 v7.10.2
+# =====================================================================
