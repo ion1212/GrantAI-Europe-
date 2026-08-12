@@ -1,4 +1,3 @@
-
 import os
 import json
 import re
@@ -24,25 +23,29 @@ except Exception:
 
 
 # =====================================================================
-# STAGE 46 — POST-RESOLUTION PROVENANCE VALIDATOR
+# STAGE 46 v2 — POST-RESOLUTION PROVENANCE VALIDATOR
+# Dedicated Supabase persistence:
+#   locked_evidence_provenance_runs
+#   locked_evidence_provenance_items
+#   locked_evidence_provenance_sources
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 46 — Post-Resolution Provenance Validator",
+    page_title="Stage 46 v2 — Provenance Validator",
     page_icon="🛡️",
     layout="wide",
 )
 
-st.title("🛡️ Etapa 46 — AI Post-Resolution Provenance Validator")
+st.title("🛡️ Etapa 46 v2 — AI Post-Resolution Provenance Validator")
 st.caption(
-    "Validează independent dovezile RESOLVED produse în Etapa 45. "
-    "Etapa 46 nu inventează reguli și nu transformă WAITING în RESOLVED. "
-    "PASS este permis numai pentru dovezi oficiale explicite, verificabile și trasabile."
+    "Etapa 46 v2 citește rezultatele Stage 45, dar își păstrează propriul audit în tabelele "
+    "provenance. PASS este permis numai dacă toate cerințele OFFICIAL au dovadă RESOLVED "
+    "și provenance verificat independent."
 )
 
 
 # ---------------------------------------------------------------------
-# Config / auth / helpers
+# Generic helpers
 # ---------------------------------------------------------------------
 
 def secret(name: str, default: str = "") -> str:
@@ -66,6 +69,10 @@ def now_iso() -> str:
 
 def normalize_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def normalize_body(value: Any) -> str:
+    return re.sub(r"\s+", " ", normalize_text(value)).strip()
 
 
 def as_dict(value: Any) -> dict:
@@ -105,7 +112,7 @@ def restore_auth_session(sb) -> None:
             pass
 
 
-def current_user_id(sb) -> str | None:
+def current_user_id(sb):
     for key in ("auth_user", "user"):
         user = st.session_state.get(key)
         if isinstance(user, dict) and user.get("id"):
@@ -146,38 +153,30 @@ def sha256_text(value: Any):
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest() if text else None
 
 
-def normalize_body(value: Any) -> str:
-    return re.sub(r"\s+", " ", normalize_text(value)).strip()
-
-
 def canonical_url(url: Any) -> str:
     return normalize_text(url).split("#", 1)[0].rstrip("/")
 
 
 # ---------------------------------------------------------------------
-# Official source guards
+# Source / transport verification
 # ---------------------------------------------------------------------
 
-def is_allowed_official_url(url: Any) -> bool:
+def allowed_official_url(url: Any) -> bool:
     host = urlparse(normalize_text(url)).netloc.lower()
-
     return bool(
-        host == "ec.europa.eu"
+        host == "europa.eu"
+        or host.endswith(".europa.eu")
+        or host == "ec.europa.eu"
         or host.endswith(".ec.europa.eu")
         or host == "commission.europa.eu"
         or host.endswith(".commission.europa.eu")
         or host == "funding-tenders.ec.europa.eu"
         or host.endswith(".funding-tenders.ec.europa.eu")
-        or host == "europa.eu"
-        or host.endswith(".europa.eu")
     )
 
 
-def is_auth_or_error_url(url: Any) -> bool:
+def auth_or_error_url(url: Any) -> bool:
     u = normalize_text(url).lower()
-    if not u:
-        return True
-
     blocked = (
         "/cas/",
         "/login",
@@ -192,13 +191,11 @@ def is_auth_or_error_url(url: Any) -> bool:
         "/logout",
         "/error",
     )
+    return (not u) or any(x in u for x in blocked)
 
-    return any(x in u for x in blocked)
 
-
-def is_auth_or_error_content(text: Any, title: Any = "") -> bool:
+def auth_or_error_content(text: Any, title: Any = "") -> bool:
     corpus = " ".join([normalize_text(title), normalize_text(text)]).lower()
-
     markers = (
         "central authentication service",
         "authentication required",
@@ -213,37 +210,29 @@ def is_auth_or_error_content(text: Any, title: Any = "") -> bool:
         "sign in to continue",
         "log in to continue",
     )
-
     return any(x in corpus for x in markers)
 
 
 def extract_pdf_text(content: bytes, max_pages=250, max_chars=1_200_000) -> str:
     if not content or PdfReader is None:
         return ""
-
     try:
         reader = PdfReader(BytesIO(content))
         parts = []
         total = 0
-
         for idx, page in enumerate(reader.pages):
             if idx >= max_pages:
                 break
-
             try:
                 page_text = page.extract_text() or ""
             except Exception:
                 page_text = ""
-
             if page_text:
                 parts.append(f"\n[PDF PAGE {idx + 1}]\n{page_text}")
                 total += len(page_text)
-
             if total >= max_chars:
                 break
-
         return "\n".join(parts)[:max_chars]
-
     except Exception:
         return ""
 
@@ -251,36 +240,28 @@ def extract_pdf_text(content: bytes, max_pages=250, max_chars=1_200_000) -> str:
 def extract_html_text(html: str, max_chars=1_200_000) -> str:
     if not html:
         return ""
-
     if BeautifulSoup is None:
         clean = re.sub(r"<script.*?</script>", " ", html, flags=re.I | re.S)
         clean = re.sub(r"<style.*?</style>", " ", clean, flags=re.I | re.S)
         clean = re.sub(r"<[^>]+>", " ", clean)
         return normalize_body(clean)[:max_chars]
-
     try:
         soup = BeautifulSoup(html, "html.parser")
-
         for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
             tag.decompose()
-
         chunks = []
-
         for node in soup.find_all(["h1", "h2", "h3", "h4", "p", "li", "td", "th"]):
             txt = " ".join(node.stripped_strings).strip()
             if txt:
                 chunks.append(txt)
-
         if not chunks:
             chunks = list(soup.stripped_strings)
-
         return "\n".join(chunks)[:max_chars]
-
     except Exception:
         return ""
 
 
-def extract_source_text(response) -> tuple[str, str]:
+def extract_response_text(response):
     ctype = normalize_text(response.headers.get("content-type", "")).lower()
     final_url = normalize_text(getattr(response, "url", ""))
 
@@ -289,21 +270,22 @@ def extract_source_text(response) -> tuple[str, str]:
 
     if "json" in ctype:
         try:
-            payload = response.json()
-            return json.dumps(payload, ensure_ascii=False, default=str)[:1_200_000], "JSON"
+            return json.dumps(response.json(), ensure_ascii=False, default=str)[:1_200_000], "JSON"
         except Exception:
-            return normalize_text(response.text)[:1_200_000], "JSON"
+            try:
+                return (response.text or "")[:1_200_000], "JSON"
+            except Exception:
+                return "", "JSON"
 
-    raw_text = ""
     try:
-        raw_text = response.text or ""
+        raw = response.text or ""
     except Exception:
-        pass
+        raw = ""
 
-    if "html" in ctype or "<html" in raw_text[:5000].lower():
-        return extract_html_text(raw_text), "HTML"
+    if "html" in ctype or "<html" in raw[:5000].lower():
+        return extract_html_text(raw), "HTML"
 
-    return raw_text[:1_200_000], "TEXT"
+    return raw[:1_200_000], "TEXT"
 
 
 def fetch_source(url: str, timeout=45) -> dict:
@@ -314,9 +296,11 @@ def fetch_source(url: str, timeout=45) -> dict:
         "status": None,
         "content_type": "",
         "content_kind": "UNKNOWN",
+        "response_bytes": 0,
         "text": "",
-        "error": "",
         "redirected": False,
+        "error_type": None,
+        "error_message": None,
     }
 
     try:
@@ -325,7 +309,7 @@ def fetch_source(url: str, timeout=45) -> dict:
             timeout=timeout,
             allow_redirects=True,
             headers={
-                "User-Agent": "GreenRise/Stage46-ProvenanceValidator",
+                "User-Agent": "GreenRise/Stage46-v2",
                 "Accept": "application/pdf,application/json,text/html,text/plain,*/*",
                 "Accept-Language": "en-GB,en;q=0.9",
                 "Connection": "close",
@@ -335,24 +319,36 @@ def fetch_source(url: str, timeout=45) -> dict:
         result["status"] = r.status_code
         result["final_url"] = normalize_text(getattr(r, "url", "")) or normalize_text(url)
         result["content_type"] = normalize_text(r.headers.get("content-type", ""))
+        result["response_bytes"] = len(r.content or b"")
         result["redirected"] = canonical_url(result["final_url"]) != canonical_url(url)
 
-        text, kind = extract_source_text(r)
+        text, kind = extract_response_text(r)
         result["text"] = text
         result["content_kind"] = kind
         result["ok"] = bool(r.ok and text.strip())
 
         if not r.ok:
-            result["error"] = f"HTTP {r.status_code}"
+            result["error_type"] = "HTTP_ERROR"
+            result["error_message"] = f"HTTP {r.status_code}"
 
+    except requests.exceptions.Timeout as exc:
+        result["error_type"] = "TIMEOUT"
+        result["error_message"] = str(exc)
+    except requests.exceptions.SSLError as exc:
+        result["error_type"] = "SSL_ERROR"
+        result["error_message"] = str(exc)
+    except requests.exceptions.ConnectionError as exc:
+        result["error_type"] = "CONNECTION_ERROR"
+        result["error_message"] = str(exc)
     except Exception as exc:
-        result["error"] = f"{type(exc).__name__}: {str(exc)}"
+        result["error_type"] = type(exc).__name__
+        result["error_message"] = str(exc)
 
     return result
 
 
 # ---------------------------------------------------------------------
-# Topic identity / excerpt verification
+# Topic / excerpt / chain verification
 # ---------------------------------------------------------------------
 
 def topic_tokens(topic_identity: Any):
@@ -377,11 +373,10 @@ def exact_topic_match(text_value: Any, topic_identity: Any) -> bool:
         return False
 
     hits = sum(1 for t in tokens if t in hay)
-
     return hits >= max(3, len(tokens) - 1)
 
 
-def excerpt_present_in_source(excerpt: Any, source_text: Any) -> bool:
+def excerpt_in_source(excerpt: Any, source_text: Any) -> bool:
     excerpt_n = normalize_body(excerpt).lower()
     source_n = normalize_body(source_text).lower()
 
@@ -392,12 +387,11 @@ def excerpt_present_in_source(excerpt: Any, source_text: Any) -> bool:
         return True
 
     words = excerpt_n.split()
-
     if len(words) < 16:
         return False
 
-    size = 12
     fragments = []
+    size = 12
 
     for i in range(0, len(words) - size + 1, size):
         frag = " ".join(words[i:i + size]).strip()
@@ -405,29 +399,24 @@ def excerpt_present_in_source(excerpt: Any, source_text: Any) -> bool:
             fragments.append(frag)
 
     sampled = fragments[:8]
-
     if not sampled:
         return False
 
     hits = sum(1 for frag in sampled if frag in source_n)
     required = max(2, (len(sampled) + 1) // 2)
-
     return hits >= required
 
 
-def provenance_chain_urls(chain: Any):
-    if not chain:
-        return []
-
+def chain_urls(chain: Any):
     urls = []
 
     def walk(obj):
         if isinstance(obj, dict):
-            for value in obj.values():
-                walk(value)
+            for v in obj.values():
+                walk(v)
         elif isinstance(obj, list):
-            for value in obj:
-                walk(value)
+            for v in obj:
+                walk(v)
         else:
             for u in re.findall(r'https?://[^\s"\'<>\]\[(){}]+', normalize_text(obj)):
                 clean = u.rstrip(".,;:")
@@ -435,17 +424,16 @@ def provenance_chain_urls(chain: Any):
                     urls.append(clean)
 
     walk(chain)
-
     return urls
 
 
-def traceable_topic_chain(chain: Any, topic_identity: Any) -> bool:
-    urls = provenance_chain_urls(chain)
+def chain_verified(chain: Any, topic_identity: Any) -> bool:
+    urls = chain_urls(chain)
 
     if not urls:
         return False
 
-    if not all(is_allowed_official_url(u) for u in urls):
+    if not all(allowed_official_url(u) for u in urls):
         return False
 
     try:
@@ -457,19 +445,36 @@ def traceable_topic_chain(chain: Any, topic_identity: Any) -> bool:
 
 
 # ---------------------------------------------------------------------
-# Stage 45 result discovery
+# Stage 45 handoff discovery
 # ---------------------------------------------------------------------
 
-def requirement_identity(item: dict) -> str:
-    return (
-        normalize_text(item.get("execution_task_id"))
-        or normalize_text(item.get("requirement_id"))
-        or normalize_text(item.get("requirement_key"))
-        or normalize_text(item.get("requirement_label"))
+def requirement_match_key(row: dict) -> list[str]:
+    values = [
+        normalize_text(row.get("execution_task_id")),
+        normalize_text(row.get("requirement_id")),
+        normalize_text(row.get("requirement_key")).lower(),
+        normalize_text(row.get("requirement_label")).lower(),
+    ]
+    return [v for v in values if v]
+
+
+def is_stage45_resolved_evidence(item: dict) -> bool:
+    if normalize_text(item.get("route_type")).upper() != "OFFICIAL_VERIFICATION":
+        return False
+
+    resolved = (
+        normalize_text(item.get("worker_status")).upper() == "RESOLVED"
+        or bool(item.get("explicit_evidence_verified"))
+    )
+
+    return bool(
+        resolved
+        and normalize_text(item.get("evidence_url"))
+        and normalize_text(item.get("evidence_excerpt"))
     )
 
 
-def load_stage45_history() -> list[dict]:
+def load_stage45_history():
     return rows(
         "locked_evidence_worker_items",
         {
@@ -478,182 +483,355 @@ def load_stage45_history() -> list[dict]:
             "opportunity_lock_id": lock_id,
         },
         "created_at",
-        3000,
+        5000,
     )
 
 
-def load_best_resolved_stage45_items(history: list[dict]) -> list[dict]:
+def find_best_stage45_item(task: dict, history: list[dict]):
     """
-    Search the whole Stage 45 history, not only the newest row.
-    Keep the newest substantive RESOLVED row per execution task/requirement.
+    Search all historical worker items, with multiple matching keys.
+    This fixes the Stage 46 v1 issue where a valid historical TRL resolution
+    could be hidden by a newer WAITING row.
     """
-    selected = {}
+    task_keys = set(requirement_match_key(task))
+
+    candidates = []
 
     for item in history:
-        route = normalize_text(item.get("route_type")).upper()
-        status = normalize_text(item.get("worker_status")).upper()
-
-        if route != "OFFICIAL_VERIFICATION":
+        if not is_stage45_resolved_evidence(item):
             continue
 
-        if status != "RESOLVED" and not bool(item.get("explicit_evidence_verified")):
-            continue
+        item_keys = set(requirement_match_key(item))
 
-        if not normalize_text(item.get("evidence_url")):
-            continue
+        if task_keys.intersection(item_keys):
+            candidates.append(item)
 
-        if not normalize_text(item.get("evidence_excerpt")):
-            continue
+    if not candidates:
+        return None
 
-        key = requirement_identity(item)
-
-        if key and key not in selected:
-            selected[key] = item
-
-    return list(selected.values())
-
-
-def current_official_tasks() -> list[dict]:
-    return [
-        t for t in execution_tasks
-        if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION"
-    ]
+    # rows() already returns newest first, so keep newest substantive RESOLVED item.
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------
-# Independent provenance verdict
+# Dedicated Stage 46 persistence
 # ---------------------------------------------------------------------
 
-def validate_stage45_item(item: dict) -> dict:
-    url = normalize_text(item.get("evidence_url"))
-    excerpt = normalize_text(item.get("evidence_excerpt"))
-    source_title = normalize_text(item.get("source_title"))
-    chain = item.get("provenance_chain")
+def create_provenance_run(total_requirements: int, source_items_found: int):
+    data = (
+        supabase.table("locked_evidence_provenance_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "stage": 46,
+            "validator_version": "stage46-v2",
+            "run_status": "RUNNING",
+            "total_requirements": total_requirements,
+            "source_worker_items_found": source_items_found,
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "summary": {
+                "stage": 46,
+                "version": "v2",
+            },
+            "diagnostics": [],
+            "started_at": now_iso(),
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
 
-    verdict = {
-        "stage": 46,
-        "version": "v1",
-        "worker_item_id": item.get("id"),
-        "execution_task_id": item.get("execution_task_id"),
-        "requirement_id": item.get("requirement_id"),
-        "requirement_key": item.get("requirement_key"),
-        "requirement_label": item.get("requirement_label"),
-        "status": "REJECTED",
-        "requested_url": url,
-        "final_url": None,
-        "http_status": None,
-        "content_type": None,
-        "content_kind": None,
-        "redirected": False,
-        "official_final_host": False,
-        "auth_or_error_url": False,
-        "auth_or_error_content": False,
-        "excerpt_present_in_source": False,
-        "exact_topic_in_source": False,
-        "traceable_topic_chain": False,
-        "document_sha256": None,
-        "excerpt_sha256": sha256_text(normalize_body(excerpt)),
-        "reason": "",
-        "checked_at": now_iso(),
+    if not data:
+        raise RuntimeError("Could not create locked_evidence_provenance_runs row.")
+
+    return data[0]
+
+
+def create_provenance_item(run_id: str, task: dict, stage45_item: dict | None):
+    payload = {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+        "execution_run_id": execution_run_id,
+        "provenance_run_id": run_id,
+        "execution_task_id": task.get("id"),
+        "requirement_id": task.get("requirement_id"),
+        "requirement_key": task.get("requirement_key"),
+        "requirement_category": task.get("requirement_category"),
+        "requirement_label": task.get("requirement_label"),
+        "opportunity_identity": identity,
+        "source_stage": 45,
+        "validation_stage": 46,
+        "validation_status": "VALIDATING" if stage45_item else "WAITING",
+        "updated_at": now_iso(),
     }
 
-    if not url or not excerpt:
-        verdict["reason"] = "Missing evidence URL or evidence excerpt."
-        return verdict
+    if stage45_item:
+        payload.update({
+            "stage45_worker_run_id": stage45_item.get("worker_run_id"),
+            "stage45_worker_item_id": stage45_item.get("id"),
+            "stage45_worker_status": stage45_item.get("worker_status"),
+            "stage45_evidence_source": stage45_item.get("evidence_source"),
+            "requested_url": stage45_item.get("evidence_url"),
+            "evidence_reference": stage45_item.get("evidence_reference"),
+            "evidence_excerpt": stage45_item.get("evidence_excerpt"),
+            "provenance_chain": stage45_item.get("provenance_chain") or [],
+            "source_snapshot": {
+                "stage45_worker_item_id": stage45_item.get("id"),
+                "worker_status": stage45_item.get("worker_status"),
+                "evidence_source": stage45_item.get("evidence_source"),
+                "evidence_url": stage45_item.get("evidence_url"),
+                "evidence_reference": stage45_item.get("evidence_reference"),
+                "exact_topic_verified": stage45_item.get("exact_topic_verified"),
+                "authoritative_source_verified": stage45_item.get("authoritative_source_verified"),
+                "explicit_evidence_verified": stage45_item.get("explicit_evidence_verified"),
+            },
+        })
+    else:
+        payload.update({
+            "validation_reason": "No Stage 45 RESOLVED evidence found for this requirement.",
+            "next_action": "Return requirement to Stage 45 official evidence resolution.",
+            "checked_at": now_iso(),
+        })
 
-    fetched = fetch_source(url)
+    data = (
+        supabase.table("locked_evidence_provenance_items")
+        .insert(payload)
+        .execute()
+    ).data or []
 
-    verdict["final_url"] = fetched.get("final_url")
-    verdict["http_status"] = fetched.get("status")
-    verdict["content_type"] = fetched.get("content_type")
-    verdict["content_kind"] = fetched.get("content_kind")
-    verdict["redirected"] = bool(fetched.get("redirected"))
+    if not data:
+        raise RuntimeError("Could not create locked_evidence_provenance_items row.")
+
+    return data[0]
+
+
+def save_provenance_source(
+    run_id: str,
+    provenance_item_id: str,
+    task: dict,
+    stage45_item: dict,
+    fetched: dict,
+    checks: dict,
+):
+    fetch_status = (
+        "TRANSPORT_FAILED"
+        if not fetched.get("ok")
+        else "REJECTED"
+        if checks.get("validation_status") == "REJECTED"
+        else "VERIFIED"
+        if checks.get("validation_status") == "VERIFIED"
+        else "FETCHED"
+    )
+
+    payload = {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+        "provenance_run_id": run_id,
+        "provenance_item_id": provenance_item_id,
+        "execution_task_id": task.get("id"),
+        "stage45_worker_item_id": stage45_item.get("id"),
+        "opportunity_identity": identity,
+        "requested_url": stage45_item.get("evidence_url"),
+        "final_url": fetched.get("final_url"),
+        "source_title": stage45_item.get("source_title"),
+        "http_status": fetched.get("status"),
+        "content_type": fetched.get("content_type"),
+        "content_kind": fetched.get("content_kind"),
+        "redirected": bool(fetched.get("redirected")),
+        "official_host": bool(checks.get("official_final_host_verified")),
+        "auth_or_error_url": bool(checks.get("auth_or_error_url_detected")),
+        "auth_or_error_content": bool(checks.get("auth_or_error_content_detected")),
+        "fetch_status": fetch_status,
+        "response_bytes": int(fetched.get("response_bytes") or 0),
+        "document_sha256": checks.get("document_sha256"),
+        "excerpt_sha256": checks.get("excerpt_sha256"),
+        "evidence_excerpt": stage45_item.get("evidence_excerpt"),
+        "excerpt_verified": bool(checks.get("excerpt_present_in_source")),
+        "topic_verified": bool(checks.get("exact_topic_in_source")),
+        "provenance_chain": stage45_item.get("provenance_chain") or [],
+        "fetch_payload": {
+            "version": "stage46-v2",
+            "checks": checks,
+        },
+        "error_type": fetched.get("error_type"),
+        "error_message": fetched.get("error_message"),
+        "retrieved_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    supabase.table("locked_evidence_provenance_sources").insert(payload).execute()
+
+
+def update_provenance_item(item_id: str, verdict: dict):
+    status = verdict.get("validation_status")
+
+    payload = {
+        "validation_status": status,
+        "final_url": verdict.get("final_url"),
+        "http_status": verdict.get("http_status"),
+        "content_type": verdict.get("content_type"),
+        "content_kind": verdict.get("content_kind"),
+        "redirected": bool(verdict.get("redirected")),
+        "official_final_host_verified": bool(verdict.get("official_final_host_verified")),
+        "auth_or_error_url_detected": bool(verdict.get("auth_or_error_url_detected")),
+        "auth_or_error_content_detected": bool(verdict.get("auth_or_error_content_detected")),
+        "excerpt_present_in_source": bool(verdict.get("excerpt_present_in_source")),
+        "exact_topic_in_source": bool(verdict.get("exact_topic_in_source")),
+        "provenance_chain_verified": bool(verdict.get("provenance_chain_verified")),
+        "substantive_source_verified": bool(verdict.get("substantive_source_verified")),
+        "explicit_evidence_verified": bool(verdict.get("explicit_evidence_verified")),
+        "document_sha256": verdict.get("document_sha256"),
+        "excerpt_sha256": verdict.get("excerpt_sha256"),
+        "validation_payload": verdict,
+        "rejection_reason": verdict.get("rejection_reason"),
+        "validation_reason": verdict.get("validation_reason"),
+        "next_action": verdict.get("next_action"),
+        "checked_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    supabase.table("locked_evidence_provenance_items").update(
+        payload
+    ).eq("id", item_id).eq("user_id", user_id).execute()
+
+
+# ---------------------------------------------------------------------
+# Independent Stage 46 verdict
+# ---------------------------------------------------------------------
+
+def validate_stage45_evidence(stage45_item: dict):
+    requested_url = normalize_text(stage45_item.get("evidence_url"))
+    excerpt = normalize_text(stage45_item.get("evidence_excerpt"))
+    chain = stage45_item.get("provenance_chain") or []
+    source_title = normalize_text(stage45_item.get("source_title"))
+
+    fetched = fetch_source(requested_url)
+
+    verdict = {
+        "validation_status": "REJECTED",
+        "requested_url": requested_url,
+        "final_url": fetched.get("final_url"),
+        "http_status": fetched.get("status"),
+        "content_type": fetched.get("content_type"),
+        "content_kind": fetched.get("content_kind"),
+        "redirected": bool(fetched.get("redirected")),
+        "official_final_host_verified": False,
+        "auth_or_error_url_detected": False,
+        "auth_or_error_content_detected": False,
+        "excerpt_present_in_source": False,
+        "exact_topic_in_source": False,
+        "provenance_chain_verified": False,
+        "substantive_source_verified": False,
+        "explicit_evidence_verified": False,
+        "document_sha256": None,
+        "excerpt_sha256": sha256_text(normalize_body(excerpt)),
+        "rejection_reason": None,
+        "validation_reason": None,
+        "next_action": None,
+    }
+
+    if not requested_url or not excerpt:
+        verdict["rejection_reason"] = "Missing evidence URL or evidence excerpt."
+        verdict["next_action"] = "Return to Stage 45."
+        return verdict, fetched
 
     if not fetched.get("ok"):
-        verdict["reason"] = (
-            "Evidence source could not be freshly fetched: "
-            + normalize_text(fetched.get("error"))
+        verdict["validation_status"] = "WAITING"
+        verdict["validation_reason"] = (
+            "Fresh-source retrieval failed; evidence cannot be accepted or rejected factually."
         )
-        return verdict
+        verdict["next_action"] = "Retry provenance validation or resolve transport."
+        return verdict, fetched
 
     final_url = normalize_text(fetched.get("final_url"))
     source_text = fetched.get("text") or ""
 
-    verdict["official_final_host"] = is_allowed_official_url(final_url)
-    verdict["auth_or_error_url"] = is_auth_or_error_url(final_url)
-    verdict["auth_or_error_content"] = is_auth_or_error_content(
+    verdict["official_final_host_verified"] = allowed_official_url(final_url)
+    verdict["auth_or_error_url_detected"] = auth_or_error_url(final_url)
+    verdict["auth_or_error_content_detected"] = auth_or_error_content(
         source_text,
         source_title,
     )
-    verdict["excerpt_present_in_source"] = excerpt_present_in_source(
+    verdict["excerpt_present_in_source"] = excerpt_in_source(
         excerpt,
         source_text,
     )
     verdict["exact_topic_in_source"] = exact_topic_match(
-        " ".join([
-            final_url,
-            source_title,
-            source_text[:150000],
-        ]),
+        " ".join([final_url, source_title, source_text[:150000]]),
         identity,
     )
-    verdict["traceable_topic_chain"] = traceable_topic_chain(
+    verdict["provenance_chain_verified"] = chain_verified(
         chain,
         identity,
     )
     verdict["document_sha256"] = sha256_text(normalize_body(source_text))
 
-    if not verdict["official_final_host"]:
-        verdict["reason"] = "Final evidence URL is not on an allowed official EC/EU host."
-        return verdict
-
-    if verdict["auth_or_error_url"]:
-        verdict["reason"] = "Final URL is CAS/login/auth/error infrastructure, not substantive evidence."
-        return verdict
-
-    if verdict["auth_or_error_content"]:
-        verdict["reason"] = "Fetched source is authentication/error content, not substantive evidence."
-        return verdict
-
-    if not verdict["excerpt_present_in_source"]:
-        verdict["reason"] = "Evidence excerpt cannot be verified in the freshly fetched source."
-        return verdict
-
-    if not (
-        verdict["exact_topic_in_source"]
-        or verdict["traceable_topic_chain"]
-    ):
-        verdict["reason"] = "Exact-topic applicability is not proven by source or provenance chain."
-        return verdict
-
-    verdict["status"] = "VERIFIED"
-    verdict["reason"] = (
-        "Fresh-source provenance verified: official final host, substantive source, "
-        "cited excerpt present, and exact-topic applicability established."
+    verdict["substantive_source_verified"] = bool(
+        verdict["official_final_host_verified"]
+        and not verdict["auth_or_error_url_detected"]
+        and not verdict["auth_or_error_content_detected"]
     )
 
-    return verdict
+    verdict["explicit_evidence_verified"] = bool(
+        verdict["substantive_source_verified"]
+        and verdict["excerpt_present_in_source"]
+        and (
+            verdict["exact_topic_in_source"]
+            or verdict["provenance_chain_verified"]
+        )
+    )
+
+    if not verdict["official_final_host_verified"]:
+        verdict["rejection_reason"] = "Final URL is not an allowed official EC/EU host."
+    elif verdict["auth_or_error_url_detected"]:
+        verdict["rejection_reason"] = "Final URL is authentication/error infrastructure."
+    elif verdict["auth_or_error_content_detected"]:
+        verdict["rejection_reason"] = "Fetched content is authentication/error content."
+    elif not verdict["excerpt_present_in_source"]:
+        verdict["rejection_reason"] = "Cited excerpt was not found in the freshly fetched source."
+    elif not (
+        verdict["exact_topic_in_source"]
+        or verdict["provenance_chain_verified"]
+    ):
+        verdict["rejection_reason"] = "Exact-topic applicability is not proven."
+    else:
+        verdict["validation_status"] = "VERIFIED"
+        verdict["validation_reason"] = (
+            "Official substantive source verified; cited excerpt exists in the fresh source; "
+            "exact-topic applicability is established directly or through the official provenance chain."
+        )
+        verdict["next_action"] = "ALLOW_DOWNSTREAM"
+        return verdict, fetched
+
+    verdict["next_action"] = "RETURN_TO_STAGE_45"
+    return verdict, fetched
 
 
 # ---------------------------------------------------------------------
-# Persist Stage 46 result without requiring new SQL tables
+# Update only execution task after Stage 46 verdict.
+# Stage 45 audit is intentionally preserved.
 # ---------------------------------------------------------------------
 
-def merge_completion_payload(task: dict, stage46_result: dict) -> dict:
-    payload = as_dict(task.get("completion_payload"))
-    payload["stage46_provenance_validation"] = stage46_result
-    return payload
+def apply_verified_to_execution_task(task: dict, provenance_item_id: str, verdict: dict):
+    completion_payload = as_dict(task.get("completion_payload"))
+    completion_payload["stage46_provenance_validation"] = {
+        "provenance_item_id": provenance_item_id,
+        **verdict,
+    }
 
-
-def mark_task_stage46_verified(task: dict, stage46_result: dict):
     supabase.table("locked_evidence_execution_tasks").update({
-        "completion_payload": merge_completion_payload(task, stage46_result),
         "completion_status": "VERIFIED",
+        "completion_payload": completion_payload,
         "updated_at": now_iso(),
     }).eq("id", task["id"]).eq("user_id", user_id).execute()
 
 
-def revoke_task_stage45_completion(task: dict, stage46_result: dict):
+def apply_rejected_to_execution_task(task: dict, provenance_item_id: str, verdict: dict):
     supabase.table("locked_evidence_execution_tasks").update({
         "task_status": "WAITING_OFFICIAL",
         "completion_status": None,
@@ -663,50 +841,15 @@ def revoke_task_stage45_completion(task: dict, stage46_result: dict):
         "completion_payload": {
             "stage": 46,
             "status": "WAITING_OFFICIAL",
-            "reason": (
-                "Etapa 46 a respins dovada folosită pentru rezolvarea din Etapa 45."
-            ),
-            "stage46_provenance_validation": stage46_result,
+            "stage46_provenance_item_id": provenance_item_id,
+            "stage46_provenance_validation": verdict,
         },
         "updated_at": now_iso(),
     }).eq("id", task["id"]).eq("user_id", user_id).execute()
 
 
-def update_worker_item_validation(item: dict, stage46_result: dict):
-    payload = item.get("official_document_payload") or {}
-    if not isinstance(payload, dict):
-        payload = {}
-
-    payload["stage46_provenance_validation"] = stage46_result
-
-    verified = stage46_result.get("status") == "VERIFIED"
-
-    update_payload = {
-        "official_document_payload": payload,
-        "official_verified": verified,
-        "authoritative_source_verified": verified,
-        "explicit_evidence_verified": verified,
-        "official_document_status": "VERIFIED" if verified else "WAITING_OFFICIAL",
-        "retrieved_at": now_iso(),
-        "updated_at": now_iso(),
-    }
-
-    if not verified:
-        update_payload["worker_status"] = "WAITING_OFFICIAL"
-        update_payload["missing_evidence_reason"] = (
-            "Stage 46 provenance validator rejected the previously resolved evidence."
-        )
-        update_payload["next_action"] = (
-            "Return to Stage 45 official evidence resolution with a substantive traceable source."
-        )
-
-    supabase.table("locked_evidence_worker_items").update(
-        update_payload
-    ).eq("id", item["id"]).eq("user_id", user_id).execute()
-
-
 # ---------------------------------------------------------------------
-# Init
+# Init / gate
 # ---------------------------------------------------------------------
 
 supabase = get_supabase()
@@ -717,25 +860,20 @@ if not user_id:
     st.error("Nu am putut identifica utilizatorul autentificat.")
     st.stop()
 
-projects = rows(
-    "projects",
-    {"user_id": user_id},
-    "updated_at",
-    200,
-)
+projects = rows("projects", {"user_id": user_id}, "updated_at", 200)
 
 if not projects:
     st.warning("Nu există proiecte.")
     st.stop()
 
 project_map = {project_label(p): p for p in projects}
-selected_label = st.selectbox(
+selected_project = st.selectbox(
     "Project",
     list(project_map.keys()),
-    key="stage46_project",
+    key="stage46_v2_project",
 )
 
-project = project_map[selected_label]
+project = project_map[selected_project]
 project_id = str(project["id"])
 
 locks = rows(
@@ -780,7 +918,7 @@ execution_run = next(
 )
 
 if not execution_run:
-    st.warning("Nu există execution run disponibil pentru acest lock.")
+    st.warning("Nu există execution run disponibil.")
     st.stop()
 
 execution_run_id = str(execution_run["id"])
@@ -797,225 +935,154 @@ execution_tasks = rows(
     500,
 )
 
+official_tasks = [
+    t for t in execution_tasks
+    if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION"
+]
+
 hard_gate = (
     normalize_text(lock.get("lock_status")).upper() == "ACTIVE"
     and workflow_allowed
     and bool(identity)
     and future_deadline(deadline)
-    and bool(execution_tasks)
+    and bool(official_tasks)
 )
 
 if not hard_gate:
-    st.error("Etapa 46 este BLOCKED de hard gate.")
+    st.error("Etapa 46 v2 este BLOCKED de hard gate.")
     st.stop()
 
-st.success("Hard gate Etapa 46: PASS.")
-
+st.success("Hard gate Etapa 46 v2: PASS.")
 st.write(f"**Locked opportunity:** {identity}")
 st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
 
 # ---------------------------------------------------------------------
-# Stage 46 workspace
+# Handoff preview
 # ---------------------------------------------------------------------
 
-history = load_stage45_history()
-resolved_items = load_best_resolved_stage45_items(history)
-official_tasks = current_official_tasks()
+stage45_history = load_stage45_history()
 
-resolved_by_task = {
-    normalize_text(item.get("execution_task_id")): item
-    for item in resolved_items
-    if item.get("execution_task_id")
-}
-
-task_rows = []
-
+handoff = []
 for task in official_tasks:
-    task_id = str(task.get("id"))
-    candidate = resolved_by_task.get(task_id)
-
-    task_rows.append({
-        "Requirement": task.get("requirement_label"),
-        "Stage 45 task status": task.get("task_status"),
-        "Resolved evidence found": bool(candidate),
-        "Evidence URL": candidate.get("evidence_url") if candidate else None,
-        "Worker item": candidate.get("id") if candidate else None,
+    item = find_best_stage45_item(task, stage45_history)
+    handoff.append({
+        "task": task,
+        "stage45_item": item,
     })
 
-st.subheader("Stage 45 → Stage 46 handoff")
+st.subheader("Stage 45 → Stage 46 v2 handoff")
+
 st.dataframe(
-    task_rows,
+    [
+        {
+            "Requirement": x["task"].get("requirement_label"),
+            "Task status": x["task"].get("task_status"),
+            "Historical RESOLVED evidence": bool(x["stage45_item"]),
+            "Worker item": x["stage45_item"].get("id") if x["stage45_item"] else None,
+            "Evidence URL": x["stage45_item"].get("evidence_url") if x["stage45_item"] else None,
+        }
+        for x in handoff
+    ],
     use_container_width=True,
     hide_index=True,
 )
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("OFFICIAL requirements", len(official_tasks))
-c2.metric("Resolved evidence found", len(resolved_items))
-c3.metric(
-    "Still WAITING",
-    sum(
-        1 for t in official_tasks
-        if normalize_text(t.get("task_status")).upper() != "COMPLETED"
-    ),
-)
-c4.metric("History worker items", len(history))
+h1, h2, h3, h4 = st.columns(4)
+h1.metric("OFFICIAL requirements", len(official_tasks))
+h2.metric("Historical RESOLVED found", sum(1 for x in handoff if x["stage45_item"]))
+h3.metric("Missing RESOLVED evidence", sum(1 for x in handoff if not x["stage45_item"]))
+h4.metric("Stage 45 history rows", len(stage45_history))
 
 
-# Pre-flight independent validations for UI.
-preflight = []
-
-for item in resolved_items:
-    try:
-        result = validate_stage45_item(item)
-    except Exception as exc:
-        result = {
-            "status": "ERROR",
-            "reason": f"{type(exc).__name__}: {str(exc)}",
-            "final_url": None,
-            "official_final_host": False,
-            "auth_or_error_url": False,
-            "auth_or_error_content": False,
-            "excerpt_present_in_source": False,
-            "exact_topic_in_source": False,
-            "traceable_topic_chain": False,
-        }
-
-    preflight.append({
-        "item": item,
-        "result": result,
-    })
-
-st.subheader("Pre-flight provenance validation")
-
-if preflight:
-    st.dataframe(
-        [
-            {
-                "Requirement": x["item"].get("requirement_label"),
-                "Guard": x["result"].get("status"),
-                "HTTP": x["result"].get("http_status"),
-                "Final URL": x["result"].get("final_url"),
-                "Official host": x["result"].get("official_final_host"),
-                "Auth/error URL": x["result"].get("auth_or_error_url"),
-                "Auth/error content": x["result"].get("auth_or_error_content"),
-                "Excerpt in source": x["result"].get("excerpt_present_in_source"),
-                "Exact topic in source": x["result"].get("exact_topic_in_source"),
-                "Traceable chain": x["result"].get("traceable_topic_chain"),
-                "Reason": x["result"].get("reason"),
-            }
-            for x in preflight
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-else:
-    st.info("Nu există încă dovezi RESOLVED în istoricul Etapei 45.")
-
+# ---------------------------------------------------------------------
+# Execute Stage 46 v2
+# ---------------------------------------------------------------------
 
 if st.button(
-    "🛡️ Run Stage 46 provenance validation",
+    "🛡️ Run Stage 46 v2 provenance validation",
     type="primary",
     use_container_width=True,
-    key="stage46_run",
+    key="stage46_v2_run",
 ):
-    run = (
-        supabase.table("locked_evidence_worker_runs")
-        .insert({
-            "user_id": user_id,
-            "project_id": project_id,
-            "opportunity_lock_id": lock_id,
-            "execution_run_id": execution_run_id,
-            "opportunity_identity": identity,
-            "total_tasks": len(official_tasks),
-            "worker_status": "RUNNING",
-            "deep_resolution_version": "stage46-v1",
-            "diagnostic_status": "CLEAN",
-            "error_count": 0,
-            "diagnostics": [],
-            "started_at": now_iso(),
-            "summary": {
-                "stage": 46,
-                "version": "v1",
-                "official_requirements": len(official_tasks),
-                "stage45_resolved_evidence": len(resolved_items),
-            },
-            "updated_at": now_iso(),
-        })
-        .execute()
-    ).data or []
+    source_items_found = sum(1 for x in handoff if x["stage45_item"])
 
-    if not run:
-        st.error("Nu am putut crea Stage 46 run.")
-        st.stop()
+    run = create_provenance_run(
+        total_requirements=len(official_tasks),
+        source_items_found=source_items_found,
+    )
+    run_id = str(run["id"])
 
-    run_id = str(run[0]["id"])
+    verified = rejected = waiting = failed = documents_revalidated = 0
+    diagnostics = []
 
-    verified = rejected = waiting = failed = 0
-    results = []
+    progress = st.progress(0)
 
-    task_map = {
-        str(t["id"]): t
-        for t in official_tasks
-    }
-
-    processed_task_ids = set()
-
-    for item in resolved_items:
-        task_id = normalize_text(item.get("execution_task_id"))
-        task = task_map.get(task_id)
-
-        if not task:
-            continue
-
-        processed_task_ids.add(task_id)
+    for idx, entry in enumerate(handoff, 1):
+        task = entry["task"]
+        stage45_item = entry["stage45_item"]
 
         try:
-            verdict = validate_stage45_item(item)
+            provenance_item = create_provenance_item(
+                run_id,
+                task,
+                stage45_item,
+            )
+            provenance_item_id = str(provenance_item["id"])
 
-            if verdict.get("status") == "VERIFIED":
+            if not stage45_item:
+                waiting += 1
+                progress.progress(idx / len(handoff))
+                continue
+
+            verdict, fetched = validate_stage45_evidence(stage45_item)
+            documents_revalidated += int(bool(fetched.get("requested_url")))
+
+            save_provenance_source(
+                run_id,
+                provenance_item_id,
+                task,
+                stage45_item,
+                fetched,
+                verdict,
+            )
+
+            update_provenance_item(
+                provenance_item_id,
+                verdict,
+            )
+
+            if verdict.get("validation_status") == "VERIFIED":
                 verified += 1
-                mark_task_stage46_verified(task, verdict)
-                update_worker_item_validation(item, verdict)
+                apply_verified_to_execution_task(
+                    task,
+                    provenance_item_id,
+                    verdict,
+                )
+
+            elif verdict.get("validation_status") == "WAITING":
+                waiting += 1
 
             else:
                 rejected += 1
-                revoke_task_stage45_completion(task, verdict)
-                update_worker_item_validation(item, verdict)
-
-            results.append(verdict)
+                apply_rejected_to_execution_task(
+                    task,
+                    provenance_item_id,
+                    verdict,
+                )
 
         except Exception as exc:
             failed += 1
-            results.append({
-                "stage": 46,
-                "version": "v1",
-                "execution_task_id": task_id,
-                "requirement_label": task.get("requirement_label"),
-                "status": "ERROR",
-                "reason": f"{type(exc).__name__}: {str(exc)}",
-                "checked_at": now_iso(),
+            diagnostics.append({
+                "requirement": task.get("requirement_label"),
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "time": now_iso(),
             })
 
-    # Any OFFICIAL requirement without a resolved Stage 45 evidence row remains WAITING.
-    for task in official_tasks:
-        task_id = str(task["id"])
+        progress.progress(idx / len(handoff))
 
-        if task_id not in processed_task_ids:
-            waiting += 1
-            results.append({
-                "stage": 46,
-                "version": "v1",
-                "execution_task_id": task_id,
-                "requirement_label": task.get("requirement_label"),
-                "status": "WAITING_OFFICIAL",
-                "reason": "No Stage 45 RESOLVED evidence exists yet for this requirement.",
-                "checked_at": now_iso(),
-            })
-
-    # PASS requires every OFFICIAL requirement to have verified provenance.
-    pass_gate = (
+    gate_pass = (
         len(official_tasks) > 0
         and verified == len(official_tasks)
         and rejected == 0
@@ -1023,66 +1090,70 @@ if st.button(
         and failed == 0
     )
 
-    final = (
-        "FAILED"
-        if failed and verified == 0 and rejected == 0
-        else "PASS"
-        if pass_gate
+    run_status = (
+        "PASS"
+        if gate_pass
+        else "FAILED"
+        if failed and verified == 0 and rejected == 0 and waiting == 0
+        else "PARTIAL_FAILURE"
+        if failed
         else "WAITING"
     )
 
-    supabase.table("locked_evidence_worker_runs").update({
-        "resolved_tasks": verified,
-        "waiting_tasks": waiting + rejected,
-        "failed_tasks": failed,
-        "worker_status": "COMPLETED" if final == "PASS" else final,
+    supabase.table("locked_evidence_provenance_runs").update({
+        "run_status": run_status,
+        "verified_requirements": verified,
+        "rejected_requirements": rejected,
+        "waiting_requirements": waiting,
+        "failed_requirements": failed,
+        "source_worker_items_found": source_items_found,
+        "documents_revalidated": documents_revalidated,
         "diagnostic_status": (
             "FAILED"
-            if final == "FAILED"
+            if run_status == "FAILED"
             else "PARTIAL_FAILURE"
-            if failed
+            if run_status == "PARTIAL_FAILURE"
             else "CLEAN"
         ),
-        "official_tasks_resolved": verified,
-        "official_tasks_waiting": waiting + rejected,
-        "deep_resolution_version": "stage46-v1",
-        "provenance_summary": {
-            "stage46_gate": final,
+        "error_count": failed,
+        "summary": {
+            "stage": 46,
+            "version": "v2",
+            "gate": run_status,
             "verified": verified,
             "rejected": rejected,
             "waiting": waiting,
             "failed": failed,
-            "results": results,
+            "source_worker_items_found": source_items_found,
+            "documents_revalidated": documents_revalidated,
         },
-        "completed_at": now_iso() if final in {"PASS", "FAILED"} else None,
+        "diagnostics": diagnostics,
+        "completed_at": now_iso() if run_status in {"PASS", "FAILED"} else None,
         "updated_at": now_iso(),
     }).eq("id", run_id).eq("user_id", user_id).execute()
 
-    if final == "PASS":
-        st.success(
-            "Etapa 46: PASS — toate cerințele OFFICIAL au dovadă RESOLVED "
-            "și provenance verificat."
-        )
-    elif final == "WAITING":
+    if run_status == "PASS":
+        st.success("Etapa 46 v2: PASS.")
+    elif run_status == "WAITING":
         st.warning(
-            f"Etapa 46: WAITING — verified {verified}, rejected {rejected}, "
-            f"waiting {waiting}, failed {failed}."
+            f"Etapa 46 v2: WAITING — Verified {verified}, Rejected {rejected}, "
+            f"Waiting {waiting}, Failed {failed}."
         )
     else:
         st.error(
-            f"Etapa 46: FAILED — verified {verified}, rejected {rejected}, "
-            f"waiting {waiting}, failed {failed}."
+            f"Etapa 46 v2: {run_status} — Verified {verified}, Rejected {rejected}, "
+            f"Waiting {waiting}, Failed {failed}."
         )
 
     st.rerun()
 
 
 # ---------------------------------------------------------------------
-# Latest Stage 46 result
+# Latest Stage 46 dedicated result
 # ---------------------------------------------------------------------
 
-stage46_runs = rows(
-    "locked_evidence_worker_runs",
+provenance_runs = rows(
+    "locked_evidence_provenance_runs",
     {
         "user_id": user_id,
         "project_id": project_id,
@@ -1092,46 +1163,108 @@ stage46_runs = rows(
     100,
 )
 
-stage46_runs = [
-    r for r in stage46_runs
-    if normalize_text(r.get("deep_resolution_version")).lower() == "stage46-v1"
-]
-
-if stage46_runs:
-    latest = stage46_runs[0]
-    summary = latest.get("provenance_summary") or {}
+if provenance_runs:
+    latest = provenance_runs[0]
+    latest_run_id = str(latest["id"])
 
     st.divider()
-    st.subheader("Latest Stage 46 Result")
+    st.subheader("Latest Stage 46 v2 Result")
 
-    z1, z2, z3, z4, z5 = st.columns(5)
+    p1, p2, p3, p4, p5 = st.columns(5)
+    p1.metric("Gate", latest.get("run_status") or "—")
+    p2.metric("Verified", latest.get("verified_requirements") or 0)
+    p3.metric("Rejected", latest.get("rejected_requirements") or 0)
+    p4.metric("Waiting", latest.get("waiting_requirements") or 0)
+    p5.metric("Failed", latest.get("failed_requirements") or 0)
 
-    z1.metric("Gate", summary.get("stage46_gate") or latest.get("worker_status") or "—")
-    z2.metric("Verified", summary.get("verified", 0))
-    z3.metric("Rejected", summary.get("rejected", 0))
-    z4.metric("Waiting", summary.get("waiting", 0))
-    z5.metric("Failed", summary.get("failed", 0))
+    items = rows(
+        "locked_evidence_provenance_items",
+        {
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "provenance_run_id": latest_run_id,
+        },
+        "created_at",
+        500,
+    )
 
-    with st.expander("Stage 46 provenance results", expanded=False):
-        st.json(summary.get("results", []))
+    if items:
+        st.subheader("Requirement provenance verdicts")
 
-    if summary.get("stage46_gate") == "PASS":
-        st.success(
-            "Etapa 46 este PASS. Rezultatele OFFICIAL validate pot fi predate Etapei 47."
+        st.dataframe(
+            [
+                {
+                    "Requirement": i.get("requirement_label"),
+                    "Stage 45 status": i.get("stage45_worker_status"),
+                    "Stage 46 verdict": i.get("validation_status"),
+                    "Official host": i.get("official_final_host_verified"),
+                    "Auth/error URL": i.get("auth_or_error_url_detected"),
+                    "Auth/error content": i.get("auth_or_error_content_detected"),
+                    "Excerpt verified": i.get("excerpt_present_in_source"),
+                    "Exact topic": i.get("exact_topic_in_source"),
+                    "Chain verified": i.get("provenance_chain_verified"),
+                    "Explicit evidence": i.get("explicit_evidence_verified"),
+                    "Final URL": i.get("final_url"),
+                    "Reason": i.get("validation_reason") or i.get("rejection_reason"),
+                }
+                for i in items
+            ],
+            use_container_width=True,
+            hide_index=True,
         )
+
+    sources = rows(
+        "locked_evidence_provenance_sources",
+        {
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "provenance_run_id": latest_run_id,
+        },
+        "created_at",
+        500,
+    )
+
+    with st.expander("Stage 46 source audit", expanded=False):
+        if sources:
+            st.dataframe(
+                [
+                    {
+                        "Fetch status": s.get("fetch_status"),
+                        "HTTP": s.get("http_status"),
+                        "Requested URL": s.get("requested_url"),
+                        "Final URL": s.get("final_url"),
+                        "Content type": s.get("content_type"),
+                        "Official host": s.get("official_host"),
+                        "Auth/error URL": s.get("auth_or_error_url"),
+                        "Excerpt verified": s.get("excerpt_verified"),
+                        "Topic verified": s.get("topic_verified"),
+                        "Document SHA256": s.get("document_sha256"),
+                        "Excerpt SHA256": s.get("excerpt_sha256"),
+                        "Error": s.get("error_message"),
+                    }
+                    for s in sources
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Nu există source audit pentru ultimul run.")
+
+    if normalize_text(latest.get("run_status")).upper() == "PASS":
+        st.success("Etapa 46 este PASS și poate preda controlul Etapei 47.")
     else:
         st.warning(
-            "Etapa 46 nu este încă PASS. Cerințele WAITING/REJECTED trebuie retrimise "
-            "controlat către Etapa 45 înainte de etapa următoare."
+            "Etapa 46 nu este încă PASS. Cerințele WAITING/REJECTED trebuie rezolvate "
+            "în Stage 45 înainte de etapa următoare."
         )
 
 
 st.caption(
-    "Invariantă Etapa 46: un rezultat RESOLVED din Etapa 45 nu este trusted automat. "
-    "Este acceptat numai dacă sursa finală este oficială și substanțială, pasajul citat "
-    "există în documentul recitit, iar aplicabilitatea la topic este demonstrată direct "
-    "sau prin provenance chain oficial trasabil."
+    "Invariantă Etapa 46 v2: Stage 45 este sursa candidate evidence, dar verdictul provenance "
+    "este păstrat separat. PASS necesită VERIFIED pentru fiecare requirement OFFICIAL."
 )
 # =====================================================================
-# END STAGE 46
+# END STAGE 46 v2
 # =====================================================================
