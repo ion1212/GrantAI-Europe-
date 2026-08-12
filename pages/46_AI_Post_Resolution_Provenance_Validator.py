@@ -31,7 +31,7 @@ except Exception:
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 46 v2 — Provenance Validator",
+    page_title="Stage 46 v2.1 — Provenance Validator",
     page_icon="🛡️",
     layout="wide",
 )
@@ -448,34 +448,153 @@ def chain_verified(chain: Any, topic_identity: Any) -> bool:
 # Stage 45 handoff discovery
 # ---------------------------------------------------------------------
 
+def _first_value(row: dict, names: list[str]):
+    for name in names:
+        value = row.get(name)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _canonical_requirement(value: Any) -> str:
+    s = normalize_text(value).lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = " ".join(s.split())
+
+    aliases = {
+        "applicant eligibility": "applicant eligibility",
+        "eligibility": "applicant eligibility",
+        "applicant": "applicant eligibility",
+        "consortium requirements": "consortium requirements",
+        "consortium requirement": "consortium requirements",
+        "consortium": "consortium requirements",
+        "trl requirements": "trl requirements",
+        "trl requirement": "trl requirements",
+        "trl": "trl requirements",
+        "technology readiness level": "trl requirements",
+        "technology readiness level requirements": "trl requirements",
+    }
+    return aliases.get(s, s)
+
+
 def requirement_match_key(row: dict) -> list[str]:
     values = [
         normalize_text(row.get("execution_task_id")),
         normalize_text(row.get("requirement_id")),
         normalize_text(row.get("requirement_key")).lower(),
-        normalize_text(row.get("requirement_label")).lower(),
+        _canonical_requirement(row.get("requirement_label")),
+        _canonical_requirement(row.get("requirement_category")),
+        _canonical_requirement(row.get("requirement")),
+        _canonical_requirement(row.get("task_label")),
     ]
     return [v for v in values if v]
 
 
+def _stage45_status(item: dict) -> str:
+    return normalize_text(_first_value(item, [
+        "worker_status",
+        "resolution_status",
+        "status",
+        "task_status",
+        "validation_status",
+    ])).upper()
+
+
+def _stage45_url(item: dict) -> str:
+    candidates = [
+        "evidence_url",
+        "official_url",
+        "source_url",
+        "resolved_url",
+        "document_url",
+        "requested_url",
+        "evidence_reference",
+    ]
+    for field in candidates:
+        value = normalize_text(item.get(field))
+        if value.startswith(("http://", "https://")):
+            return value
+    return ""
+
+
+def _stage45_excerpt(item: dict) -> str:
+    return normalize_text(_first_value(item, [
+        "evidence_excerpt",
+        "explicit_evidence_excerpt",
+        "resolved_excerpt",
+        "source_excerpt",
+        "document_excerpt",
+        "evidence_text",
+        "passage",
+        "excerpt",
+    ]))
+
+
+def normalize_stage45_item(item: dict) -> dict:
+    """
+    Convert historical Stage 45 variants to the canonical shape consumed by
+    Stage 46. The original row is preserved and only missing canonical fields
+    are filled from known historical aliases.
+    """
+    out = dict(item)
+    out["worker_status"] = _stage45_status(item)
+    out["evidence_url"] = _stage45_url(item)
+    out["evidence_excerpt"] = _stage45_excerpt(item)
+
+    if not out.get("worker_run_id"):
+        out["worker_run_id"] = _first_value(item, [
+            "run_id", "execution_run_id", "resolution_run_id"
+        ])
+
+    if not out.get("evidence_source"):
+        out["evidence_source"] = _first_value(item, [
+            "source_type", "official_source", "document_source"
+        ])
+
+    if not out.get("provenance_chain"):
+        out["provenance_chain"] = _first_value(item, [
+            "reference_chain", "official_reference_chain", "source_chain"
+        ]) or []
+
+    return out
+
+
 def is_stage45_resolved_evidence(item: dict) -> bool:
-    if normalize_text(item.get("route_type")).upper() != "OFFICIAL_VERIFICATION":
-        return False
+    item = normalize_stage45_item(item)
+
+    # Historical Stage 45 versions did not always persist the same route_type.
+    route = normalize_text(item.get("route_type")).upper()
+    if route and route not in {
+        "OFFICIAL_VERIFICATION",
+        "OFFICIAL",
+        "OFFICIAL_EVIDENCE",
+        "EVIDENCE_RESOLUTION",
+    }:
+        # Do not reject solely on route when the row has explicit official flags.
+        if not (
+            bool(item.get("authoritative_source_verified"))
+            or bool(item.get("explicit_evidence_verified"))
+            or bool(item.get("exact_topic_verified"))
+        ):
+            return False
 
     resolved = (
-        normalize_text(item.get("worker_status")).upper() == "RESOLVED"
+        _stage45_status(item) in {"RESOLVED", "COMPLETED", "VERIFIED", "PASS", "PASSED"}
         or bool(item.get("explicit_evidence_verified"))
     )
 
-    return bool(
-        resolved
-        and normalize_text(item.get("evidence_url"))
-        and normalize_text(item.get("evidence_excerpt"))
-    )
+    return bool(resolved and _stage45_url(item) and _stage45_excerpt(item))
 
 
 def load_stage45_history():
-    return rows(
+    """
+    v2.1 historical recovery:
+    1. Read the exact current lock first.
+    2. Also read project history, because older Stage 45 versions could persist
+       a valid worker item without the current opportunity_lock_id/execution_run_id.
+    3. Deduplicate by row id.
+    """
+    exact = rows(
         "locked_evidence_worker_items",
         {
             "user_id": user_id,
@@ -486,31 +605,115 @@ def load_stage45_history():
         5000,
     )
 
+    project_history = rows(
+        "locked_evidence_worker_items",
+        {
+            "user_id": user_id,
+            "project_id": project_id,
+        },
+        "created_at",
+        5000,
+    )
+
+    merged = []
+    seen = set()
+    for raw in exact + project_history:
+        rid = normalize_text(raw.get("id")) or json.dumps(raw, sort_keys=True, default=str)
+        if rid in seen:
+            continue
+        seen.add(rid)
+        merged.append(normalize_stage45_item(raw))
+
+    return merged
+
+
+def _candidate_score(task: dict, item: dict) -> int:
+    """
+    Prefer exact identifiers, then requirement identity, then the current lock.
+    A historical row can still win without lock_id if it has a strong
+    requirement match and substantive RESOLVED evidence.
+    """
+    score = 0
+
+    task_id = normalize_text(task.get("id"))
+    item_task_id = normalize_text(item.get("execution_task_id"))
+    if task_id and item_task_id and task_id == item_task_id:
+        score += 100
+
+    task_req_id = normalize_text(task.get("requirement_id"))
+    item_req_id = normalize_text(item.get("requirement_id"))
+    if task_req_id and item_req_id and task_req_id == item_req_id:
+        score += 80
+
+    task_req_key = normalize_text(task.get("requirement_key")).lower()
+    item_req_key = normalize_text(item.get("requirement_key")).lower()
+    if task_req_key and item_req_key and task_req_key == item_req_key:
+        score += 70
+
+    task_label = _canonical_requirement(task.get("requirement_label"))
+    item_labels = {
+        _canonical_requirement(item.get("requirement_label")),
+        _canonical_requirement(item.get("requirement_category")),
+        _canonical_requirement(item.get("requirement")),
+        _canonical_requirement(item.get("task_label")),
+    }
+    item_labels.discard("")
+    if task_label and task_label in item_labels:
+        score += 60
+
+    if normalize_text(item.get("opportunity_lock_id")) == normalize_text(lock_id):
+        score += 25
+
+    if normalize_text(item.get("execution_run_id")) == normalize_text(execution_run_id):
+        score += 15
+
+    item_identity = normalize_text(_first_value(item, [
+        "opportunity_identity", "topic_identity", "topic_id", "opportunity_id"
+    ]))
+    if item_identity and normalize_text(identity) and item_identity.lower() == normalize_text(identity).lower():
+        score += 20
+
+    if bool(item.get("exact_topic_verified")):
+        score += 5
+    if bool(item.get("authoritative_source_verified")):
+        score += 5
+    if bool(item.get("explicit_evidence_verified")):
+        score += 10
+
+    return score
+
 
 def find_best_stage45_item(task: dict, history: list[dict]):
     """
-    Search all historical worker items, with multiple matching keys.
-    This fixes the Stage 46 v1 issue where a valid historical TRL resolution
-    could be hidden by a newer WAITING row.
-    """
-    task_keys = set(requirement_match_key(task))
+    Stage 46 v2.1.1 historical evidence recovery.
 
+    It does not rely only on the newest Stage 45 row. It searches the complete
+    project history, accepts historical field variants, and scores candidates
+    by stable requirement identity. This recovers valid v7.10.1 evidence that
+    may have been written before the current execution task/run identifiers.
+    """
     candidates = []
 
-    for item in history:
+    for raw in history:
+        item = normalize_stage45_item(raw)
         if not is_stage45_resolved_evidence(item):
             continue
 
-        item_keys = set(requirement_match_key(item))
-
-        if task_keys.intersection(item_keys):
-            candidates.append(item)
+        score = _candidate_score(task, item)
+        if score >= 60:
+            candidates.append((score, item))
 
     if not candidates:
         return None
 
-    # rows() already returns newest first, so keep newest substantive RESOLVED item.
-    return candidates[0]
+    candidates.sort(
+        key=lambda pair: (
+            pair[0],
+            normalize_text(pair[1].get("created_at")),
+        ),
+        reverse=True,
+    )
+    return candidates[0][1]
 
 
 # ---------------------------------------------------------------------
@@ -527,7 +730,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "execution_run_id": execution_run_id,
             "opportunity_identity": identity,
             "stage": 46,
-            "validator_version": "stage46-v2",
+            "validator_version": "stage46-v2.1",
             "run_status": "RUNNING",
             "total_requirements": total_requirements,
             "source_worker_items_found": source_items_found,
@@ -535,7 +738,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "error_count": 0,
             "summary": {
                 "stage": 46,
-                "version": "v2",
+                "version": "v2.1",
             },
             "diagnostics": [],
             "started_at": now_iso(),
@@ -655,7 +858,7 @@ def save_provenance_source(
         "topic_verified": bool(checks.get("exact_topic_in_source")),
         "provenance_chain": stage45_item.get("provenance_chain") or [],
         "fetch_payload": {
-            "version": "stage46-v2",
+            "version": "stage46-v2.1",
             "checks": checks,
         },
         "error_type": fetched.get("error_type"),
@@ -952,7 +1155,7 @@ if not hard_gate:
     st.error("Etapa 46 v2 este BLOCKED de hard gate.")
     st.stop()
 
-st.success("Hard gate Etapa 46 v2: PASS.")
+st.success("Hard gate Etapa 46 v2.1: PASS.")
 st.write(f"**Locked opportunity:** {identity}")
 st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
@@ -971,7 +1174,7 @@ for task in official_tasks:
         "stage45_item": item,
     })
 
-st.subheader("Stage 45 → Stage 46 v2 handoff")
+st.subheader("Stage 45 → Stage 46 v2.1 handoff")
 
 st.dataframe(
     [
@@ -996,14 +1199,14 @@ h4.metric("Stage 45 history rows", len(stage45_history))
 
 
 # ---------------------------------------------------------------------
-# Execute Stage 46 v2
+# Execute Stage 46 v2.1
 # ---------------------------------------------------------------------
 
 if st.button(
-    "🛡️ Run Stage 46 v2 provenance validation",
+    "🛡️ Run Stage 46 v2.1 provenance validation",
     type="primary",
     use_container_width=True,
-    key="stage46_v2_run",
+    key="stage46_v2_1_run",
 ):
     source_items_found = sum(1 for x in handoff if x["stage45_item"])
 
@@ -1118,7 +1321,7 @@ if st.button(
         "error_count": failed,
         "summary": {
             "stage": 46,
-            "version": "v2",
+            "version": "v2.1",
             "gate": run_status,
             "verified": verified,
             "rejected": rejected,
@@ -1133,15 +1336,15 @@ if st.button(
     }).eq("id", run_id).eq("user_id", user_id).execute()
 
     if run_status == "PASS":
-        st.success("Etapa 46 v2: PASS.")
+        st.success("Etapa 46 v2.1: PASS.")
     elif run_status == "WAITING":
         st.warning(
-            f"Etapa 46 v2: WAITING — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.1: WAITING — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
     else:
         st.error(
-            f"Etapa 46 v2: {run_status} — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.1: {run_status} — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
 
@@ -1168,7 +1371,7 @@ if provenance_runs:
     latest_run_id = str(latest["id"])
 
     st.divider()
-    st.subheader("Latest Stage 46 v2 Result")
+    st.subheader("Latest Stage 46 v2.1 Result")
 
     p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric("Gate", latest.get("run_status") or "—")
@@ -1262,7 +1465,7 @@ if provenance_runs:
 
 
 st.caption(
-    "Invariantă Etapa 46 v2: Stage 45 este sursa candidate evidence, dar verdictul provenance "
+    "Invariantă Etapa 46 v2.1: Stage 45 este sursa candidate evidence, dar verdictul provenance "
     "este păstrat separat. PASS necesită VERIFIED pentru fiecare requirement OFFICIAL."
 )
 # =====================================================================
