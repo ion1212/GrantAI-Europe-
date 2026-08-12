@@ -31,7 +31,7 @@ except Exception:
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 46 v2.1 — Provenance Validator",
+    page_title="Stage 46 v2.2 — Provenance Validator",
     page_icon="🛡️",
     layout="wide",
 )
@@ -685,7 +685,7 @@ def _candidate_score(task: dict, item: dict) -> int:
 
 def find_best_stage45_item(task: dict, history: list[dict]):
     """
-    Stage 46 v2.1.1 historical evidence recovery.
+    Stage 46 v2.2.1 historical evidence recovery.
 
     It does not rely only on the newest Stage 45 row. It searches the complete
     project history, accepts historical field variants, and scores candidates
@@ -730,7 +730,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "execution_run_id": execution_run_id,
             "opportunity_identity": identity,
             "stage": 46,
-            "validator_version": "stage46-v2.1",
+            "validator_version": "stage46-v2.2",
             "run_status": "RUNNING",
             "total_requirements": total_requirements,
             "source_worker_items_found": source_items_found,
@@ -738,7 +738,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "error_count": 0,
             "summary": {
                 "stage": 46,
-                "version": "v2.1",
+                "version": "v2.2",
             },
             "diagnostics": [],
             "started_at": now_iso(),
@@ -858,7 +858,7 @@ def save_provenance_source(
         "topic_verified": bool(checks.get("exact_topic_in_source")),
         "provenance_chain": stage45_item.get("provenance_chain") or [],
         "fetch_payload": {
-            "version": "stage46-v2.1",
+            "version": "stage46-v2.2",
             "checks": checks,
         },
         "error_type": fetched.get("error_type"),
@@ -1155,7 +1155,7 @@ if not hard_gate:
     st.error("Etapa 46 v2 este BLOCKED de hard gate.")
     st.stop()
 
-st.success("Hard gate Etapa 46 v2.1: PASS.")
+st.success("Hard gate Etapa 46 v2.2: PASS.")
 st.write(f"**Locked opportunity:** {identity}")
 st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
@@ -1174,7 +1174,7 @@ for task in official_tasks:
         "stage45_item": item,
     })
 
-st.subheader("Stage 45 → Stage 46 v2.1 handoff")
+st.subheader("Stage 45 → Stage 46 v2.2 handoff")
 
 st.dataframe(
     [
@@ -1199,14 +1199,14 @@ h4.metric("Stage 45 history rows", len(stage45_history))
 
 
 # ---------------------------------------------------------------------
-# Execute Stage 46 v2.1
+# Execute Stage 46 v2.2
 # ---------------------------------------------------------------------
 
 if st.button(
-    "🛡️ Run Stage 46 v2.1 provenance validation",
+    "🛡️ Run Stage 46 v2.2 provenance validation",
     type="primary",
     use_container_width=True,
-    key="stage46_v2_1_run",
+    key="stage46_v2_2_run",
 ):
     source_items_found = sum(1 for x in handoff if x["stage45_item"])
 
@@ -1321,7 +1321,7 @@ if st.button(
         "error_count": failed,
         "summary": {
             "stage": 46,
-            "version": "v2.1",
+            "version": "v2.2",
             "gate": run_status,
             "verified": verified,
             "rejected": rejected,
@@ -1336,15 +1336,15 @@ if st.button(
     }).eq("id", run_id).eq("user_id", user_id).execute()
 
     if run_status == "PASS":
-        st.success("Etapa 46 v2.1: PASS.")
+        st.success("Etapa 46 v2.2: PASS.")
     elif run_status == "WAITING":
         st.warning(
-            f"Etapa 46 v2.1: WAITING — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.2: WAITING — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
     else:
         st.error(
-            f"Etapa 46 v2.1: {run_status} — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.2: {run_status} — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
 
@@ -1371,7 +1371,7 @@ if provenance_runs:
     latest_run_id = str(latest["id"])
 
     st.divider()
-    st.subheader("Latest Stage 46 v2.1 Result")
+    st.subheader("Latest Stage 46 v2.2 Result")
 
     p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric("Gate", latest.get("run_status") or "—")
@@ -1465,9 +1465,173 @@ if provenance_runs:
 
 
 st.caption(
-    "Invariantă Etapa 46 v2.1: Stage 45 este sursa candidate evidence, dar verdictul provenance "
+    "Invariantă Etapa 46 v2.2: Stage 45 este sursa candidate evidence, dar verdictul provenance "
     "este păstrat separat. PASS necesită VERIFIED pentru fiecare requirement OFFICIAL."
 )
 # =====================================================================
 # END STAGE 46 v2
+# =====================================================================
+
+
+
+# =====================================================================
+# STAGE 46 v2.2 — STAGE 45 HANDOFF DIAGNOSTICS
+# =====================================================================
+
+def s46v22_safe(v):
+    try:
+        return str(v)
+    except Exception:
+        return ""
+
+
+def s46v22_bool(v):
+    return bool(v)
+
+
+def s46v22_collect_history_diagnostics(history: list[dict]):
+    rows_out = []
+
+    for item in history:
+        rows_out.append({
+            "id": item.get("id"),
+            "created_at": item.get("created_at"),
+            "opportunity_lock_id": item.get("opportunity_lock_id"),
+            "execution_run_id": item.get("execution_run_id"),
+            "execution_task_id": item.get("execution_task_id"),
+            "requirement_id": item.get("requirement_id"),
+            "requirement_key": item.get("requirement_key"),
+            "requirement_label": item.get("requirement_label"),
+            "requirement_category": item.get("requirement_category"),
+            "route_type": item.get("route_type"),
+            "worker_status": item.get("worker_status"),
+            "official_document_status": item.get("official_document_status"),
+            "exact_topic_verified": item.get("exact_topic_verified"),
+            "authoritative_source_verified": item.get("authoritative_source_verified"),
+            "explicit_evidence_verified": item.get("explicit_evidence_verified"),
+            "evidence_url": item.get("evidence_url"),
+            "evidence_excerpt_chars": len(normalize_text(item.get("evidence_excerpt"))),
+            "evidence_reference": item.get("evidence_reference"),
+            "topic_identity": item.get("topic_identity"),
+            "opportunity_identity": item.get("opportunity_identity"),
+            "resolution_method": item.get("resolution_method"),
+        })
+
+    return rows_out
+
+
+def s46v22_match_debug(task: dict, history: list[dict]):
+    debug_rows = []
+
+    for raw in history:
+        item = normalize_stage45_item(raw)
+        score = _candidate_score(task, item)
+        if score <= 0:
+            continue
+
+        debug_rows.append({
+            "score": score,
+            "item_id": item.get("id"),
+            "created_at": item.get("created_at"),
+            "worker_status": item.get("worker_status"),
+            "route_type": item.get("route_type"),
+            "execution_task_id": item.get("execution_task_id"),
+            "requirement_id": item.get("requirement_id"),
+            "requirement_key": item.get("requirement_key"),
+            "requirement_label": item.get("requirement_label"),
+            "evidence_url": item.get("evidence_url"),
+            "excerpt_chars": len(normalize_text(item.get("evidence_excerpt"))),
+            "exact_topic_verified": item.get("exact_topic_verified"),
+            "authoritative_source_verified": item.get("authoritative_source_verified"),
+            "explicit_evidence_verified": item.get("explicit_evidence_verified"),
+            "qualifies_as_resolved_evidence": is_stage45_resolved_evidence(item),
+        })
+
+    debug_rows.sort(
+        key=lambda r: (
+            r.get("score") or 0,
+            normalize_text(r.get("created_at")),
+        ),
+        reverse=True,
+    )
+    return debug_rows[:100]
+
+
+st.divider()
+st.subheader("Stage 46 v2.2 — Stage 45 Handoff Diagnostics")
+st.info(
+    "Acest diagnostic nu schimbă verdicturi. Arată exact ce rânduri Stage 45 există și de ce "
+    "sunt sau nu sunt selectate pentru Stage 46."
+)
+
+_v22_history = load_stage45_history()
+_v22_diag_rows = s46v22_collect_history_diagnostics(_v22_history)
+
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("Stage 45 history rows", len(_v22_history))
+d2.metric(
+    "Rows with RESOLVED-like status",
+    sum(
+        1 for r in _v22_history
+        if _stage45_status(normalize_stage45_item(r))
+        in {"RESOLVED", "COMPLETED", "VERIFIED", "PASS", "PASSED"}
+    ),
+)
+d3.metric(
+    "Rows with explicit evidence flag",
+    sum(1 for r in _v22_history if bool(r.get("explicit_evidence_verified"))),
+)
+d4.metric(
+    "Rows with URL + excerpt",
+    sum(
+        1 for r in _v22_history
+        if _stage45_url(normalize_stage45_item(r))
+        and _stage45_excerpt(normalize_stage45_item(r))
+    ),
+)
+
+with st.expander("Raw Stage 45 worker history", expanded=False):
+    if _v22_diag_rows:
+        st.dataframe(
+            _v22_diag_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No Stage 45 worker history rows found.")
+
+st.subheader("Per-requirement match diagnostics")
+
+for _task in official_tasks:
+    _matches = s46v22_match_debug(_task, _v22_history)
+
+    with st.expander(
+        f"{_task.get('requirement_label') or 'Requirement'} — "
+        f"{len(_matches)} candidate matches",
+        expanded=False,
+    ):
+        st.write(
+            {
+                "task_id": _task.get("id"),
+                "requirement_id": _task.get("requirement_id"),
+                "requirement_key": _task.get("requirement_key"),
+                "requirement_label": _task.get("requirement_label"),
+            }
+        )
+
+        if _matches:
+            st.dataframe(
+                _matches,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No candidate Stage 45 rows matched this requirement.")
+
+st.caption(
+    "v2.2 diagnostic invariant: no Stage 45 row is promoted or demoted here. "
+    "This panel is read-only and exists only to reveal the actual persisted schema/history."
+)
+# =====================================================================
+# END STAGE 46 v2.2 DIAGNOSTICS
 # =====================================================================
