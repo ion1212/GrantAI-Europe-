@@ -6843,3 +6843,511 @@ st.caption(
 # =====================================================================
 # END STAGE 45 v7.10.2
 # =====================================================================
+
+
+
+# =====================================================================
+# STAGE 45 v7.10.3 — PERSISTED EVIDENCE HANDOFF TO STAGE 46
+# =====================================================================
+# Purpose:
+#   - Reuse the strict Topic Document & Annex Resolver already present.
+#   - Persist only strict RESOLVED results into locked_evidence_worker_items.
+#   - Persist exact requirement identity + URL + excerpt + provenance.
+#   - Do NOT treat Stage 45 candidate evidence as final provenance validation.
+#   - Stage 46 remains the independent trust gate.
+#
+# Fail-closed invariant:
+#   WAITING stays WAITING. Only exact-topic + authoritative + explicit evidence
+#   is persisted as a RESOLVED Stage 45 candidate for Stage 46.
+
+def s45v7103_requirement_key(task):
+    raw = " ".join([
+        normalize_text(task.get("requirement_key")),
+        normalize_text(task.get("requirement_category")),
+        normalize_text(task.get("requirement_label")),
+    ]).lower()
+
+    if any(x in raw for x in ("applicant", "eligib", "beneficiar")):
+        return "APPLICANT_ELIGIBILITY"
+
+    if any(x in raw for x in ("consortium", "partner")):
+        return "CONSORTIUM_REQUIREMENTS"
+
+    if any(x in raw for x in ("trl", "technology readiness", "readiness level")):
+        return "TRL_REQUIREMENTS"
+
+    return None
+
+
+def s45v7103_source_row_for_result(result, documents):
+    evidence_url = normalize_text(result.get("evidence_url"))
+
+    if not evidence_url:
+        return None
+
+    # Prefer exact URL match.
+    for row in documents or []:
+        if normalize_text(row.get("source_url")).rstrip("/") == evidence_url.rstrip("/"):
+            return row
+
+    # Conservative fallback: compare without fragments.
+    clean = evidence_url.split("#", 1)[0].rstrip("/")
+    for row in documents or []:
+        row_url = normalize_text(row.get("source_url")).split("#", 1)[0].rstrip("/")
+        if row_url and row_url == clean:
+            return row
+
+    return None
+
+
+def s45v7103_worker_payload(task, worker_run_id, result, source_row):
+    provenance_chain = []
+
+    if source_row:
+        chain = source_row.get("provenance_chain") or []
+        if isinstance(chain, list):
+            provenance_chain = chain
+        elif chain:
+            provenance_chain = [chain]
+
+    evidence_url = normalize_text(result.get("evidence_url"))
+
+    if evidence_url and evidence_url not in provenance_chain:
+        provenance_chain.append(evidence_url)
+
+    evidence_excerpt = normalize_text(result.get("evidence_excerpt"))[:10000]
+
+    return {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+        "execution_run_id": execution_run_id,
+        "worker_run_id": worker_run_id,
+        "execution_task_id": task.get("id"),
+        "requirement_id": task.get("requirement_id"),
+        "opportunity_identity": identity,
+        "requirement_key": task.get("requirement_key"),
+        "requirement_category": task.get("requirement_category"),
+        "requirement_label": task.get("requirement_label"),
+        "route_type": task.get("route_type"),
+        "destination_module": task.get("destination_module"),
+
+        "worker_action": "STAGE46_EVIDENCE_HANDOFF",
+        "worker_status": "RESOLVED",
+
+        "resolved_value": {
+            "stage45_candidate": True,
+            "requirement": task.get("requirement_label"),
+        },
+
+        "evidence_source": "OFFICIAL_DOCUMENTATION",
+        "evidence_reference": (
+            normalize_text(source_row.get("evidence_reference"))
+            if source_row
+            else normalize_text(task.get("requirement_label"))
+        ),
+        "evidence_url": evidence_url,
+        "evidence_excerpt": evidence_excerpt,
+        "confidence": "High",
+
+        # Stage 45 has established the candidate evidence conditions,
+        # but Stage 46 still independently re-fetches/revalidates provenance.
+        "official_verified": False,
+        "reason": normalize_text(result.get("reason"))[:5000],
+        "next_action": "VALIDATE_IN_STAGE_46",
+
+        "source_title": (
+            normalize_text(source_row.get("source_title"))
+            if source_row
+            else "Official European Commission source"
+        ),
+        "document_type": (
+            normalize_text(source_row.get("document_type"))
+            if source_row
+            else "OFFICIAL_EC_DOCUMENT"
+        ),
+        "source_authority": (
+            normalize_text(source_row.get("source_authority"))
+            if source_row
+            else "EUROPEAN_COMMISSION"
+        ),
+
+        "topic_identity": identity,
+        "provenance_chain": provenance_chain,
+
+        "documents_checked": [
+            normalize_text(source_row.get("source_url"))
+        ] if source_row else [evidence_url],
+
+        "searches_attempted": [],
+        "transport_attempts": [],
+
+        "resolution_method": "OFFICIAL_DOCUMENTATION",
+        "retrieved_at": now_iso(),
+
+        "exact_topic_verified": bool(result.get("exact_topic_verified")),
+        "authoritative_source_verified": bool(result.get("authoritative_source_verified")),
+        "explicit_evidence_verified": bool(result.get("explicit_evidence_verified")),
+
+        # EVIDENCE_FOUND deliberately means "candidate ready for Stage 46",
+        # not final provenance trust.
+        "official_document_status": "EVIDENCE_FOUND",
+
+        "official_document_payload": {
+            "stage": 45,
+            "version": "v7.10.3",
+            "handoff_target": "STAGE_46",
+            "stage45_resolution": result,
+            "source_document_id": source_row.get("id") if source_row else None,
+            "source_document_status": source_row.get("retrieval_status") if source_row else None,
+        },
+
+        "resolved_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+
+def s45v7103_persist_candidate(task, worker_run_id, result, documents):
+    # Strict persistence guard.
+    if normalize_text(result.get("status")).upper() != "RESOLVED":
+        return "WAITING_OFFICIAL", None
+
+    if not (
+        bool(result.get("exact_topic_verified"))
+        and bool(result.get("authoritative_source_verified"))
+        and bool(result.get("explicit_evidence_verified"))
+        and normalize_text(result.get("evidence_url"))
+        and normalize_text(result.get("evidence_excerpt"))
+    ):
+        return "WAITING_OFFICIAL", None
+
+    source_row = s45v7103_source_row_for_result(result, documents)
+    payload = s45v7103_worker_payload(task, worker_run_id, result, source_row)
+
+    inserted = (
+        supabase.table("locked_evidence_worker_items")
+        .insert(payload)
+        .execute()
+    ).data or []
+
+    if not inserted:
+        raise RuntimeError("Stage 45 v7.10.3 could not persist the resolved evidence handoff.")
+
+    return "RESOLVED", inserted[0]
+
+
+def s45v7103_update_execution_task_candidate(task, worker_item):
+    """
+    Preserve Stage 46 as the final provenance gate.
+    The execution task remains WAITING_OFFICIAL, but its payload records that
+    Stage 45 has produced a candidate evidence item ready for Stage 46.
+    """
+    existing_payload = as_dict(task.get("completion_payload"))
+
+    existing_payload["stage45_evidence_candidate"] = {
+        "stage": 45,
+        "version": "v7.10.3",
+        "worker_item_id": worker_item.get("id"),
+        "status": "RESOLVED",
+        "evidence_url": worker_item.get("evidence_url"),
+        "evidence_reference": worker_item.get("evidence_reference"),
+        "evidence_excerpt": worker_item.get("evidence_excerpt"),
+        "exact_topic_verified": worker_item.get("exact_topic_verified"),
+        "authoritative_source_verified": worker_item.get("authoritative_source_verified"),
+        "explicit_evidence_verified": worker_item.get("explicit_evidence_verified"),
+        "handoff": "STAGE_46",
+        "created_at": now_iso(),
+    }
+
+    supabase.table("locked_evidence_execution_tasks").update({
+        "task_status": "WAITING_OFFICIAL",
+        "completion_status": None,
+        "completion_source": None,
+        "completion_reference": None,
+        "completed_at": None,
+        "completion_payload": existing_payload,
+        "updated_at": now_iso(),
+    }).eq("id", task.get("id")).eq("user_id", user_id).execute()
+
+
+st.divider()
+st.subheader("Stage 45 v7.10.3 — Persisted Evidence Handoff to Stage 46")
+st.info(
+    "v7.10.3 repară strict persistența Stage 45 → Stage 46. "
+    "Numai rezultatele care au simultan exact-topic, sursă autoritativă, pasaj explicit, "
+    "evidence URL și evidence excerpt sunt salvate ca worker_status=RESOLVED. "
+    "Execution task-ul rămâne WAITING_OFFICIAL până când Etapa 46 validează provenance."
+)
+
+_v7103_docs = []
+try:
+    _v7103_docs = (
+        supabase.table("locked_evidence_official_documents")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("project_id", project_id)
+        .eq("opportunity_lock_id", lock_id)
+        .order("created_at", desc=True)
+        .limit(1000)
+        .execute()
+    ).data or []
+except Exception as _v7103_docs_exc:
+    st.warning(f"v7.10.3 document load warning: {_v7103_docs_exc}")
+
+_v7103_tasks = [
+    t for t in current_tasks
+    if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION"
+]
+
+_v7103_preview = []
+
+for _task in _v7103_tasks:
+    _rk = s45v7103_requirement_key(_task)
+
+    if not _rk:
+        _res = {
+            "status": "WAITING_OFFICIAL",
+            "exact_topic_verified": False,
+            "authoritative_source_verified": False,
+            "explicit_evidence_verified": False,
+            "evidence_url": None,
+            "evidence_excerpt": None,
+            "reason": "Requirement family is not handled by v7.10.3 persistence.",
+        }
+    else:
+        _res = s45v710_resolve_from_documents(
+            _rk,
+            identity,
+            _v7103_docs,
+        )
+
+    _v7103_preview.append({
+        "task": _task,
+        "requirement_key_v7103": _rk,
+        "result": _res,
+    })
+
+v31, v32, v33, v34 = st.columns(4)
+v31.metric("OFFICIAL requirements", len(_v7103_tasks))
+v32.metric(
+    "Strict RESOLVED candidates",
+    sum(1 for x in _v7103_preview if normalize_text(x["result"].get("status")).upper() == "RESOLVED"),
+)
+v33.metric(
+    "Candidates with URL + excerpt",
+    sum(
+        1 for x in _v7103_preview
+        if normalize_text(x["result"].get("evidence_url"))
+        and normalize_text(x["result"].get("evidence_excerpt"))
+    ),
+)
+v34.metric("Official documents loaded", len(_v7103_docs))
+
+if _v7103_preview:
+    st.dataframe(
+        [
+            {
+                "Requirement": x["task"].get("requirement_label"),
+                "Resolver key": x["requirement_key_v7103"],
+                "Status": x["result"].get("status"),
+                "Exact topic": x["result"].get("exact_topic_verified"),
+                "Authoritative": x["result"].get("authoritative_source_verified"),
+                "Explicit evidence": x["result"].get("explicit_evidence_verified"),
+                "Evidence URL": x["result"].get("evidence_url"),
+                "Excerpt chars": len(normalize_text(x["result"].get("evidence_excerpt"))),
+                "Reason": x["result"].get("reason"),
+            }
+            for x in _v7103_preview
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+if st.button(
+    "📤 Run Stage 45 v7.10.3 persisted handoff",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v7103_handoff",
+):
+    run = (
+        supabase.table("locked_evidence_worker_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "total_tasks": len(_v7103_tasks),
+            "worker_status": "RUNNING",
+            "deep_resolution_version": "v7.10.3",
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "started_at": now_iso(),
+            "summary": {
+                "stage": 45,
+                "version": "v7.10.3",
+                "purpose": "PERSISTED_STAGE46_HANDOFF",
+            },
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not run:
+        st.error("Nu am putut crea Stage 45 v7.10.3 run.")
+    else:
+        _run_id = str(run[0]["id"])
+        _resolved = 0
+        _waiting = 0
+        _failed = 0
+        _handoff_items = []
+
+        _bar = st.progress(0)
+
+        for _idx, _entry in enumerate(_v7103_preview, 1):
+            _task = _entry["task"]
+            _res = _entry["result"]
+
+            try:
+                _state, _worker_item = s45v7103_persist_candidate(
+                    _task,
+                    _run_id,
+                    _res,
+                    _v7103_docs,
+                )
+
+                if _state == "RESOLVED" and _worker_item:
+                    _resolved += 1
+                    _handoff_items.append(_worker_item)
+                    s45v7103_update_execution_task_candidate(
+                        _task,
+                        _worker_item,
+                    )
+                else:
+                    _waiting += 1
+
+            except Exception as _exc:
+                _failed += 1
+                st.warning(
+                    f"{_task.get('requirement_label')} — "
+                    f"{type(_exc).__name__}: {str(_exc)[:500]}"
+                )
+
+            _bar.progress(_idx / max(1, len(_v7103_preview)))
+
+        _final = (
+            "FAILED"
+            if _failed and _resolved == 0 and _waiting == 0
+            else "PARTIAL_FAILURE"
+            if _failed
+            else "COMPLETED"
+            if (_resolved + _waiting) == len(_v7103_tasks)
+            else "WAITING"
+        )
+
+        supabase.table("locked_evidence_worker_runs").update({
+            "resolved_tasks": _resolved,
+            "waiting_tasks": _waiting,
+            "failed_tasks": _failed,
+            "worker_status": _final,
+            "diagnostic_status": (
+                "FAILED"
+                if _final == "FAILED"
+                else "PARTIAL_FAILURE"
+                if _final == "PARTIAL_FAILURE"
+                else "CLEAN"
+            ),
+            "official_tasks_resolved": _resolved,
+            "official_tasks_waiting": _waiting,
+            "deep_resolution_version": "v7.10.3",
+            "provenance_summary": {
+                "stage": 45,
+                "version": "v7.10.3",
+                "handoff_target": "STAGE_46",
+                "resolved_candidates_persisted": _resolved,
+                "waiting": _waiting,
+                "failed": _failed,
+                "worker_item_ids": [
+                    x.get("id") for x in _handoff_items
+                ],
+            },
+            "completed_at": now_iso(),
+            "updated_at": now_iso(),
+        }).eq("id", _run_id).eq("user_id", user_id).execute()
+
+        st.success(
+            f"Stage 45 v7.10.3: {_final} — "
+            f"persisted RESOLVED {_resolved}, waiting {_waiting}, failed {_failed}."
+        )
+        st.rerun()
+
+
+_v7103_runs = rows(
+    "locked_evidence_worker_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    100,
+)
+
+_v7103_runs = [
+    r for r in _v7103_runs
+    if normalize_text(r.get("deep_resolution_version")).lower() == "v7.10.3"
+]
+
+if _v7103_runs:
+    _latest_v7103 = _v7103_runs[0]
+
+    st.subheader("Latest Stage 45 v7.10.3 Result")
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Status", _latest_v7103.get("worker_status") or "—")
+    p2.metric("Persisted RESOLVED", _latest_v7103.get("official_tasks_resolved") or 0)
+    p3.metric("Waiting", _latest_v7103.get("official_tasks_waiting") or 0)
+    p4.metric("Failed", _latest_v7103.get("failed_tasks") or 0)
+
+    _v7103_items = rows(
+        "locked_evidence_worker_items",
+        {
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "worker_run_id": str(_latest_v7103.get("id")),
+        },
+        "created_at",
+        100,
+    )
+
+    if _v7103_items:
+        st.subheader("Stage 46 handoff rows")
+        st.dataframe(
+            [
+                {
+                    "Requirement": i.get("requirement_label"),
+                    "Worker status": i.get("worker_status"),
+                    "Execution task": i.get("execution_task_id"),
+                    "Requirement id": i.get("requirement_id"),
+                    "Requirement key": i.get("requirement_key"),
+                    "Exact topic": i.get("exact_topic_verified"),
+                    "Authoritative": i.get("authoritative_source_verified"),
+                    "Explicit evidence": i.get("explicit_evidence_verified"),
+                    "Document status": i.get("official_document_status"),
+                    "Evidence URL": i.get("evidence_url"),
+                    "Excerpt chars": len(normalize_text(i.get("evidence_excerpt"))),
+                }
+                for i in _v7103_items
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+st.caption(
+    "v7.10.3 invariant: Stage 45 persists only strict substantive evidence candidates. "
+    "Final provenance trust remains the responsibility of Stage 46."
+)
+# =====================================================================
+# END STAGE 45 v7.10.3
+# =====================================================================
