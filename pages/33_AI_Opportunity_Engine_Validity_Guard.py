@@ -150,26 +150,12 @@ project_id = str(selected_project["id"]) if selected_project else None
 
 
 # ---------------------------------------------------------------------
-# Discover opportunity records from existing tables
+# Authoritative Stage 34 snapshot input — FAIL CLOSED
 # ---------------------------------------------------------------------
-candidate_tables = (
-    "opportunities",
-    "grant_opportunities",
-    "funding_opportunities",
-)
+# Stage 33 must consume ONLY the latest successful Stage 34 clean snapshot.
+# Historical opportunities and workflow-history fallbacks are not allowed
+# to become current Stage 33 input.
 
-opportunities = []
-source_table = None
-
-for table in candidate_tables:
-    data = rows(table, {"user_id": user_id}, "updated_at", 500)
-    if data:
-        opportunities = data
-        source_table = table
-        break
-
-# Fallback: derive unique opportunity identities already used by projects/workflow.
-# Prefer the clean opportunity set produced by the latest successful Etapa 34 run.
 latest_refresh_runs = rows(
     "opportunity_refresh_runs",
     {"user_id": user_id},
@@ -192,77 +178,112 @@ latest_refresh_run = next(
     None,
 )
 
-latest_refresh_identities = set()
-if latest_refresh_run:
-    refresh_items = rows(
-        "opportunity_refresh_items",
-        {
-            "user_id": user_id,
-            "refresh_run_id": latest_refresh_run["id"],
-        },
-        "created_at",
-        1000,
+if not latest_refresh_run:
+    st.error(
+        "Stage 33 este BLOCKED: nu există un refresh Stage 34 COMPLETED "
+        "cu oportunități salvate pentru contextul curent."
     )
-    latest_refresh_identities = {
-        str(r.get("opportunity_identity") or "").strip()
-        for r in refresh_items
-        if str(r.get("refresh_status") or "") in ("Candidate", "Saved")
-        and str(r.get("opportunity_identity") or "").strip()
-    }
+    st.stop()
 
-    if latest_refresh_identities and opportunities:
-        by_identity = {}
-        for row in opportunities:
-            identity = str(row.get("identity") or "").strip()
-            if identity in latest_refresh_identities and identity not in by_identity:
-                by_identity[identity] = row
-        opportunities = list(by_identity.values())
+latest_refresh_run_id = str(latest_refresh_run.get("id") or "").strip()
+if not latest_refresh_run_id:
+    st.error("Stage 33 este BLOCKED: ultimul Stage 34 run nu are refresh_run_id valid.")
+    st.stop()
+
+all_opportunities = rows(
+    "opportunities",
+    {"user_id": user_id},
+    "updated_at",
+    5000,
+)
+
+opportunities = []
+for row in all_opportunities:
+    raw_data = row.get("data")
+    if isinstance(raw_data, str) and raw_data.strip():
+        try:
+            raw_data = json.loads(raw_data)
+        except Exception:
+            raw_data = {}
+    if not isinstance(raw_data, dict):
+        raw_data = {}
+
+    if str(raw_data.get("refresh_source") or "").strip() != "Etapa 34":
+        continue
+    if str(raw_data.get("refresh_run_id") or "").strip() != latest_refresh_run_id:
+        continue
+    if raw_data.get("active_in_latest_refresh") is not True:
+        continue
+
+    opportunities.append(row)
+
+source_table = "opportunities / latest Stage 34 active snapshot"
+
+# Secondary cross-check against opportunity_refresh_items from the same run.
+refresh_items = rows(
+    "opportunity_refresh_items",
+    {
+        "user_id": user_id,
+        "refresh_run_id": latest_refresh_run_id,
+    },
+    "created_at",
+    2000,
+)
+
+stage34_candidate_identities = {
+    str(r.get("opportunity_identity") or "").strip()
+    for r in refresh_items
+    if str(r.get("refresh_status") or "") == "Candidate"
+    and str(r.get("opportunity_identity") or "").strip()
+}
+
+snapshot_identities = {
+    str(r.get("identity") or "").strip()
+    for r in opportunities
+    if str(r.get("identity") or "").strip()
+}
+
+snapshot_invariant_errors = []
 
 if not opportunities:
-    seen = set()
-    fallback_tables = (
-        "opportunity_fit_gate_runs",
-        "evidence_requirement_resolution_runs",
-        "official_call_verification_runs",
-        "opportunity_validity_runs",
-        "rereview_orchestration_runs",
+    snapshot_invariant_errors.append(
+        "Ultimul Stage 34 run este COMPLETED, dar snapshot-ul activ este gol."
     )
-    for table in fallback_tables:
-        filters = {"user_id": user_id}
-        if project_id:
-            filters["project_id"] = project_id
-        for row in rows(table, filters, "created_at", 500):
-            identity = str(row.get("opportunity_identity") or "").strip()
-            if identity and identity not in seen:
-                seen.add(identity)
-                opportunities.append({
-                    "id": None,
-                    "opportunity_identity": identity,
-                    "title": identity,
-                    "project_id": row.get("project_id"),
-                    "_derived": True,
-                })
-    source_table = "workflow history"
 
-if project_id:
-    filtered = []
-    for opp in opportunities:
-        opp_project = str(opp.get("project_id") or "")
-        if not opp_project or opp_project == project_id:
-            filtered.append(opp)
-    opportunities = filtered
+expected_saved = int(latest_refresh_run.get("saved_opportunities") or 0)
+if expected_saved and len(opportunities) != expected_saved:
+    snapshot_invariant_errors.append(
+        f"Stage 34 saved_opportunities={expected_saved}, "
+        f"dar Stage 33 găsește {len(opportunities)} rânduri active."
+    )
 
-if not opportunities:
-    st.warning("Nu am găsit oportunități de verificat.")
+if stage34_candidate_identities and snapshot_identities != stage34_candidate_identities:
+    missing = sorted(stage34_candidate_identities - snapshot_identities)
+    extra = sorted(snapshot_identities - stage34_candidate_identities)
+    snapshot_invariant_errors.append(
+        "Identitățile snapshot-ului activ nu corespund exact item-urilor Candidate "
+        f"din Stage 34. missing={missing[:10]}, extra={extra[:10]}"
+    )
+
+if snapshot_invariant_errors:
+    st.error(
+        "Stage 33 este BLOCKED deoarece invariantul Stage 34 → Stage 33 a eșuat:\n\n"
+        + "\n".join(f"- {x}" for x in snapshot_invariant_errors)
+    )
     st.stop()
 
 st.write(f"**Sursă oportunități:** {source_table}")
-st.write(f"**Oportunități găsite:** {len(opportunities)}")
-if latest_refresh_run and latest_refresh_identities:
-    st.success(
-        f"Set activ din Etapa 34: {len(opportunities)} oportunități curate "
-        f"(refresh {str(latest_refresh_run.get('id'))[:8]})."
-    )
+
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("Stage 34 latest run", str(latest_refresh_run_id)[:8])
+d2.metric("Stage 34 snapshot rows", len(opportunities))
+d3.metric("Stage 33 rows evaluated", len(opportunities))
+d4.metric("Snapshot run id", str(latest_refresh_run_id)[:8])
+
+st.success(
+    f"Snapshot Stage 34 confirmat: {len(opportunities)} oportunități active "
+    f"(refresh {latest_refresh_run_id[:8]})."
+)
 
 
 # ---------------------------------------------------------------------
@@ -467,6 +488,9 @@ def classify(row: dict):
             "source_url": source_url,
             "confidence": confidence,
             "source": "Etapa 32",
+            "source_stage": 34,
+            "source_refresh_run_id": latest_refresh_run_id,
+            "source_snapshot_active": True,
             "opportunity_id": row.get("id"),
         }
 
@@ -532,6 +556,9 @@ def classify(row: dict):
         "source_url": source_url,
         "confidence": confidence,
         "source": source_table,
+        "source_stage": 34,
+        "source_refresh_run_id": latest_refresh_run_id,
+        "source_snapshot_active": True,
         "opportunity_id": row.get("id"),
     }
 
@@ -591,6 +618,11 @@ if st.button(
 ):
     with st.spinner("Aplic gate-ul de validitate oportunităților..."):
         try:
+            if len(classified) != len(opportunities):
+                raise RuntimeError(
+                    "Snapshot invariant failed before persistence: "
+                    f"Stage34={len(opportunities)} vs Stage33={len(classified)}."
+                )
             run_insert = (
                 supabase.table("opportunity_engine_guard_runs")
                 .insert({
@@ -606,7 +638,16 @@ if st.button(
                     "summary": {
                         "stage": 33,
                         "source_table": source_table,
-                        "rule": "Only VALID opportunities are eligible for scoring/workflow.",
+                        "source_stage": 34,
+                        "source_refresh_run_id": latest_refresh_run_id,
+                        "source_snapshot_active": True,
+                        "stage34_snapshot_rows": len(opportunities),
+                        "stage33_rows_evaluated": len(classified),
+                        "snapshot_invariant_ok": len(opportunities) == len(classified),
+                        "rule": (
+                            "Only VALID opportunities from the active snapshot of the latest "
+                            "successful Stage 34 refresh are eligible for scoring/workflow."
+                        ),
                     },
                     "updated_at": now_iso(),
                 })
@@ -654,6 +695,9 @@ if st.button(
                         "stage": 33,
                         "guard_run_id": run_id,
                         "guard_date": today.isoformat(),
+                        "source_stage": 34,
+                        "source_refresh_run_id": latest_refresh_run_id,
+                        "source_snapshot_active": True,
                     },
                     "updated_at": now_iso(),
                 }).execute()
