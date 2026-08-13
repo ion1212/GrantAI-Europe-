@@ -492,19 +492,6 @@ def evaluate_candidate(c):
     title = normalize_text(c.get("title"))
     source_url = normalize_text(c.get("official_url"))
 
-    if not identity:
-        return "Rejected missing identity", "Lipsește identitatea oportunității.", deadline_date
-
-    if not deadline_date:
-        return "Rejected missing deadline", "Deadline-ul nu poate fi determinat.", None
-
-    if deadline_date < date.today():
-        return (
-            "Rejected expired",
-            f"Deadline {deadline_date.isoformat()} este în trecut.",
-            deadline_date,
-        )
-
     metadata_points = 0
     metadata_points += 25 if identity else 0
     metadata_points += 20 if title else 0
@@ -513,17 +500,32 @@ def evaluate_candidate(c):
     metadata_points += 10 if c.get("programme") else 0
     metadata_points += 10 if c.get("status") else 0
 
+    if not identity:
+        return "Rejected missing identity", "Lipsește identitatea oportunității.", deadline_date, metadata_points
+
+    if not deadline_date:
+        return "Rejected missing deadline", "Deadline-ul nu poate fi determinat.", None, metadata_points
+
+    if deadline_date < date.today():
+        return (
+            "Rejected expired",
+            f"Deadline {deadline_date.isoformat()} este în trecut.",
+            deadline_date,
+            metadata_points,
+        )
+
     if metadata_points < 60:
         return (
             "Rejected invalid metadata",
             f"Calitatea metadatelor este insuficientă ({metadata_points}/100).",
             deadline_date,
+            metadata_points,
         )
 
-    return "Candidate", "", deadline_date
+    return "Candidate", "", deadline_date, metadata_points
 
 
-def build_opportunities_payload(c, deadline_date):
+def build_opportunities_payload(c, deadline_date, metadata_quality, refresh_run_id):
     # Store in the exact schema used by public.opportunities:
     # identity + data JSONB.
     deadline_iso = (
@@ -549,8 +551,10 @@ def build_opportunities_payload(c, deadline_date):
         "status": c.get("status") or "",
         "country_or_region": c.get("country_or_region") or "",
         "deadline_label": "Deschis" if days_left is not None and days_left >= 0 else "Închis",
-        "metadata_quality": 100,
+        "metadata_quality": int(metadata_quality or 0),
         "refresh_source": "Etapa 34",
+        "refresh_run_id": refresh_run_id,
+        "active_in_latest_refresh": True,
         "refreshed_at": now_iso(),
     }
 
@@ -603,23 +607,28 @@ if st.button(
                     "rejected_expired": 0,
                     "rejected_missing_deadline": 0,
                     "rejected_missing_identity": 0,
+                    "rejected_invalid_metadata": 0,
+                    "deactivated_stale": 0,
+                    "snapshot_count": 0,
                     "saved_opportunities": 0,
                 }
 
                 clean_candidates = []
 
                 for c in candidates:
-                    status, reason, deadline_date = evaluate_candidate(c)
+                    status, reason, deadline_date, metadata_quality = evaluate_candidate(c)
 
                     if status == "Candidate":
                         stats["valid_metadata"] += 1
-                        clean_candidates.append((c, deadline_date))
+                        clean_candidates.append((c, deadline_date, metadata_quality))
                     elif status == "Rejected expired":
                         stats["rejected_expired"] += 1
                     elif status == "Rejected missing deadline":
                         stats["rejected_missing_deadline"] += 1
                     elif status == "Rejected missing identity":
                         stats["rejected_missing_identity"] += 1
+                    elif status == "Rejected invalid metadata":
+                        stats["rejected_invalid_metadata"] += 1
 
                     supabase.table("opportunity_refresh_items").insert({
                         "user_id": user_id,
@@ -640,16 +649,55 @@ if st.button(
                         ),
                         "source_status": c.get("status") or None,
                         "source_url": c.get("official_url") or None,
-                        "metadata_quality": 100 if status == "Candidate" else 0,
+                        "metadata_quality": int(metadata_quality or 0),
                         "refresh_status": status,
                         "rejection_reason": reason or None,
                         "raw_data": c.get("raw") or {},
                         "updated_at": now_iso(),
                     }).execute()
 
-                # Upsert only clean, non-expired opportunities.
-                for c, deadline_date in clean_candidates:
-                    payload = build_opportunities_payload(c, deadline_date)
+                # CLEAN REBUILD: keep history, but activate only THIS refresh snapshot.
+                clean_identity_set = {
+                    normalize_text(c.get("identity"))
+                    for c, _, _ in clean_candidates
+                    if normalize_text(c.get("identity"))
+                }
+
+                existing_stage34_rows = rows(
+                    "opportunities",
+                    {"user_id": user_id},
+                    "updated_at",
+                    5000,
+                )
+
+                for existing_row in existing_stage34_rows:
+                    data = existing_row.get("data") or {}
+                    if not isinstance(data, dict):
+                        continue
+                    if normalize_text(data.get("refresh_source")) != "Etapa 34":
+                        continue
+
+                    existing_identity = normalize_text(existing_row.get("identity"))
+                    should_be_active = existing_identity in clean_identity_set
+
+                    if not should_be_active and bool(data.get("active_in_latest_refresh", True)):
+                        data["active_in_latest_refresh"] = False
+                        data["deactivated_by_refresh_run_id"] = run_id
+                        data["deactivated_at"] = now_iso()
+
+                        (
+                            supabase.table("opportunities")
+                            .update({"data": data, "updated_at": now_iso()})
+                            .eq("id", existing_row["id"])
+                            .eq("user_id", user_id)
+                            .execute()
+                        )
+                        stats["deactivated_stale"] += 1
+
+                for c, deadline_date, metadata_quality in clean_candidates:
+                    payload = build_opportunities_payload(
+                        c, deadline_date, metadata_quality, run_id
+                    )
 
                     existing = (
                         supabase.table("opportunities")
@@ -676,8 +724,62 @@ if st.button(
 
                     stats["saved_opportunities"] += 1
 
+                # Verify the exact active snapshot written by this run.
+                refreshed_rows = rows(
+                    "opportunities",
+                    {"user_id": user_id},
+                    "updated_at",
+                    5000,
+                )
+
+                active_snapshot = []
+                invariant_errors = []
+
+                for opp_row in refreshed_rows:
+                    data = opp_row.get("data") or {}
+                    if not isinstance(data, dict):
+                        continue
+                    if normalize_text(data.get("refresh_source")) != "Etapa 34":
+                        continue
+                    if normalize_text(data.get("refresh_run_id")) != run_id:
+                        continue
+                    if not bool(data.get("active_in_latest_refresh")):
+                        continue
+
+                    snapshot_identity = normalize_text(opp_row.get("identity"))
+                    snapshot_deadline = parse_date(data.get("deadline"))
+
+                    if not snapshot_identity:
+                        invariant_errors.append(
+                            f"Active row {opp_row.get('id')} has no identity."
+                        )
+                        continue
+                    if not snapshot_deadline:
+                        invariant_errors.append(
+                            f"{snapshot_identity}: active row has no parsable deadline."
+                        )
+                        continue
+                    if snapshot_deadline < date.today():
+                        invariant_errors.append(
+                            f"{snapshot_identity}: active deadline {snapshot_deadline.isoformat()} is expired."
+                        )
+                        continue
+
+                    active_snapshot.append(opp_row)
+
+                stats["snapshot_count"] = len(active_snapshot)
+
+                if stats["snapshot_count"] != stats["saved_opportunities"]:
+                    invariant_errors.append(
+                        f"snapshot_count != saved_opportunities "
+                        f"({stats['snapshot_count']} != {stats['saved_opportunities']})."
+                    )
+
+
                 run_status = (
-                    "Completed"
+                    "Failed"
+                    if invariant_errors
+                    else "Completed"
                     if stats["saved_opportunities"] > 0
                     else "Needs attention"
                 )
@@ -691,9 +793,12 @@ if st.button(
                             "stage": 34,
                             "api_url": api_url,
                             "rule": (
-                                "Only future-deadline opportunities with sufficient metadata "
-                                "are saved to public.opportunities."
+                                "Only the current clean refresh snapshot with identity, parsable "
+                                "future deadline and sufficient metadata remains active for Stage 33."
                             ),
+                            "active_snapshot_count": stats["snapshot_count"],
+                            "deactivated_stale": stats["deactivated_stale"],
+                            "invariant_errors": invariant_errors,
                         },
                         "completed_at": now_iso(),
                         "updated_at": now_iso(),
@@ -703,9 +808,17 @@ if st.button(
                     .execute()
                 )
 
-                st.success(
-                    f"Refresh finalizat: {stats['saved_opportunities']} oportunități curate salvate."
-                )
+                if run_status == "Failed":
+                    st.error(
+                        "Refresh-ul a încălcat invariantul snapshot-ului curat: "
+                        + " | ".join(invariant_errors[:6])
+                    )
+                else:
+                    st.success(
+                        f"Refresh finalizat: {stats['saved_opportunities']} salvate; "
+                        f"snapshot activ {stats['snapshot_count']}; "
+                        f"stale dezactivate {stats['deactivated_stale']}."
+                    )
                 st.rerun()
 
             except Exception as exc:
@@ -755,11 +868,13 @@ st.divider()
 st.subheader("Refresh Result")
 
 if latest:
-    a, b, c, d = st.columns(4)
+    a, b, c, d, e, f = st.columns(6)
     a.metric("Fetched", int(latest.get("total_fetched") or 0))
     b.metric("Valid metadata", int(latest.get("valid_metadata") or 0))
     c.metric("Expired rejected", int(latest.get("rejected_expired") or 0))
-    d.metric("Saved", int(latest.get("saved_opportunities") or 0))
+    d.metric("Missing deadline", int(latest.get("rejected_missing_deadline") or 0))
+    e.metric("Saved", int(latest.get("saved_opportunities") or 0))
+    f.metric("Snapshot", int(latest.get("snapshot_count") or latest.get("saved_opportunities") or 0))
 
     st.write(f"**Run status:** {latest.get('run_status')}")
 
@@ -774,37 +889,54 @@ if latest:
     )
 
     if items:
-        st.dataframe(
-            [
-                {
-                    "Title": i.get("opportunity_title"),
-                    "Identity": i.get("opportunity_identity"),
-                    "Deadline": i.get("deadline_date"),
-                    "Status": i.get("refresh_status"),
-                    "Reason": i.get("rejection_reason"),
-                    "Source status": i.get("source_status"),
-                }
-                for i in items
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        saved_items = [
-            i for i in items
-            if i.get("refresh_status") == "Candidate"
-        ]
+        saved_items = [i for i in items if i.get("refresh_status") == "Candidate"]
+        rejected_items = [i for i in items if i.get("refresh_status") != "Candidate"]
 
         if saved_items:
+            st.subheader("Active clean snapshot")
+            st.dataframe(
+                [
+                    {
+                        "Title": i.get("opportunity_title"),
+                        "Identity": i.get("opportunity_identity"),
+                        "Deadline": i.get("deadline_date"),
+                        "Status": i.get("refresh_status"),
+                        "Metadata quality": i.get("metadata_quality"),
+                        "Source status": i.get("source_status"),
+                    }
+                    for i in saved_items
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
             st.success(
-                "Aceste oportunități au trecut filtrul Etapei 34. "
-                "Rulează apoi Etapa 33 pentru validarea finală înainte de scoring."
+                "Aceste oportunități reprezintă snapshot-ul curat al ultimei rulări. "
+                "Etapa 33 trebuie să accepte numai acest set activ."
             )
         else:
             st.warning(
                 "Nicio oportunitate nu a trecut filtrul. "
                 "Schimbă termenii de căutare sau verifică sursa/API-ul."
             )
+
+        if rejected_items:
+            with st.expander(f"Rejected by Stage 34 ({len(rejected_items)})", expanded=False):
+                st.dataframe(
+                    [
+                        {
+                            "Title": i.get("opportunity_title"),
+                            "Identity": i.get("opportunity_identity"),
+                            "Deadline": i.get("deadline_date"),
+                            "Status": i.get("refresh_status"),
+                            "Reason": i.get("rejection_reason"),
+                            "Metadata quality": i.get("metadata_quality"),
+                        }
+                        for i in rejected_items
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
 else:
     st.caption("Nu există încă un refresh Etapa 34.")
 
@@ -820,7 +952,10 @@ with st.expander("Istoric Etapa 34"):
                     "valid": r.get("valid_metadata"),
                     "expired": r.get("rejected_expired"),
                     "missing_deadline": r.get("rejected_missing_deadline"),
+                    "invalid_metadata": r.get("rejected_invalid_metadata"),
                     "saved": r.get("saved_opportunities"),
+                    "snapshot": r.get("snapshot_count"),
+                    "deactivated_stale": r.get("deactivated_stale"),
                     "status": r.get("run_status"),
                 }
                 for r in history
