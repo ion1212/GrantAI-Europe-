@@ -7352,287 +7352,430 @@ st.caption(
 # END STAGE 45 v7.10.3
 # =====================================================================
 
-
 # =====================================================================
-# STAGE 45 v7.10.4 — CANONICAL SOURCE RECOVERY & STRICT STAGE 46 HANDOFF
+# STAGE 45 v7.10.5 — STRICT CANONICAL DOCUMENT RESOLVER
 # =====================================================================
-# v7.10.4 repairs the failure mode where a candidate points to an EC/EU
-# authentication/error/search wrapper rather than the canonical substantive
-# document. It does NOT weaken Stage 46. Stage 46 remains the final provenance
-# gate.
+# This replaces v7.10.4 discovery behavior.
 #
-# Invariants:
-#   1) Never promote CAS/login/auth/error content.
-#   2) Require an allowed official EC/EU final host.
-#   3) Require exact locked-topic applicability.
-#   4) Require explicit requirement evidence in the freshly fetched source.
-#   5) Persist the canonical final URL + exact excerpt actually present there.
-#   6) Keep unresolved requirements WAITING_OFFICIAL.
+# Core invariants:
+#   1) The ACTIVE lock canonical URL is the primary seed.
+#   2) Historical Stage 45 documents are NOT re-crawled as discovery seeds.
+#   3) Search API endpoints are discovery-only and can never be evidence.
+#   4) CAS/EU Login/auth/error pages and static assets are rejected BEFORE promotion.
+#   5) Redirects to auth/error destinations are rejected immediately.
+#   6) Only substantive official EC/EU documents/pages can prove exact-topic applicability.
+#   7) Exact topic must be present in the freshly fetched substantive source itself.
+#   8) Applicant / consortium / TRL require an explicit passage in that same source.
+#   9) Unproven requirements remain WAITING_OFFICIAL. Stage 46 remains the final gate.
 
-def s45v7104_requirement_key(task):
+
+def s45v7105_requirement_key(task):
     return s45v7103_requirement_key(task)
 
 
-def s45v7104_allowed_official_url(url):
-    url = normalize_text(url)
-    if not url:
-        return False
+def s45v7105_host(url):
     try:
-        host = (urlparse(url).hostname or "").lower()
+        return (urlparse(normalize_text(url)).hostname or '').lower()
     except Exception:
-        return False
-    return (
-        host == "europa.eu"
-        or host.endswith(".europa.eu")
-        or host == "ec.europa.eu"
-        or host.endswith(".ec.europa.eu")
-    )
+        return ''
 
 
-def s45v7104_bad_url(url):
+def s45v7105_is_search_api(url):
+    host = s45v7105_host(url)
     low = normalize_text(url).lower()
-    if not low:
+    return host == 'api.tech.ec.europa.eu' and '/search-api/' in low
+
+
+def s45v7105_allowed_official_host(url):
+    host = s45v7105_host(url)
+    return bool(
+        host == 'europa.eu'
+        or host.endswith('.europa.eu')
+        or host == 'ec.europa.eu'
+        or host.endswith('.ec.europa.eu')
+        or host == 'commission.europa.eu'
+        or host.endswith('.commission.europa.eu')
+    )
+
+
+def s45v7105_is_static_asset(url):
+    low = normalize_text(url).lower().split('?', 1)[0].split('#', 1)[0]
+    return any(low.endswith(ext) for ext in (
+        '.js', '.css', '.map', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp',
+        '.ico', '.woff', '.woff2', '.ttf', '.eot', '.xml', '.rss', '.atom',
+    ))
+
+
+def s45v7105_bad_url(url):
+    low = normalize_text(url).lower()
+    host = s45v7105_host(url)
+    if not low or not host:
         return True
-    bad = (
-        "/cas/", "/login", "/signin", "/sign-in", "/oauth", "/authorize",
-        "/authentication", "/auth/", "error=", "/error", "access-denied",
-        "access_denied", "sessionexpired", "session-expired",
+
+    bad_hosts = (
+        'webgate.',
+        'trusted-digital-identity.',
+        'ecas.',
+        'login.',
+        'authentication.',
     )
-    return any(x in low for x in bad)
+    if any(host.startswith(x) for x in bad_hosts):
+        return True
 
-
-def s45v7104_bad_content(text, title=""):
-    low = re.sub(r"\s+", " ", f"{normalize_text(title)} {normalize_text(text)}").lower()
-    markers = (
-        "central authentication service",
-        "authentication required",
-        "please sign in",
-        "please log in",
-        "login required",
-        "access denied",
-        "session expired",
-        "an error occurred",
-        "page not found",
-        "request could not be processed",
+    bad_markers = (
+        '/cas/', '/login', '/signin', '/sign-in', '/oauth', '/authorize',
+        '/authentication', '/auth/', 'privacyStatement', 'privacystatement',
+        'loginrequestid=', 'ecas_sessionid', '__secure-ecas', '/logout',
+        'access-denied', 'access_denied', 'sessionexpired', 'session-expired',
+        '/error', 'error=', '/account', '/iam/', '/identity-and-access',
     )
-    return any(x in low for x in markers)
+    if any(x.lower() in low for x in bad_markers):
+        return True
+
+    return s45v7105_is_static_asset(url)
 
 
-def s45v7104_html_to_text(raw, content_type=""):
-    raw = raw or ""
-    ctype = normalize_text(content_type).lower()
-
-    if "json" in ctype:
-        try:
-            obj = json.loads(raw)
-            return json.dumps(obj, ensure_ascii=False, default=str)
-        except Exception:
-            return raw
-
-    if ("html" in ctype or "<html" in raw[:3000].lower()) and BeautifulSoup is not None:
-        try:
-            soup = BeautifulSoup(raw, "html.parser")
-            for node in soup(["script", "style", "noscript", "svg"]):
-                node.decompose()
-            return re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-        except Exception:
-            pass
-
-    return re.sub(r"\s+", " ", raw)
+def s45v7105_bad_content(text, title=''):
+    corpus = re.sub(r'\s+', ' ', f'{normalize_text(title)} {normalize_text(text)}').lower()
+    strong = (
+        'central authentication service',
+        'eu login one account',
+        'eu login user portal',
+        'identity and access management service',
+        'authentication required',
+        'please sign in',
+        'please log in',
+        'login required',
+        'access denied',
+        'session expired',
+        'privacy statement for users registered with the european commission',
+        'request could not be processed',
+        'page not found',
+    )
+    return any(x in corpus for x in strong)
 
 
-def s45v7104_fetch(url, timeout=40):
+def s45v7105_pdf_text(content):
+    if not content or PdfReader is None:
+        return ''
+    try:
+        reader = PdfReader(BytesIO(content))
+        parts = []
+        for page in reader.pages[:350]:
+            try:
+                txt = page.extract_text() or ''
+            except Exception:
+                txt = ''
+            if txt:
+                parts.append(txt)
+            if sum(len(x) for x in parts) >= 350000:
+                break
+        return re.sub(r'\s+', ' ', '\n'.join(parts))[:350000]
+    except Exception:
+        return ''
+
+
+def s45v7105_html_text(raw):
+    raw = raw or ''
+    if BeautifulSoup is None:
+        return re.sub(r'\s+', ' ', raw)
+    try:
+        soup = BeautifulSoup(raw, 'html.parser')
+        for node in soup(['script', 'style', 'noscript', 'svg', 'template']):
+            node.decompose()
+        return re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    except Exception:
+        return re.sub(r'\s+', ' ', raw)
+
+
+def s45v7105_fetch(url, timeout=45):
+    requested = normalize_text(url)
     out = {
-        "ok": False,
-        "requested_url": normalize_text(url),
-        "final_url": None,
-        "status": None,
-        "content_type": "",
-        "text": "",
-        "raw": "",
-        "title": "",
-        "error": "",
+        'ok': False,
+        'requested_url': requested,
+        'final_url': requested,
+        'status': None,
+        'content_type': '',
+        'title': '',
+        'text': '',
+        'raw': '',
+        'json': None,
+        'error': '',
+        'rejected_reason': '',
     }
 
-    if not out["requested_url"]:
-        out["error"] = "Missing URL."
+    if not requested or not s45v7105_allowed_official_host(requested):
+        out['rejected_reason'] = 'NON_OFFICIAL_OR_MISSING_URL'
+        return out
+    if s45v7105_bad_url(requested):
+        out['rejected_reason'] = 'AUTH_ERROR_OR_STATIC_ASSET_URL'
         return out
 
     try:
         r = requests.get(
-            out["requested_url"],
+            requested,
             timeout=timeout,
             allow_redirects=True,
             headers={
-                "User-Agent": "Mozilla/5.0 GreenRise/Stage45-v7.10.4",
-                "Accept": "application/json,text/html,application/xhtml+xml,text/plain,application/pdf,*/*",
-                "Accept-Language": "en-GB,en;q=0.9",
+                'User-Agent': 'Mozilla/5.0 GreenRise/Stage45-v7.10.5',
+                'Accept': 'application/json,text/html,application/xhtml+xml,text/plain,application/pdf,*/*',
+                'Accept-Language': 'en-GB,en;q=0.9',
+                'Cache-Control': 'no-cache',
             },
         )
-        out["status"] = r.status_code
-        out["final_url"] = normalize_text(r.url) or out["requested_url"]
-        out["content_type"] = normalize_text(r.headers.get("content-type"))
-        out["raw"] = r.text or ""
+        out['status'] = r.status_code
+        out['final_url'] = normalize_text(r.url) or requested
+        out['content_type'] = normalize_text(r.headers.get('content-type'))
 
-        title = ""
-        if BeautifulSoup is not None and "<html" in out["raw"][:3000].lower():
-            try:
-                soup = BeautifulSoup(out["raw"], "html.parser")
-                if soup.title:
-                    title = normalize_text(soup.title.get_text(" ", strip=True))
-            except Exception:
-                pass
+        if not s45v7105_allowed_official_host(out['final_url']):
+            out['rejected_reason'] = 'REDIRECTED_TO_NON_OFFICIAL_HOST'
+            return out
+        if s45v7105_bad_url(out['final_url']):
+            out['rejected_reason'] = 'REDIRECTED_TO_AUTH_ERROR_OR_STATIC_ASSET'
+            return out
+        if not r.ok:
+            out['error'] = f'HTTP {r.status_code}'
+            return out
 
-        out["title"] = title
-        out["text"] = s45v7104_html_to_text(out["raw"], out["content_type"])[:250000]
-        out["ok"] = bool(r.ok and out["text"].strip())
-        if not out["ok"]:
-            out["error"] = f"HTTP {r.status_code} or empty response."
+        ctype = out['content_type'].lower()
+        if 'application/pdf' in ctype or out['final_url'].lower().split('?', 1)[0].endswith('.pdf'):
+            out['text'] = s45v7105_pdf_text(r.content)
+            out['raw'] = ''
+        else:
+            raw = r.text or ''
+            out['raw'] = raw[:600000]
+            if 'json' in ctype:
+                try:
+                    out['json'] = r.json()
+                    out['text'] = json.dumps(out['json'], ensure_ascii=False, default=str)[:350000]
+                except Exception:
+                    out['text'] = re.sub(r'\s+', ' ', raw)[:350000]
+            elif 'html' in ctype or '<html' in raw[:3000].lower():
+                if BeautifulSoup is not None:
+                    try:
+                        soup = BeautifulSoup(raw, 'html.parser')
+                        if soup.title:
+                            out['title'] = normalize_text(soup.title.get_text(' ', strip=True))
+                    except Exception:
+                        pass
+                out['text'] = s45v7105_html_text(raw)[:350000]
+            else:
+                out['text'] = re.sub(r'\s+', ' ', raw)[:350000]
+
+        if s45v7105_bad_content(out['text'], out['title']):
+            out['rejected_reason'] = 'AUTH_OR_ERROR_CONTENT'
+            return out
+
+        out['ok'] = bool(out['text'].strip())
+        if not out['ok']:
+            out['error'] = 'EMPTY_SUBSTANTIVE_CONTENT'
     except Exception as exc:
-        out["error"] = f"{type(exc).__name__}: {str(exc)[:800]}"
+        out['error'] = f'{type(exc).__name__}: {str(exc)[:1000]}'
 
     return out
 
 
-def s45v7104_extract_urls_from_text(text):
-    found = []
-    for u in re.findall(r'https?://[^\s<>"\']+', normalize_text(text)):
-        u = u.rstrip(".,;)'\"")
-        if s45v7104_allowed_official_url(u) and u not in found:
-            found.append(u)
-    return found
-
-
-def s45v7104_candidate_urls(task, documents):
+def s45v7105_url_from_lock_context():
     urls = []
 
     def add(url):
         url = normalize_text(url)
-        if url and s45v7104_allowed_official_url(url) and url not in urls:
-            urls.append(url)
+        if not url or url in urls:
+            return
+        if not s45v7105_allowed_official_host(url):
+            return
+        if s45v7105_bad_url(url):
+            return
+        urls.append(url)
 
-    # Existing locked official source.
-    for u in s45v3_urls(official_url):
-        add(u)
+    # Canonical lock URL is always seed #1.
+    add(lock.get('official_source_url'))
+    add(lock.get('official_source_reference'))
 
-    # All persisted official documents and provenance chains for this lock.
-    for row in documents or []:
-        add(row.get("source_url"))
-        for u in (row.get("provenance_chain") or []):
-            add(u)
-        payload = row.get("evidence_payload") or {}
-        if isinstance(payload, (dict, list)):
-            for u in s45v7_collect_urls(payload):
-                add(u)
+    # Only exact-topic URLs from the lock verification snapshot are admitted.
+    snap = as_dict(lock.get('verification_snapshot'))
+    for _, value in walk(snap):
+        if not isinstance(value, str):
+            continue
+        value_text = normalize_text(value)
+        if normalize_text(identity).lower() not in value_text.lower():
+            continue
+        for u in re.findall(r'https?://[^\s|<>"\']+', value_text):
+            add(u.rstrip('.,;)\'"'))
 
-    # URLs already referenced by previous worker items.
-    try:
-        old_items = rows(
-            "locked_evidence_worker_items",
-            {
-                "user_id": user_id,
-                "project_id": project_id,
-                "opportunity_lock_id": lock_id,
-            },
-            "created_at",
-            500,
-        )
-        rk = normalize_text(task.get("requirement_key"))
-        rl = normalize_text(task.get("requirement_label"))
-        for item in old_items:
-            if (
-                normalize_text(item.get("requirement_key")) == rk
-                or normalize_text(item.get("requirement_label")) == rl
-            ):
-                add(item.get("evidence_url"))
-                for u in (item.get("provenance_chain") or []):
-                    add(u)
-    except Exception:
-        pass
+    return urls
 
-    # Exact-topic EC Search API discovery endpoints.
+
+def s45v7105_search_urls():
     topic = normalize_text(identity)
-    if topic:
-        q = quote_plus(topic)
-        add(
-            f"https://api.tech.ec.europa.eu/search-api/prod/rest/search"
-            f"?apiKey=SEDIA&text={q}&pageSize=50&pageNumber=1"
-        )
-        add(
-            f"https://api.tech.ec.europa.eu/search-api/prod/rest/search"
-            f"?apiKey=SEDIA&text=%22{q}%22&pageSize=50&pageNumber=1"
-        )
-
-    return urls[:120]
+    if not topic:
+        return []
+    q = quote_plus(topic)
+    return [
+        f'https://api.tech.ec.europa.eu/search-api/prod/rest/search?apiKey=SEDIA&text={q}&pageSize=50&pageNumber=1',
+        f'https://api.tech.ec.europa.eu/search-api/prod/rest/search?apiKey=SEDIA&text=%22{q}%22&pageSize=50&pageNumber=1',
+    ]
 
 
-def s45v7104_explicit_excerpt(text, requirement_key):
-    text = re.sub(r"\s+", " ", normalize_text(text))
-    if not text:
-        return ""
+def s45v7105_exact_topic_in_substantive_source(fetched):
+    # Search API is discovery-only, never evidence.
+    final_url = normalize_text(fetched.get('final_url'))
+    if s45v7105_is_search_api(final_url):
+        return False
 
-    key = normalize_text(requirement_key).upper()
-    needles = {
-        "APPLICANT_ELIGIBILITY": [
-            "eligible applicants", "eligible entities", "eligible participants",
-            "eligibility conditions", "legal entities", "conditions for participation",
-            "who can apply", "applicants must",
-        ],
-        "CONSORTIUM_REQUIREMENTS": [
-            "consortium", "minimum number", "at least three independent legal entities",
-            "independent legal entities", "beneficiaries", "participants",
-        ],
-        "TRL_REQUIREMENTS": [
-            "technology readiness level", "trl", "starting trl", "target trl",
-            "technology readiness levels",
-        ],
-    }.get(key, [])
-
-    low = text.lower()
-    best = ""
-
-    for needle in needles:
-        start = 0
-        while True:
-            idx = low.find(needle, start)
-            if idx < 0:
-                break
-            a = max(0, idx - 900)
-            b = min(len(text), idx + 2400)
-            excerpt = text[a:b].strip()
-
-            # Strict: the excerpt itself must be tied to the locked topic, OR
-            # the whole fetched source must establish exact-topic identity.
-            if len(excerpt) > len(best):
-                best = excerpt
-
-            start = idx + len(needle)
-
-    return best[:10000]
-
-
-def s45v7104_source_exact_topic(fetched):
-    corpus = " ".join([
-        normalize_text(fetched.get("final_url")),
-        normalize_text(fetched.get("title")),
-        normalize_text(fetched.get("text"))[:200000],
+    corpus = ' '.join([
+        final_url,
+        normalize_text(fetched.get('title')),
+        normalize_text(fetched.get('text'))[:300000],
     ])
     return s45v710_exact_topic_match(corpus, identity)
 
 
-def s45v7104_discover_and_verify(task, documents):
-    requirement_key = s45v7104_requirement_key(task)
+def s45v7105_requirement_excerpt(text, requirement_key):
+    body = re.sub(r'\s+', ' ', normalize_text(text))
+    if not body:
+        return ''
+
+    key = normalize_text(requirement_key).upper()
+    needles = {
+        'APPLICANT_ELIGIBILITY': [
+            'eligible applicants', 'eligible entities', 'eligible participants',
+            'eligibility conditions', 'conditions for participation',
+            'legal entities are eligible', 'who can apply', 'applicants must',
+            'beneficiaries and affiliated entities',
+        ],
+        'CONSORTIUM_REQUIREMENTS': [
+            'consortium', 'minimum number of', 'independent legal entities',
+            'at least three independent legal entities', 'composition of the consortium',
+            'consortium composition', 'beneficiaries',
+        ],
+        'TRL_REQUIREMENTS': [
+            'technology readiness level', 'technology readiness levels',
+            'starting trl', 'target trl', 'reach trl', 'trl ', '(trl',
+        ],
+    }.get(key, [])
+
+    low = body.lower()
+    best = ''
+    best_score = -1
+    topic = normalize_text(identity).lower()
+
+    for needle in needles:
+        start = 0
+        while True:
+            idx = low.find(needle.lower(), start)
+            if idx < 0:
+                break
+            a = max(0, idx - 1200)
+            b = min(len(body), idx + 3600)
+            excerpt = body[a:b].strip()
+            score = 1
+            if topic and topic in excerpt.lower():
+                score += 5
+            # Prefer denser passages, but do not infer a rule.
+            score += sum(1 for n in needles if n.lower() in excerpt.lower())
+            if score > best_score or (score == best_score and len(excerpt) > len(best)):
+                best = excerpt
+                best_score = score
+            start = idx + max(1, len(needle))
+
+    return best[:12000]
+
+
+def s45v7105_urls_from_exact_search_object(obj):
+    topic = normalize_text(identity)
+    if not topic:
+        return []
+
+    out = []
+
+    def add(url):
+        url = normalize_text(url).rstrip('.,;)\'"')
+        if not url or url in out:
+            return
+        if not s45v7105_allowed_official_host(url):
+            return
+        if s45v7105_bad_url(url):
+            return
+        if s45v7105_is_search_api(url):
+            return
+        out.append(url)
+
+    def visit(node):
+        if isinstance(node, dict):
+            serialized = json.dumps(node, ensure_ascii=False, default=str)
+            if s45v710_exact_topic_match(serialized, topic):
+                for u in re.findall(r'https?://[^\s|<>"\']+', serialized):
+                    add(u)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(obj)
+    return out[:40]
+
+
+def s45v7105_discover_from_search_api(fetched):
+    urls = []
+    payload = fetched.get('json')
+    if isinstance(payload, (dict, list)):
+        urls.extend(s45v7105_urls_from_exact_search_object(payload))
+
+    # Always construct the canonical topic page from the already verified topic identity.
+    topic = normalize_text(identity)
+    if topic:
+        canonical = (
+            'https://ec.europa.eu/info/funding-tenders/opportunities/portal/'
+            'screen/opportunities/topic-details/' + topic
+        )
+        if canonical not in urls:
+            urls.insert(0, canonical)
+
+    return urls[:40]
+
+
+def s45v7105_discover_links_from_substantive_source(fetched):
+    # Very conservative: only document-like official URLs, not arbitrary page assets/navigation.
+    raw = normalize_text(fetched.get('raw'))
+    if not raw:
+        return []
+
+    out = []
+    for u in re.findall(r'https?://[^\s<>"\']+', raw):
+        u = u.rstrip('.,;)\'"')
+        low = u.lower().split('?', 1)[0]
+        if not s45v7105_allowed_official_host(u) or s45v7105_bad_url(u):
+            continue
+        if s45v7105_is_search_api(u):
+            continue
+        # Follow only document-looking links or exact-topic links.
+        document_like = any(low.endswith(ext) for ext in ('.pdf', '.doc', '.docx', '.odt', '.txt'))
+        exact_link = normalize_text(identity).lower() in u.lower()
+        if (document_like or exact_link) and u not in out:
+            out.append(u)
+    return out[:30]
+
+
+def s45v7105_discover_and_verify(task):
+    requirement_key = s45v7105_requirement_key(task)
     if not requirement_key:
         return {
-            "status": "WAITING_OFFICIAL",
-            "reason": "Requirement family is not handled by v7.10.4.",
-            "attempts": [],
+            'status': 'WAITING_OFFICIAL',
+            'reason': 'Requirement family is not handled by v7.10.5.',
+            'attempts': [],
         }
 
-    queue = s45v7104_candidate_urls(task, documents)
+    # Priority 1: canonical lock context. Priority 2: exact-topic Search API, discovery-only.
+    queue = []
+    for u in s45v7105_url_from_lock_context() + s45v7105_search_urls():
+        if u and u not in queue:
+            queue.append(u)
+
     visited = set()
     attempts = []
-    max_fetches = 60
+    max_fetches = 30
 
     while queue and len(visited) < max_fetches:
         url = queue.pop(0)
@@ -7640,395 +7783,405 @@ def s45v7104_discover_and_verify(task, documents):
             continue
         visited.add(url)
 
-        fetched = s45v7104_fetch(url)
-        final_url = normalize_text(fetched.get("final_url"))
+        # Reject before transport if the URL is known-bad/static.
+        if s45v7105_bad_url(url):
+            attempts.append({
+                'requested_url': url,
+                'final_url': url,
+                'official_host': s45v7105_allowed_official_host(url),
+                'search_api_discovery_only': s45v7105_is_search_api(url),
+                'auth_or_error_or_asset': True,
+                'exact_topic': False,
+                'explicit_evidence': False,
+                'rejected_reason': 'PRE_FETCH_REJECTED_URL',
+            })
+            continue
+
+        fetched = s45v7105_fetch(url)
+        final_url = normalize_text(fetched.get('final_url'))
+        discovery_only = s45v7105_is_search_api(final_url) or s45v7105_is_search_api(url)
 
         audit = {
-            "requested_url": url,
-            "final_url": final_url,
-            "http_status": fetched.get("status"),
-            "content_type": fetched.get("content_type"),
-            "official_host": s45v7104_allowed_official_url(final_url),
-            "auth_or_error_url": s45v7104_bad_url(final_url),
-            "auth_or_error_content": s45v7104_bad_content(
-                fetched.get("text"),
-                fetched.get("title"),
+            'requested_url': url,
+            'final_url': final_url,
+            'http_status': fetched.get('status'),
+            'content_type': fetched.get('content_type'),
+            'official_host': s45v7105_allowed_official_host(final_url),
+            'search_api_discovery_only': discovery_only,
+            'auth_or_error_or_asset': bool(
+                s45v7105_bad_url(final_url)
+                or s45v7105_bad_content(fetched.get('text'), fetched.get('title'))
             ),
-            "exact_topic": False,
-            "explicit_evidence": False,
-            "error": fetched.get("error"),
+            'exact_topic': False,
+            'explicit_evidence': False,
+            'rejected_reason': fetched.get('rejected_reason'),
+            'error': fetched.get('error'),
         }
 
-        if fetched.get("ok"):
-            # Search/API/wrapper pages can reveal canonical official URLs.
-            for discovered in s45v7104_extract_urls_from_text(fetched.get("raw")):
+        if fetched.get('ok'):
+            if discovery_only:
+                for discovered in s45v7105_discover_from_search_api(fetched):
+                    if discovered not in visited and discovered not in queue:
+                        queue.append(discovered)
+                attempts.append(audit)
+                continue
+
+            # Substantive source: exact topic and explicit evidence are evaluated here only.
+            audit['exact_topic'] = s45v7105_exact_topic_in_substantive_source(fetched)
+            excerpt = s45v7105_requirement_excerpt(fetched.get('text'), requirement_key)
+            audit['explicit_evidence'] = bool(excerpt)
+
+            # Conservative document discovery from the substantive source itself.
+            for discovered in s45v7105_discover_links_from_substantive_source(fetched):
                 if discovered not in visited and discovered not in queue:
                     queue.append(discovered)
 
-            # JSON responses often contain URLs escaped or nested.
-            try:
-                payload = json.loads(fetched.get("raw") or "")
-                for discovered in s45v7_collect_urls(payload):
-                    if discovered not in visited and discovered not in queue:
-                        queue.append(discovered)
-            except Exception:
-                pass
-
-            audit["exact_topic"] = s45v7104_source_exact_topic(fetched)
-            excerpt = s45v7104_explicit_excerpt(
-                fetched.get("text"),
-                requirement_key,
-            )
-            audit["explicit_evidence"] = bool(excerpt)
-
             valid = (
-                audit["official_host"]
-                and not audit["auth_or_error_url"]
-                and not audit["auth_or_error_content"]
-                and audit["exact_topic"]
+                audit['official_host']
+                and not audit['auth_or_error_or_asset']
+                and audit['exact_topic']
                 and bool(excerpt)
             )
 
             if valid:
                 attempts.append(audit)
                 return {
-                    "status": "RESOLVED",
-                    "requirement_key": requirement_key,
-                    "exact_topic_verified": True,
-                    "authoritative_source_verified": True,
-                    "explicit_evidence_verified": True,
-                    "evidence_url": final_url,
-                    "evidence_excerpt": excerpt,
-                    "evidence_reference": requirement_key,
-                    "source_title": fetched.get("title") or "Official European Commission source",
-                    "document_type": "OFFICIAL_EC_DOCUMENT",
-                    "source_authority": "EUROPEAN_COMMISSION",
-                    "provenance_chain": [url, final_url] if url != final_url else [final_url],
-                    "reason": (
-                        "v7.10.4 verified a canonical substantive official source: "
-                        "allowed EC/EU host, no authentication/error content, exact locked topic, "
-                        "and explicit requirement evidence in the freshly fetched source."
+                    'status': 'RESOLVED',
+                    'requirement_key': requirement_key,
+                    'exact_topic_verified': True,
+                    'authoritative_source_verified': True,
+                    'explicit_evidence_verified': True,
+                    'evidence_url': final_url,
+                    'evidence_excerpt': excerpt,
+                    'evidence_reference': requirement_key,
+                    'source_title': fetched.get('title') or 'Official European Commission source',
+                    'document_type': 'OFFICIAL_EC_DOCUMENT',
+                    'source_authority': 'EUROPEAN_COMMISSION',
+                    'provenance_chain': [url, final_url] if url != final_url else [final_url],
+                    'reason': (
+                        'v7.10.5 verified a freshly fetched substantive official source: '
+                        'canonical/official host, no CAS/auth/error/static content, exact locked topic '
+                        'present in the source, and an explicit requirement passage in that same source.'
                     ),
-                    "attempts": attempts,
+                    'attempts': attempts,
                 }
 
         attempts.append(audit)
 
     return {
-        "status": "WAITING_OFFICIAL",
-        "requirement_key": requirement_key,
-        "exact_topic_verified": False,
-        "authoritative_source_verified": False,
-        "explicit_evidence_verified": False,
-        "evidence_url": None,
-        "evidence_excerpt": None,
-        "reason": (
-            "No canonical substantive official source simultaneously proved exact topic "
-            "and explicit requirement evidence. Requirement remains WAITING_OFFICIAL."
+        'status': 'WAITING_OFFICIAL',
+        'requirement_key': requirement_key,
+        'exact_topic_verified': False,
+        'authoritative_source_verified': False,
+        'explicit_evidence_verified': False,
+        'evidence_url': None,
+        'evidence_excerpt': None,
+        'reason': (
+            'No freshly fetched substantive official source proved both exact locked-topic applicability '
+            'and the explicit requirement. Search API/auth/static/history content is not evidence. '
+            'Requirement remains WAITING_OFFICIAL.'
         ),
-        "attempts": attempts,
+        'attempts': attempts,
     }
 
 
-def s45v7104_save_verified_document(task, result):
-    url = normalize_text(result.get("evidence_url"))
-    excerpt = normalize_text(result.get("evidence_excerpt"))
+def s45v7105_save_verified_document(task, result):
+    url = normalize_text(result.get('evidence_url'))
+    excerpt = normalize_text(result.get('evidence_excerpt'))
     if not url or not excerpt:
         return None
 
     row = {
-        "user_id": user_id,
-        "project_id": project_id,
-        "opportunity_lock_id": lock_id,
-        "execution_run_id": execution_run_id,
-        "execution_task_id": task.get("id"),
-        "requirement_id": task.get("requirement_id"),
-        "opportunity_identity": identity,
-        "requirement_key": task.get("requirement_key"),
-        "requirement_category": task.get("requirement_category"),
-        "requirement_label": task.get("requirement_label"),
-        "source_url": url,
-        "source_title": result.get("source_title") or "Official European Commission source",
-        "document_type": result.get("document_type") or "OFFICIAL_EC_DOCUMENT",
-        "source_authority": result.get("source_authority") or "EUROPEAN_COMMISSION",
-        "topic_identity": identity,
-        "exact_topic_verified": True,
-        "applicability_verified": True,
-        "applicability_reason": "v7.10.4 canonical source exact-topic verification passed.",
-        "evidence_found": True,
-        "evidence_excerpt": excerpt[:10000],
-        "evidence_reference": result.get("evidence_reference") or task.get("requirement_label"),
-        "evidence_payload": {
-            "stage": 45,
-            "version": "v7.10.4",
-            "canonical_recovery": True,
-            "attempts": result.get("attempts", [])[-20:],
+        'user_id': user_id,
+        'project_id': project_id,
+        'opportunity_lock_id': lock_id,
+        'execution_run_id': execution_run_id,
+        'execution_task_id': task.get('id'),
+        'requirement_id': task.get('requirement_id'),
+        'opportunity_identity': identity,
+        'requirement_key': task.get('requirement_key'),
+        'requirement_category': task.get('requirement_category'),
+        'requirement_label': task.get('requirement_label'),
+        'source_url': url,
+        'source_title': result.get('source_title') or 'Official European Commission source',
+        'document_type': result.get('document_type') or 'OFFICIAL_EC_DOCUMENT',
+        'source_authority': result.get('source_authority') or 'EUROPEAN_COMMISSION',
+        'topic_identity': identity,
+        'exact_topic_verified': True,
+        'applicability_verified': True,
+        'applicability_reason': 'v7.10.5 strict canonical exact-topic verification passed.',
+        'evidence_found': True,
+        'evidence_excerpt': excerpt[:10000],
+        'evidence_reference': result.get('evidence_reference') or task.get('requirement_label'),
+        'evidence_payload': {
+            'stage': 45,
+            'version': 'v7.10.5',
+            'strict_canonical_resolver': True,
+            'history_used_as_seed': False,
+            'search_api_is_evidence': False,
+            'attempts': result.get('attempts', [])[-30:],
         },
-        "provenance_chain": result.get("provenance_chain") or [url],
-        "retrieval_status": "VERIFIED",
-        "retrieved_at": now_iso(),
-        "updated_at": now_iso(),
+        'provenance_chain': result.get('provenance_chain') or [url],
+        'retrieval_status': 'VERIFIED',
+        'retrieved_at': now_iso(),
+        'updated_at': now_iso(),
     }
 
     existing = (
-        supabase.table("locked_evidence_official_documents")
-        .select("id")
-        .eq("user_id", user_id)
-        .eq("opportunity_lock_id", lock_id)
-        .eq("execution_task_id", task.get("id"))
-        .eq("source_url", url)
+        supabase.table('locked_evidence_official_documents')
+        .select('id')
+        .eq('user_id', user_id)
+        .eq('opportunity_lock_id', lock_id)
+        .eq('execution_task_id', task.get('id'))
+        .eq('source_url', url)
         .limit(1)
         .execute()
     ).data or []
 
     if existing:
         saved = (
-            supabase.table("locked_evidence_official_documents")
+            supabase.table('locked_evidence_official_documents')
             .update(row)
-            .eq("id", existing[0]["id"])
-            .eq("user_id", user_id)
+            .eq('id', existing[0]['id'])
+            .eq('user_id', user_id)
             .execute()
         ).data or []
-        return saved[0] if saved else {**row, "id": existing[0]["id"]}
+        return saved[0] if saved else {**row, 'id': existing[0]['id']}
 
-    saved = (
-        supabase.table("locked_evidence_official_documents")
-        .insert(row)
-        .execute()
-    ).data or []
+    saved = supabase.table('locked_evidence_official_documents').insert(row).execute().data or []
     return saved[0] if saved else None
 
 
-def s45v7104_worker_payload(task, worker_run_id, result, source_row):
-    evidence_url = normalize_text(result.get("evidence_url"))
-    excerpt = normalize_text(result.get("evidence_excerpt"))[:10000]
-    chain = result.get("provenance_chain") or []
+def s45v7105_worker_payload(task, worker_run_id, result, source_row):
+    evidence_url = normalize_text(result.get('evidence_url'))
+    excerpt = normalize_text(result.get('evidence_excerpt'))[:10000]
+    chain = result.get('provenance_chain') or []
     if not isinstance(chain, list):
         chain = [chain] if chain else []
     if evidence_url and evidence_url not in chain:
         chain.append(evidence_url)
 
     return {
-        "user_id": user_id,
-        "project_id": project_id,
-        "opportunity_lock_id": lock_id,
-        "execution_run_id": execution_run_id,
-        "worker_run_id": worker_run_id,
-        "execution_task_id": task.get("id"),
-        "requirement_id": task.get("requirement_id"),
-        "opportunity_identity": identity,
-        "requirement_key": task.get("requirement_key"),
-        "requirement_category": task.get("requirement_category"),
-        "requirement_label": task.get("requirement_label"),
-        "route_type": task.get("route_type"),
-        "destination_module": task.get("destination_module"),
-        "worker_action": "CANONICAL_SOURCE_STAGE46_HANDOFF",
-        "worker_status": "RESOLVED",
-        "resolved_value": {
-            "stage45_candidate": True,
-            "requirement": task.get("requirement_label"),
-            "canonical_source_recovered": True,
+        'user_id': user_id,
+        'project_id': project_id,
+        'opportunity_lock_id': lock_id,
+        'execution_run_id': execution_run_id,
+        'worker_run_id': worker_run_id,
+        'execution_task_id': task.get('id'),
+        'requirement_id': task.get('requirement_id'),
+        'opportunity_identity': identity,
+        'requirement_key': task.get('requirement_key'),
+        'requirement_category': task.get('requirement_category'),
+        'requirement_label': task.get('requirement_label'),
+        'route_type': task.get('route_type'),
+        'destination_module': task.get('destination_module'),
+        'worker_action': 'STRICT_CANONICAL_STAGE46_HANDOFF',
+        'worker_status': 'RESOLVED',
+        'resolved_value': {
+            'stage45_candidate': True,
+            'requirement': task.get('requirement_label'),
+            'strict_canonical_source_verified': True,
         },
-        "evidence_source": "OFFICIAL_DOCUMENTATION",
-        "evidence_reference": result.get("evidence_reference") or task.get("requirement_label"),
-        "evidence_url": evidence_url,
-        "evidence_excerpt": excerpt,
-        "confidence": "High",
-        "official_verified": False,
-        "reason": result.get("reason"),
-        "next_action": "VALIDATE_IN_STAGE_46",
-        "source_title": result.get("source_title") or "Official European Commission source",
-        "document_type": result.get("document_type") or "OFFICIAL_EC_DOCUMENT",
-        "source_authority": result.get("source_authority") or "EUROPEAN_COMMISSION",
-        "topic_identity": identity,
-        "provenance_chain": chain,
-        "documents_checked": [evidence_url],
-        "searches_attempted": [],
-        "transport_attempts": result.get("attempts", [])[-20:],
-        "resolution_method": "CANONICAL_OFFICIAL_SOURCE_RECOVERY",
-        "retrieved_at": now_iso(),
-        "exact_topic_verified": True,
-        "authoritative_source_verified": True,
-        "explicit_evidence_verified": True,
-        "official_document_status": "EVIDENCE_FOUND",
-        "official_document_payload": {
-            "stage": 45,
-            "version": "v7.10.4",
-            "handoff_target": "STAGE_46",
-            "canonical_source_recovery": True,
-            "source_document_id": source_row.get("id") if source_row else None,
-            "source_document_status": source_row.get("retrieval_status") if source_row else None,
-            "attempts": result.get("attempts", [])[-20:],
+        'evidence_source': 'OFFICIAL_DOCUMENTATION',
+        'evidence_reference': result.get('evidence_reference') or task.get('requirement_label'),
+        'evidence_url': evidence_url,
+        'evidence_excerpt': excerpt,
+        'confidence': 'High',
+        'official_verified': False,
+        'reason': result.get('reason'),
+        'next_action': 'VALIDATE_IN_STAGE_46',
+        'source_title': result.get('source_title') or 'Official European Commission source',
+        'document_type': result.get('document_type') or 'OFFICIAL_EC_DOCUMENT',
+        'source_authority': result.get('source_authority') or 'EUROPEAN_COMMISSION',
+        'topic_identity': identity,
+        'provenance_chain': chain,
+        'documents_checked': [evidence_url],
+        'searches_attempted': s45v7105_search_urls(),
+        'transport_attempts': result.get('attempts', [])[-30:],
+        # Use the existing DB-allowed resolution_method value.
+        'resolution_method': 'OFFICIAL_DOCUMENTATION',
+        'retrieved_at': now_iso(),
+        'exact_topic_verified': True,
+        'authoritative_source_verified': True,
+        'explicit_evidence_verified': True,
+        'official_document_status': 'EVIDENCE_FOUND',
+        'official_document_payload': {
+            'stage': 45,
+            'version': 'v7.10.5',
+            'handoff_target': 'STAGE_46',
+            'strict_canonical_resolver': True,
+            'history_used_as_seed': False,
+            'search_api_is_evidence': False,
+            'source_document_id': source_row.get('id') if source_row else None,
+            'source_document_status': source_row.get('retrieval_status') if source_row else None,
+            'attempts': result.get('attempts', [])[-30:],
         },
-        "resolved_at": now_iso(),
-        "updated_at": now_iso(),
+        'resolved_at': now_iso(),
+        'updated_at': now_iso(),
     }
 
 
-def s45v7104_persist_worker_item(task, worker_run_id, result, source_row):
-    if normalize_text(result.get("status")).upper() != "RESOLVED":
+def s45v7105_persist_worker_item(task, worker_run_id, result, source_row):
+    if normalize_text(result.get('status')).upper() != 'RESOLVED':
         return None
 
-    payload = s45v7104_worker_payload(task, worker_run_id, result, source_row)
-
-    # Avoid multiplying identical v7.10.4 rows for the same task/run.
+    payload = s45v7105_worker_payload(task, worker_run_id, result, source_row)
     existing = (
-        supabase.table("locked_evidence_worker_items")
-        .select("id")
-        .eq("user_id", user_id)
-        .eq("worker_run_id", worker_run_id)
-        .eq("execution_task_id", task.get("id"))
+        supabase.table('locked_evidence_worker_items')
+        .select('id')
+        .eq('user_id', user_id)
+        .eq('worker_run_id', worker_run_id)
+        .eq('execution_task_id', task.get('id'))
         .limit(1)
         .execute()
     ).data or []
 
     if existing:
         saved = (
-            supabase.table("locked_evidence_worker_items")
+            supabase.table('locked_evidence_worker_items')
             .update(payload)
-            .eq("id", existing[0]["id"])
-            .eq("user_id", user_id)
+            .eq('id', existing[0]['id'])
+            .eq('user_id', user_id)
             .execute()
         ).data or []
-        return saved[0] if saved else {**payload, "id": existing[0]["id"]}
+        return saved[0] if saved else {**payload, 'id': existing[0]['id']}
 
-    saved = (
-        supabase.table("locked_evidence_worker_items")
-        .insert(payload)
-        .execute()
-    ).data or []
-
+    saved = supabase.table('locked_evidence_worker_items').insert(payload).execute().data or []
     if not saved:
-        raise RuntimeError("v7.10.4 could not persist Stage 46 handoff worker item.")
+        raise RuntimeError('v7.10.5 could not persist Stage 46 handoff worker item.')
     return saved[0]
 
 
-def s45v7104_update_execution_task(task, worker_item):
-    payload = as_dict(task.get("completion_payload"))
-    payload["stage45_evidence_candidate"] = {
-        "stage": 45,
-        "version": "v7.10.4",
-        "worker_item_id": worker_item.get("id"),
-        "status": "RESOLVED",
-        "evidence_url": worker_item.get("evidence_url"),
-        "evidence_reference": worker_item.get("evidence_reference"),
-        "evidence_excerpt": worker_item.get("evidence_excerpt"),
-        "exact_topic_verified": True,
-        "authoritative_source_verified": True,
-        "explicit_evidence_verified": True,
-        "canonical_source_recovered": True,
-        "handoff": "STAGE_46",
-        "created_at": now_iso(),
+def s45v7105_update_execution_task(task, worker_item):
+    payload = as_dict(task.get('completion_payload'))
+    payload['stage45_evidence_candidate'] = {
+        'stage': 45,
+        'version': 'v7.10.5',
+        'worker_item_id': worker_item.get('id'),
+        'status': 'RESOLVED',
+        'evidence_url': worker_item.get('evidence_url'),
+        'evidence_reference': worker_item.get('evidence_reference'),
+        'evidence_excerpt': worker_item.get('evidence_excerpt'),
+        'exact_topic_verified': True,
+        'authoritative_source_verified': True,
+        'explicit_evidence_verified': True,
+        'strict_canonical_source_verified': True,
+        'handoff': 'STAGE_46',
+        'created_at': now_iso(),
     }
 
-    supabase.table("locked_evidence_execution_tasks").update({
-        "task_status": "WAITING_OFFICIAL",
-        "completion_status": None,
-        "completion_source": None,
-        "completion_reference": None,
-        "completed_at": None,
-        "completion_payload": payload,
-        "updated_at": now_iso(),
-    }).eq("id", task.get("id")).eq("user_id", user_id).execute()
+    supabase.table('locked_evidence_execution_tasks').update({
+        'task_status': 'WAITING_OFFICIAL',
+        'completion_status': None,
+        'completion_source': None,
+        'completion_reference': None,
+        'completed_at': None,
+        'completion_payload': payload,
+        'updated_at': now_iso(),
+    }).eq('id', task.get('id')).eq('user_id', user_id).execute()
 
 
 st.divider()
-st.subheader("Stage 45 v7.10.4 — Canonical Source Recovery & Strict Stage 46 Handoff")
+st.subheader('Stage 45 v7.10.5 — Strict Canonical Document Resolver')
 st.info(
-    "v7.10.4 urmărește sursele EC/EU până la documentul canonic, respinge CAS/login/auth/error, "
-    "cere exact-topic și pasaj explicit în sursa proaspăt citită, apoi persistă numai candidatul "
-    "strict pentru validarea independentă din Stage 46."
+    'v7.10.5 pornește numai din lock-ul canonic și discovery exact-topic, nu reciclează cele 128 de '
+    'documente istorice. Search API este discovery-only; CAS/EU Login/auth/static assets sunt respinse. '
+    'Un requirement devine candidat pentru Stage 46 numai dacă aceeași sursă oficială proaspăt citită '
+    'conține topicul exact și pasajul explicit.'
 )
 
-_v7104_tasks = [
+_v7105_tasks = [
     t for t in current_tasks
-    if normalize_text(t.get("route_type")).upper() == "OFFICIAL_VERIFICATION"
+    if normalize_text(t.get('route_type')).upper() == 'OFFICIAL_VERIFICATION'
 ]
 
-_v7104_docs = []
-try:
-    _v7104_docs = (
-        supabase.table("locked_evidence_official_documents")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("project_id", project_id)
-        .eq("opportunity_lock_id", lock_id)
-        .order("created_at", desc=True)
-        .limit(1500)
-        .execute()
-    ).data or []
-except Exception as _v7104_docs_exc:
-    st.warning(f"v7.10.4 document load warning: {_v7104_docs_exc}")
+_v7105_seed_urls = s45v7105_url_from_lock_context()
 
-q1, q2, q3 = st.columns(3)
-q1.metric("OFFICIAL requirements", len(_v7104_tasks))
-q2.metric("Official documents available", len(_v7104_docs))
-q3.metric("Stage 46 target", "STRICT")
+q1, q2, q3, q4 = st.columns(4)
+q1.metric('OFFICIAL requirements', len(_v7105_tasks))
+q2.metric('Canonical lock seeds', len(_v7105_seed_urls))
+q3.metric('Historical docs as seeds', '0')
+q4.metric('Stage 46 target', 'STRICT')
+
+if _v7105_seed_urls:
+    st.caption('Primary canonical seed: ' + _v7105_seed_urls[0])
+else:
+    st.warning('Nu există canonical seed valid în ACTIVE lock; v7.10.5 va rămâne fail-closed.')
 
 if st.button(
-    "🧭 Run Stage 45 v7.10.4 canonical recovery",
-    type="primary",
+    '🧭 Run Stage 45 v7.10.5 strict canonical resolver',
+    type='primary',
     use_container_width=True,
-    key="stage45_v7104_run",
+    key='stage45_v7105_run',
 ):
     _run = (
-        supabase.table("locked_evidence_worker_runs")
+        supabase.table('locked_evidence_worker_runs')
         .insert({
-            "user_id": user_id,
-            "project_id": project_id,
-            "opportunity_lock_id": lock_id,
-            "execution_run_id": execution_run_id,
-            "opportunity_identity": identity,
-            "total_tasks": len(_v7104_tasks),
-            "worker_status": "RUNNING",
-            "deep_resolution_version": "v7.10.4",
-            "diagnostic_status": "CLEAN",
-            "error_count": 0,
-            "started_at": now_iso(),
-            "summary": {
-                "stage": 45,
-                "version": "v7.10.4",
-                "purpose": "CANONICAL_SOURCE_RECOVERY_AND_STAGE46_HANDOFF",
+            'user_id': user_id,
+            'project_id': project_id,
+            'opportunity_lock_id': lock_id,
+            'execution_run_id': execution_run_id,
+            'opportunity_identity': identity,
+            'total_tasks': len(_v7105_tasks),
+            'worker_status': 'RUNNING',
+            'deep_resolution_version': 'v7.10.5',
+            'diagnostic_status': 'CLEAN',
+            'error_count': 0,
+            'started_at': now_iso(),
+            'summary': {
+                'stage': 45,
+                'version': 'v7.10.5',
+                'purpose': 'STRICT_CANONICAL_DOCUMENT_RESOLVER',
+                'canonical_seed_urls': _v7105_seed_urls,
+                'history_used_as_seed': False,
+                'search_api_is_evidence': False,
             },
-            "updated_at": now_iso(),
+            'updated_at': now_iso(),
         })
         .execute()
     ).data or []
 
     if not _run:
-        st.error("Nu am putut crea Stage 45 v7.10.4 run.")
+        st.error('Nu am putut crea Stage 45 v7.10.5 run.')
     else:
-        _run_id = str(_run[0]["id"])
+        _run_id = str(_run[0]['id'])
         _resolved = 0
         _waiting = 0
         _failed = 0
         _audit_rows = []
         _bar = st.progress(0)
 
-        for _idx, _task in enumerate(_v7104_tasks, 1):
+        for _idx, _task in enumerate(_v7105_tasks, 1):
             try:
-                _result = s45v7104_discover_and_verify(_task, _v7104_docs)
+                _result = s45v7105_discover_and_verify(_task)
+                _attempts = _result.get('attempts', []) or []
+                _rejected_auth_assets = sum(
+                    1 for a in _attempts
+                    if a.get('auth_or_error_or_asset') or a.get('rejected_reason')
+                )
+                _search_discovery = sum(
+                    1 for a in _attempts if a.get('search_api_discovery_only')
+                )
 
                 _audit_rows.append({
-                    "Requirement": _task.get("requirement_label"),
-                    "Status": _result.get("status"),
-                    "Evidence URL": _result.get("evidence_url"),
-                    "Exact topic": _result.get("exact_topic_verified"),
-                    "Authoritative": _result.get("authoritative_source_verified"),
-                    "Explicit evidence": _result.get("explicit_evidence_verified"),
-                    "Attempts": len(_result.get("attempts", [])),
-                    "Reason": _result.get("reason"),
+                    'Requirement': _task.get('requirement_label'),
+                    'Status': _result.get('status'),
+                    'Evidence URL': _result.get('evidence_url'),
+                    'Exact topic': _result.get('exact_topic_verified'),
+                    'Authoritative': _result.get('authoritative_source_verified'),
+                    'Explicit evidence': _result.get('explicit_evidence_verified'),
+                    'Attempts': len(_attempts),
+                    'Search discovery only': _search_discovery,
+                    'Rejected auth/assets': _rejected_auth_assets,
+                    'Reason': _result.get('reason'),
                 })
 
-                if normalize_text(_result.get("status")).upper() == "RESOLVED":
-                    _source_row = s45v7104_save_verified_document(_task, _result)
-                    _worker_item = s45v7104_persist_worker_item(
-                        _task,
-                        _run_id,
-                        _result,
-                        _source_row,
+                if normalize_text(_result.get('status')).upper() == 'RESOLVED':
+                    _source_row = s45v7105_save_verified_document(_task, _result)
+                    _worker_item = s45v7105_persist_worker_item(
+                        _task, _run_id, _result, _source_row
                     )
-                    s45v7104_update_execution_task(_task, _worker_item)
+                    s45v7105_update_execution_task(_task, _worker_item)
                     _resolved += 1
                 else:
                     _waiting += 1
@@ -8036,128 +8189,122 @@ if st.button(
             except Exception as _exc:
                 _failed += 1
                 _audit_rows.append({
-                    "Requirement": _task.get("requirement_label"),
-                    "Status": "FAILED",
-                    "Evidence URL": None,
-                    "Exact topic": False,
-                    "Authoritative": False,
-                    "Explicit evidence": False,
-                    "Attempts": 0,
-                    "Reason": f"{type(_exc).__name__}: {str(_exc)[:800]}",
+                    'Requirement': _task.get('requirement_label'),
+                    'Status': 'FAILED',
+                    'Evidence URL': None,
+                    'Exact topic': False,
+                    'Authoritative': False,
+                    'Explicit evidence': False,
+                    'Attempts': 0,
+                    'Search discovery only': 0,
+                    'Rejected auth/assets': 0,
+                    'Reason': f'{type(_exc).__name__}: {str(_exc)[:1000]}',
                 })
 
-            _bar.progress(_idx / max(1, len(_v7104_tasks)))
+            _bar.progress(_idx / max(1, len(_v7105_tasks)))
 
         _final = (
-            "FAILED"
+            'FAILED'
             if _failed and _resolved == 0 and _waiting == 0
-            else "PARTIAL_FAILURE"
+            else 'PARTIAL_FAILURE'
             if _failed
-            else "COMPLETED"
+            else 'COMPLETED'
         )
 
-        supabase.table("locked_evidence_worker_runs").update({
-            "resolved_tasks": _resolved,
-            "waiting_tasks": _waiting,
-            "failed_tasks": _failed,
-            "worker_status": _final,
-            "diagnostic_status": (
-                "FAILED" if _final == "FAILED"
-                else "PARTIAL_FAILURE" if _final == "PARTIAL_FAILURE"
-                else "CLEAN"
+        supabase.table('locked_evidence_worker_runs').update({
+            'resolved_tasks': _resolved,
+            'waiting_tasks': _waiting,
+            'failed_tasks': _failed,
+            'worker_status': _final,
+            'diagnostic_status': (
+                'FAILED' if _final == 'FAILED'
+                else 'PARTIAL_FAILURE' if _final == 'PARTIAL_FAILURE'
+                else 'CLEAN'
             ),
-            "official_tasks_resolved": _resolved,
-            "official_tasks_waiting": _waiting,
-            "deep_resolution_version": "v7.10.4",
-            "provenance_summary": {
-                "stage": 45,
-                "version": "v7.10.4",
-                "canonical_recovery": True,
-                "handoff_target": "STAGE_46",
-                "resolved": _resolved,
-                "waiting": _waiting,
-                "failed": _failed,
-                "audit": _audit_rows,
+            'official_tasks_resolved': _resolved,
+            'official_tasks_waiting': _waiting,
+            'deep_resolution_version': 'v7.10.5',
+            'provenance_summary': {
+                'stage': 45,
+                'version': 'v7.10.5',
+                'strict_canonical_resolver': True,
+                'handoff_target': 'STAGE_46',
+                'canonical_seed_urls': _v7105_seed_urls,
+                'history_used_as_seed': False,
+                'search_api_is_evidence': False,
+                'resolved': _resolved,
+                'waiting': _waiting,
+                'failed': _failed,
+                'audit': _audit_rows,
             },
-            "completed_at": now_iso(),
-            "updated_at": now_iso(),
-        }).eq("id", _run_id).eq("user_id", user_id).execute()
+            'completed_at': now_iso(),
+            'updated_at': now_iso(),
+        }).eq('id', _run_id).eq('user_id', user_id).execute()
 
         st.success(
-            f"Stage 45 v7.10.4: {_final} — "
-            f"canonical RESOLVED {_resolved}, waiting {_waiting}, failed {_failed}."
+            f'Stage 45 v7.10.5: {_final} — canonical RESOLVED {_resolved}, '
+            f'waiting {_waiting}, failed {_failed}.'
         )
-
         if _audit_rows:
             st.dataframe(_audit_rows, use_container_width=True, hide_index=True)
-
         st.rerun()
 
 
-_v7104_runs = rows(
-    "locked_evidence_worker_runs",
+_v7105_runs = rows(
+    'locked_evidence_worker_runs',
     {
-        "user_id": user_id,
-        "project_id": project_id,
-        "opportunity_lock_id": lock_id,
+        'user_id': user_id,
+        'project_id': project_id,
+        'opportunity_lock_id': lock_id,
     },
-    "created_at",
+    'created_at',
     100,
 )
-
-_v7104_runs = [
-    r for r in _v7104_runs
-    if normalize_text(r.get("deep_resolution_version")).lower() == "v7.10.4"
+_v7105_runs = [
+    r for r in _v7105_runs
+    if normalize_text(r.get('deep_resolution_version')).lower() == 'v7.10.5'
 ]
 
-if _v7104_runs:
-    _latest_v7104 = _v7104_runs[0]
-
-    st.subheader("Latest Stage 45 v7.10.4 Result")
+if _v7105_runs:
+    _latest_v7105 = _v7105_runs[0]
+    st.subheader('Latest Stage 45 v7.10.5 Result')
 
     z1, z2, z3, z4 = st.columns(4)
-    z1.metric("Status", _latest_v7104.get("worker_status") or "—")
-    z2.metric("Canonical RESOLVED", _latest_v7104.get("official_tasks_resolved") or 0)
-    z3.metric("Waiting", _latest_v7104.get("official_tasks_waiting") or 0)
-    z4.metric("Failed", _latest_v7104.get("failed_tasks") or 0)
+    z1.metric('Status', _latest_v7105.get('worker_status') or '—')
+    z2.metric('Canonical RESOLVED', _latest_v7105.get('official_tasks_resolved') or 0)
+    z3.metric('Waiting', _latest_v7105.get('official_tasks_waiting') or 0)
+    z4.metric('Failed', _latest_v7105.get('failed_tasks') or 0)
 
-    _summary = _latest_v7104.get("provenance_summary") or {}
-    if isinstance(_summary, dict) and _summary.get("audit"):
-        with st.expander("v7.10.4 canonical recovery audit", expanded=False):
-            st.dataframe(
-                _summary.get("audit"),
-                use_container_width=True,
-                hide_index=True,
-            )
+    _summary = _latest_v7105.get('provenance_summary') or {}
+    if isinstance(_summary, dict) and _summary.get('audit'):
+        with st.expander('v7.10.5 strict canonical audit', expanded=False):
+            st.dataframe(_summary.get('audit'), use_container_width=True, hide_index=True)
 
     _items = rows(
-        "locked_evidence_worker_items",
+        'locked_evidence_worker_items',
         {
-            "user_id": user_id,
-            "project_id": project_id,
-            "opportunity_lock_id": lock_id,
-            "worker_run_id": str(_latest_v7104.get("id")),
+            'user_id': user_id,
+            'project_id': project_id,
+            'opportunity_lock_id': lock_id,
+            'worker_run_id': str(_latest_v7105.get('id')),
         },
-        "created_at",
+        'created_at',
         100,
     )
 
     if _items:
-        st.subheader("Stage 46 canonical handoff rows")
+        st.subheader('Stage 46 strict canonical handoff rows')
         st.dataframe(
             [
                 {
-                    "Requirement": i.get("requirement_label"),
-                    "Worker status": i.get("worker_status"),
-                    "Execution task": i.get("execution_task_id"),
-                    "Requirement id": i.get("requirement_id"),
-                    "Requirement key": i.get("requirement_key"),
-                    "Exact topic": i.get("exact_topic_verified"),
-                    "Authoritative": i.get("authoritative_source_verified"),
-                    "Explicit evidence": i.get("explicit_evidence_verified"),
-                    "Document status": i.get("official_document_status"),
-                    "Evidence URL": i.get("evidence_url"),
-                    "Excerpt chars": len(normalize_text(i.get("evidence_excerpt"))),
+                    'Requirement': i.get('requirement_label'),
+                    'Worker status': i.get('worker_status'),
+                    'Exact topic': i.get('exact_topic_verified'),
+                    'Authoritative': i.get('authoritative_source_verified'),
+                    'Explicit evidence': i.get('explicit_evidence_verified'),
+                    'Document status': i.get('official_document_status'),
+                    'Evidence URL': i.get('evidence_url'),
+                    'Excerpt chars': len(normalize_text(i.get('evidence_excerpt'))),
                 }
                 for i in _items
             ],
@@ -8166,10 +8313,11 @@ if _v7104_runs:
         )
 
 st.caption(
-    "v7.10.4 invariant: canonical recovery cannot manufacture evidence. "
-    "A requirement remains WAITING_OFFICIAL unless a freshly fetched substantive EC/EU source "
-    "proves both the exact locked topic and the explicit requirement. Stage 46 remains the final provenance gate."
+    'v7.10.5 invariant: Search API, CAS/EU Login, auth/error pages, static assets and historical '
+    'worker documents are never evidence seeds. Only a freshly fetched substantive official source '
+    'that proves both the exact topic and the explicit requirement can be handed to Stage 46.'
 )
 # =====================================================================
-# END STAGE 45 v7.10.4
+# END STAGE 45 v7.10.5
 # =====================================================================
+
