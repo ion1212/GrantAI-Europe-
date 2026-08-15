@@ -7353,7 +7353,7 @@ st.caption(
 # =====================================================================
 
 # =====================================================================
-# STAGE 45 v7.10.5 — STRICT CANONICAL DOCUMENT RESOLVER
+# STAGE 45 v7.10.6 — OFFICIAL TOPIC DOCUMENT DISCOVERY RESOLVER
 # =====================================================================
 # This replaces v7.10.4 discovery behavior.
 #
@@ -7369,25 +7369,25 @@ st.caption(
 #   9) Unproven requirements remain WAITING_OFFICIAL. Stage 46 remains the final gate.
 
 
-def s45v7105_requirement_key(task):
+def s45v7106_requirement_key(task):
     return s45v7103_requirement_key(task)
 
 
-def s45v7105_host(url):
+def s45v7106_host(url):
     try:
         return (urlparse(normalize_text(url)).hostname or '').lower()
     except Exception:
         return ''
 
 
-def s45v7105_is_search_api(url):
-    host = s45v7105_host(url)
+def s45v7106_is_search_api(url):
+    host = s45v7106_host(url)
     low = normalize_text(url).lower()
     return host == 'api.tech.ec.europa.eu' and '/search-api/' in low
 
 
-def s45v7105_allowed_official_host(url):
-    host = s45v7105_host(url)
+def s45v7106_allowed_official_host(url):
+    host = s45v7106_host(url)
     return bool(
         host == 'europa.eu'
         or host.endswith('.europa.eu')
@@ -7398,7 +7398,7 @@ def s45v7105_allowed_official_host(url):
     )
 
 
-def s45v7105_is_static_asset(url):
+def s45v7106_is_static_asset(url):
     low = normalize_text(url).lower().split('?', 1)[0].split('#', 1)[0]
     return any(low.endswith(ext) for ext in (
         '.js', '.css', '.map', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp',
@@ -7406,9 +7406,9 @@ def s45v7105_is_static_asset(url):
     ))
 
 
-def s45v7105_bad_url(url):
+def s45v7106_bad_url(url):
     low = normalize_text(url).lower()
-    host = s45v7105_host(url)
+    host = s45v7106_host(url)
     if not low or not host:
         return True
 
@@ -7432,10 +7432,10 @@ def s45v7105_bad_url(url):
     if any(x.lower() in low for x in bad_markers):
         return True
 
-    return s45v7105_is_static_asset(url)
+    return s45v7106_is_static_asset(url)
 
 
-def s45v7105_bad_content(text, title=''):
+def s45v7106_bad_content(text, title=''):
     corpus = re.sub(r'\s+', ' ', f'{normalize_text(title)} {normalize_text(text)}').lower()
     strong = (
         'central authentication service',
@@ -7455,7 +7455,7 @@ def s45v7105_bad_content(text, title=''):
     return any(x in corpus for x in strong)
 
 
-def s45v7105_pdf_text(content):
+def s45v7106_pdf_text(content):
     if not content or PdfReader is None:
         return ''
     try:
@@ -7475,7 +7475,7 @@ def s45v7105_pdf_text(content):
         return ''
 
 
-def s45v7105_html_text(raw):
+def s45v7106_html_text(raw):
     raw = raw or ''
     if BeautifulSoup is None:
         return re.sub(r'\s+', ' ', raw)
@@ -7488,7 +7488,7 @@ def s45v7105_html_text(raw):
         return re.sub(r'\s+', ' ', raw)
 
 
-def s45v7105_fetch(url, timeout=45):
+def s45v7106_fetch(url, timeout=45):
     requested = normalize_text(url)
     out = {
         'ok': False,
@@ -7504,10 +7504,10 @@ def s45v7105_fetch(url, timeout=45):
         'rejected_reason': '',
     }
 
-    if not requested or not s45v7105_allowed_official_host(requested):
+    if not requested or not s45v7106_allowed_official_host(requested):
         out['rejected_reason'] = 'NON_OFFICIAL_OR_MISSING_URL'
         return out
-    if s45v7105_bad_url(requested):
+    if s45v7106_bad_url(requested):
         out['rejected_reason'] = 'AUTH_ERROR_OR_STATIC_ASSET_URL'
         return out
 
@@ -7517,7 +7517,7 @@ def s45v7105_fetch(url, timeout=45):
             timeout=timeout,
             allow_redirects=True,
             headers={
-                'User-Agent': 'Mozilla/5.0 GreenRise/Stage45-v7.10.5',
+                'User-Agent': 'Mozilla/5.0 GreenRise/Stage45-v7.10.6',
                 'Accept': 'application/json,text/html,application/xhtml+xml,text/plain,application/pdf,*/*',
                 'Accept-Language': 'en-GB,en;q=0.9',
                 'Cache-Control': 'no-cache',
@@ -7527,10 +7527,10 @@ def s45v7105_fetch(url, timeout=45):
         out['final_url'] = normalize_text(r.url) or requested
         out['content_type'] = normalize_text(r.headers.get('content-type'))
 
-        if not s45v7105_allowed_official_host(out['final_url']):
+        if not s45v7106_allowed_official_host(out['final_url']):
             out['rejected_reason'] = 'REDIRECTED_TO_NON_OFFICIAL_HOST'
             return out
-        if s45v7105_bad_url(out['final_url']):
+        if s45v7106_bad_url(out['final_url']):
             out['rejected_reason'] = 'REDIRECTED_TO_AUTH_ERROR_OR_STATIC_ASSET'
             return out
         if not r.ok:
@@ -7539,7 +7539,7 @@ def s45v7105_fetch(url, timeout=45):
 
         ctype = out['content_type'].lower()
         if 'application/pdf' in ctype or out['final_url'].lower().split('?', 1)[0].endswith('.pdf'):
-            out['text'] = s45v7105_pdf_text(r.content)
+            out['text'] = s45v7106_pdf_text(r.content)
             out['raw'] = ''
         else:
             raw = r.text or ''
@@ -7558,11 +7558,11 @@ def s45v7105_fetch(url, timeout=45):
                             out['title'] = normalize_text(soup.title.get_text(' ', strip=True))
                     except Exception:
                         pass
-                out['text'] = s45v7105_html_text(raw)[:350000]
+                out['text'] = s45v7106_html_text(raw)[:350000]
             else:
                 out['text'] = re.sub(r'\s+', ' ', raw)[:350000]
 
-        if s45v7105_bad_content(out['text'], out['title']):
+        if s45v7106_bad_content(out['text'], out['title']):
             out['rejected_reason'] = 'AUTH_OR_ERROR_CONTENT'
             return out
 
@@ -7575,16 +7575,16 @@ def s45v7105_fetch(url, timeout=45):
     return out
 
 
-def s45v7105_url_from_lock_context():
+def s45v7106_url_from_lock_context():
     urls = []
 
     def add(url):
         url = normalize_text(url)
         if not url or url in urls:
             return
-        if not s45v7105_allowed_official_host(url):
+        if not s45v7106_allowed_official_host(url):
             return
-        if s45v7105_bad_url(url):
+        if s45v7106_bad_url(url):
             return
         urls.append(url)
 
@@ -7606,7 +7606,70 @@ def s45v7105_url_from_lock_context():
     return urls
 
 
-def s45v7105_search_urls():
+def s45v7106_authoritative_reference_urls():
+    """Fresh EC reference documents derived from the locked Horizon topic identity.
+    These are authoritative evidence candidates, not historical DB seeds.
+    """
+    topic = normalize_text(identity).upper()
+    urls = []
+    # General Annexes are the canonical source for Horizon eligibility/consortium rules.
+    if topic.startswith('HORIZON-'):
+        urls.append('https://ec.europa.eu/info/funding-tenders/opportunities/docs/2021-2027/horizon/wp-call/2026-2027/wp-15-general-annexes_horizon-2026-2027_en.pdf')
+    cluster_files = {
+        'CL1': 'wp-4-health_horizon-2026-2027_en.pdf',
+        'CL2': 'wp-5-culture-creativity-and-inclusive-society_horizon-2026-2027_en.pdf',
+        'CL3': 'wp-6-civil-security-for-society_horizon-2026-2027_en.pdf',
+        'CL4': 'wp-7-digital-industry-and-space_horizon-2026-2027_en.pdf',
+        'CL5': 'wp-8-climate-energy-and-mobility_horizon-2026-2027_en.pdf',
+        'CL6': 'wp-9-food-bioeconomy-natural-resources-agriculture-and-environment_horizon-2026-2027_en.pdf',
+    }
+    m = re.search(r'HORIZON-(CL[1-6])-', topic)
+    if m and m.group(1) in cluster_files:
+        urls.insert(0, 'https://ec.europa.eu/info/funding-tenders/opportunities/docs/2021-2027/horizon/wp-call/2026-2027/' + cluster_files[m.group(1)])
+    return urls
+
+
+def s45v7106_topic_section(text):
+    """Bound the exact topic section up to the next HORIZON topic heading."""
+    body = re.sub(r'\s+', ' ', normalize_text(text))
+    topic = normalize_text(identity)
+    if not body or not topic:
+        return ''
+    m = re.search(re.escape(topic), body, flags=re.I)
+    if not m:
+        return ''
+    start = m.start()
+    tail = body[m.end():]
+    nxt = re.search(r'\bHORIZON-[A-Z0-9-]{8,}\b', tail, flags=re.I)
+    end = m.end() + nxt.start() if nxt else min(len(body), start + 45000)
+    return body[start:end].strip()[:50000]
+
+
+def s45v7106_applicability_bridge(cluster_text):
+    """Prove that the exact topic delegates eligibility to General Annex B."""
+    section = s45v7106_topic_section(cluster_text)
+    low = section.lower()
+    return bool(section and 'eligibility' in low and 'general annex b' in low)
+
+
+def s45v7106_negative_trl_evidence(cluster_text):
+    """A bounded exact-topic section can prove that no topic-specific TRL condition is stated.
+    This does not invent a TRL; it returns an explicit NOT_SPECIFIED result for Stage 46.
+    """
+    section = s45v7106_topic_section(cluster_text)
+    if not section:
+        return ''
+    low = section.lower()
+    trl_markers = ('technology readiness level', 'starting trl', 'target trl', 'reach trl', ' trl ')
+    if any(x in low for x in trl_markers):
+        return ''
+    # Preserve enough of the canonical section for independent Stage 46 validation.
+    return ('NO_TOPIC_SPECIFIC_TRL_STATED. Exact-topic section was parsed from the official EC '
+            'Cluster work programme and contains no Technology Readiness Level/TRL condition. '
+            'Stage 46 must independently re-check the bounded section. SECTION: ' + section[:9000])
+
+
+def s45v7106_search_urls():
     topic = normalize_text(identity)
     if not topic:
         return []
@@ -7617,10 +7680,10 @@ def s45v7105_search_urls():
     ]
 
 
-def s45v7105_exact_topic_in_substantive_source(fetched):
+def s45v7106_exact_topic_in_substantive_source(fetched):
     # Search API is discovery-only, never evidence.
     final_url = normalize_text(fetched.get('final_url'))
-    if s45v7105_is_search_api(final_url):
+    if s45v7106_is_search_api(final_url):
         return False
 
     corpus = ' '.join([
@@ -7631,7 +7694,7 @@ def s45v7105_exact_topic_in_substantive_source(fetched):
     return s45v710_exact_topic_match(corpus, identity)
 
 
-def s45v7105_requirement_excerpt(text, requirement_key):
+def s45v7106_requirement_excerpt(text, requirement_key):
     body = re.sub(r'\s+', ' ', normalize_text(text))
     if not body:
         return ''
@@ -7682,7 +7745,7 @@ def s45v7105_requirement_excerpt(text, requirement_key):
     return best[:12000]
 
 
-def s45v7105_urls_from_exact_search_object(obj):
+def s45v7106_urls_from_exact_search_object(obj):
     topic = normalize_text(identity)
     if not topic:
         return []
@@ -7693,11 +7756,11 @@ def s45v7105_urls_from_exact_search_object(obj):
         url = normalize_text(url).rstrip('.,;)\'"')
         if not url or url in out:
             return
-        if not s45v7105_allowed_official_host(url):
+        if not s45v7106_allowed_official_host(url):
             return
-        if s45v7105_bad_url(url):
+        if s45v7106_bad_url(url):
             return
-        if s45v7105_is_search_api(url):
+        if s45v7106_is_search_api(url):
             return
         out.append(url)
 
@@ -7717,11 +7780,11 @@ def s45v7105_urls_from_exact_search_object(obj):
     return out[:40]
 
 
-def s45v7105_discover_from_search_api(fetched):
+def s45v7106_discover_from_search_api(fetched):
     urls = []
     payload = fetched.get('json')
     if isinstance(payload, (dict, list)):
-        urls.extend(s45v7105_urls_from_exact_search_object(payload))
+        urls.extend(s45v7106_urls_from_exact_search_object(payload))
 
     # Always construct the canonical topic page from the already verified topic identity.
     topic = normalize_text(identity)
@@ -7736,7 +7799,7 @@ def s45v7105_discover_from_search_api(fetched):
     return urls[:40]
 
 
-def s45v7105_discover_links_from_substantive_source(fetched):
+def s45v7106_discover_links_from_substantive_source(fetched):
     # Very conservative: only document-like official URLs, not arbitrary page assets/navigation.
     raw = normalize_text(fetched.get('raw'))
     if not raw:
@@ -7746,9 +7809,9 @@ def s45v7105_discover_links_from_substantive_source(fetched):
     for u in re.findall(r'https?://[^\s<>"\']+', raw):
         u = u.rstrip('.,;)\'"')
         low = u.lower().split('?', 1)[0]
-        if not s45v7105_allowed_official_host(u) or s45v7105_bad_url(u):
+        if not s45v7106_allowed_official_host(u) or s45v7106_bad_url(u):
             continue
-        if s45v7105_is_search_api(u):
+        if s45v7106_is_search_api(u):
             continue
         # Follow only document-looking links or exact-topic links.
         document_like = any(low.endswith(ext) for ext in ('.pdf', '.doc', '.docx', '.odt', '.txt'))
@@ -7758,134 +7821,99 @@ def s45v7105_discover_links_from_substantive_source(fetched):
     return out[:30]
 
 
-def s45v7105_discover_and_verify(task):
-    requirement_key = s45v7105_requirement_key(task)
+def s45v7106_discover_and_verify(task):
+    requirement_key = s45v7106_requirement_key(task)
     if not requirement_key:
-        return {
-            'status': 'WAITING_OFFICIAL',
-            'reason': 'Requirement family is not handled by v7.10.5.',
-            'attempts': [],
-        }
+        return {'status':'WAITING_OFFICIAL','reason':'Requirement family is not handled by v7.10.6.','attempts':[]}
 
-    # Priority 1: canonical lock context. Priority 2: exact-topic Search API, discovery-only.
-    queue = []
-    for u in s45v7105_url_from_lock_context() + s45v7105_search_urls():
-        if u and u not in queue:
-            queue.append(u)
+    queue=[]
+    for u in s45v7106_url_from_lock_context() + s45v7106_authoritative_reference_urls() + s45v7106_search_urls():
+        if u and u not in queue: queue.append(u)
+    visited=set(); attempts=[]; max_fetches=24
+    cluster_doc=None; annex_doc=None
 
-    visited = set()
-    attempts = []
-    max_fetches = 30
-
-    while queue and len(visited) < max_fetches:
-        url = queue.pop(0)
-        if not url or url in visited:
-            continue
+    while queue and len(visited)<max_fetches:
+        url=queue.pop(0)
+        if not url or url in visited: continue
         visited.add(url)
-
-        # Reject before transport if the URL is known-bad/static.
-        if s45v7105_bad_url(url):
-            attempts.append({
-                'requested_url': url,
-                'final_url': url,
-                'official_host': s45v7105_allowed_official_host(url),
-                'search_api_discovery_only': s45v7105_is_search_api(url),
-                'auth_or_error_or_asset': True,
-                'exact_topic': False,
-                'explicit_evidence': False,
-                'rejected_reason': 'PRE_FETCH_REJECTED_URL',
-            })
+        if s45v7106_bad_url(url):
+            attempts.append({'requested_url':url,'final_url':url,'exact_topic':False,'explicit_evidence':False,'rejected_reason':'PRE_FETCH_REJECTED_URL'})
             continue
+        fetched=s45v7106_fetch(url)
+        final_url=normalize_text(fetched.get('final_url'))
+        discovery_only=s45v7106_is_search_api(final_url) or s45v7106_is_search_api(url)
+        audit={'requested_url':url,'final_url':final_url,'http_status':fetched.get('status'),'content_type':fetched.get('content_type'),
+               'official_host':s45v7106_allowed_official_host(final_url),'search_api_discovery_only':discovery_only,
+               'auth_or_error_or_asset':bool(s45v7106_bad_url(final_url) or s45v7106_bad_content(fetched.get('text'),fetched.get('title'))),
+               'exact_topic':False,'explicit_evidence':False,'rejected_reason':fetched.get('rejected_reason'),'error':fetched.get('error')}
+        if not fetched.get('ok'):
+            attempts.append(audit); continue
+        if discovery_only:
+            for d in s45v7106_discover_from_search_api(fetched):
+                if d not in visited and d not in queue: queue.append(d)
+            attempts.append(audit); continue
 
-        fetched = s45v7105_fetch(url)
-        final_url = normalize_text(fetched.get('final_url'))
-        discovery_only = s45v7105_is_search_api(final_url) or s45v7105_is_search_api(url)
+        text=normalize_text(fetched.get('text'))
+        lowurl=final_url.lower()
+        exact=s45v7106_exact_topic_in_substantive_source(fetched)
+        audit['exact_topic']=exact
+        if exact and ('wp-' in lowurl or 'work-programme' in lowurl or 'horizon-2026-2027' in lowurl):
+            cluster_doc=fetched
+        if 'general-annexes' in lowurl or 'general_annexes' in lowurl:
+            annex_doc=fetched
 
-        audit = {
-            'requested_url': url,
-            'final_url': final_url,
-            'http_status': fetched.get('status'),
-            'content_type': fetched.get('content_type'),
-            'official_host': s45v7105_allowed_official_host(final_url),
-            'search_api_discovery_only': discovery_only,
-            'auth_or_error_or_asset': bool(
-                s45v7105_bad_url(final_url)
-                or s45v7105_bad_content(fetched.get('text'), fetched.get('title'))
-            ),
-            'exact_topic': False,
-            'explicit_evidence': False,
-            'rejected_reason': fetched.get('rejected_reason'),
-            'error': fetched.get('error'),
-        }
-
-        if fetched.get('ok'):
-            if discovery_only:
-                for discovered in s45v7105_discover_from_search_api(fetched):
-                    if discovered not in visited and discovered not in queue:
-                        queue.append(discovered)
-                attempts.append(audit)
-                continue
-
-            # Substantive source: exact topic and explicit evidence are evaluated here only.
-            audit['exact_topic'] = s45v7105_exact_topic_in_substantive_source(fetched)
-            excerpt = s45v7105_requirement_excerpt(fetched.get('text'), requirement_key)
-            audit['explicit_evidence'] = bool(excerpt)
-
-            # Conservative document discovery from the substantive source itself.
-            for discovered in s45v7105_discover_links_from_substantive_source(fetched):
-                if discovered not in visited and discovered not in queue:
-                    queue.append(discovered)
-
-            valid = (
-                audit['official_host']
-                and not audit['auth_or_error_or_asset']
-                and audit['exact_topic']
-                and bool(excerpt)
-            )
-
-            if valid:
-                attempts.append(audit)
-                return {
-                    'status': 'RESOLVED',
-                    'requirement_key': requirement_key,
-                    'exact_topic_verified': True,
-                    'authoritative_source_verified': True,
-                    'explicit_evidence_verified': True,
-                    'evidence_url': final_url,
-                    'evidence_excerpt': excerpt,
-                    'evidence_reference': requirement_key,
-                    'source_title': fetched.get('title') or 'Official European Commission source',
-                    'document_type': 'OFFICIAL_EC_DOCUMENT',
-                    'source_authority': 'EUROPEAN_COMMISSION',
-                    'provenance_chain': [url, final_url] if url != final_url else [final_url],
-                    'reason': (
-                        'v7.10.5 verified a freshly fetched substantive official source: '
-                        'canonical/official host, no CAS/auth/error/static content, exact locked topic '
-                        'present in the source, and an explicit requirement passage in that same source.'
-                    ),
-                    'attempts': attempts,
-                }
-
+        # Topic-local positive evidence (especially TRL or topic-specific consortium/eligibility exceptions).
+        section=s45v7106_topic_section(text) if exact else ''
+        excerpt=s45v7106_requirement_excerpt(section or text, requirement_key)
+        audit['explicit_evidence']=bool(excerpt)
         attempts.append(audit)
 
-    return {
-        'status': 'WAITING_OFFICIAL',
-        'requirement_key': requirement_key,
-        'exact_topic_verified': False,
-        'authoritative_source_verified': False,
-        'explicit_evidence_verified': False,
-        'evidence_url': None,
-        'evidence_excerpt': None,
-        'reason': (
-            'No freshly fetched substantive official source proved both exact locked-topic applicability '
-            'and the explicit requirement. Search API/auth/static/history content is not evidence. '
-            'Requirement remains WAITING_OFFICIAL.'
-        ),
-        'attempts': attempts,
-    }
+        if exact and excerpt:
+            return {'status':'RESOLVED','requirement_key':requirement_key,'exact_topic_verified':True,
+                    'authoritative_source_verified':True,'explicit_evidence_verified':True,'evidence_url':final_url,
+                    'evidence_excerpt':excerpt,'evidence_reference':requirement_key,'source_title':fetched.get('title') or 'Official European Commission work programme',
+                    'document_type':'OFFICIAL_EC_WORK_PROGRAMME','source_authority':'EUROPEAN_COMMISSION','provenance_chain':[final_url],
+                    'reason':'v7.10.6 resolved from the bounded exact-topic section of a freshly fetched official EC work programme.','attempts':attempts}
 
+        for d in s45v7106_discover_links_from_substantive_source(fetched):
+            if d not in visited and d not in queue: queue.append(d)
 
-def s45v7105_save_verified_document(task, result):
+    # Cross-document applicability: exact topic WP -> General Annex B.
+    if cluster_doc:
+        cluster_text=normalize_text(cluster_doc.get('text'))
+        bridge=s45v7106_applicability_bridge(cluster_text)
+        if requirement_key=='TRL_REQUIREMENTS':
+            neg=s45v7106_negative_trl_evidence(cluster_text)
+            if neg:
+                u=normalize_text(cluster_doc.get('final_url'))
+                return {'status':'RESOLVED','requirement_key':requirement_key,'exact_topic_verified':True,
+                        'authoritative_source_verified':True,'explicit_evidence_verified':True,'evidence_url':u,
+                        'evidence_excerpt':neg,'evidence_reference':'TRL_NOT_SPECIFIED_IN_EXACT_TOPIC',
+                        'source_title':cluster_doc.get('title') or 'Official European Commission work programme',
+                        'document_type':'OFFICIAL_EC_WORK_PROGRAMME','source_authority':'EUROPEAN_COMMISSION','provenance_chain':[u],
+                        'reason':'v7.10.6 parsed the complete bounded exact-topic section and found no topic-specific TRL condition; no TRL value was inferred. Stage 46 must independently verify this negative finding.','attempts':attempts}
+        if bridge and annex_doc and requirement_key in ('APPLICANT_ELIGIBILITY','CONSORTIUM_REQUIREMENTS'):
+            annex_excerpt=s45v7106_requirement_excerpt(annex_doc.get('text'), requirement_key)
+            if annex_excerpt:
+                cu=normalize_text(cluster_doc.get('final_url')); au=normalize_text(annex_doc.get('final_url'))
+                topic_section=s45v7106_topic_section(cluster_text)
+                bridge_excerpt=s45v7106_requirement_excerpt(topic_section,'APPLICANT_ELIGIBILITY') or topic_section[:5000]
+                combined=('APPLICABILITY BRIDGE — exact topic delegates eligibility conditions to General Annex B. '
+                          'TOPIC SOURCE: '+bridge_excerpt[:5000]+' GENERAL ANNEX B EVIDENCE: '+annex_excerpt[:7000])
+                return {'status':'RESOLVED','requirement_key':requirement_key,'exact_topic_verified':True,
+                        'authoritative_source_verified':True,'explicit_evidence_verified':True,'evidence_url':au,
+                        'evidence_excerpt':combined[:12000],'evidence_reference':'EXACT_TOPIC_TO_GENERAL_ANNEX_B',
+                        'source_title':annex_doc.get('title') or 'Horizon Europe General Annexes',
+                        'document_type':'OFFICIAL_EC_GENERAL_ANNEXES','source_authority':'EUROPEAN_COMMISSION',
+                        'provenance_chain':[cu,au],
+                        'reason':'v7.10.6 proved applicability through the exact-topic work programme delegation to General Annex B, then extracted the requirement from the freshly fetched official General Annexes.','attempts':attempts}
+
+    return {'status':'WAITING_OFFICIAL','requirement_key':requirement_key,'exact_topic_verified':False,
+            'authoritative_source_verified':False,'explicit_evidence_verified':False,'evidence_url':None,'evidence_excerpt':None,
+            'reason':'Fresh official EC topic/work-programme/general-annex discovery did not produce a provenance-complete requirement proof. Requirement remains WAITING_OFFICIAL.',
+            'attempts':attempts}
+
+def s45v7106_save_verified_document(task, result):
     url = normalize_text(result.get('evidence_url'))
     excerpt = normalize_text(result.get('evidence_excerpt'))
     if not url or not excerpt:
@@ -7909,13 +7937,13 @@ def s45v7105_save_verified_document(task, result):
         'topic_identity': identity,
         'exact_topic_verified': True,
         'applicability_verified': True,
-        'applicability_reason': 'v7.10.5 strict canonical exact-topic verification passed.',
+        'applicability_reason': 'v7.10.6 strict canonical exact-topic verification passed.',
         'evidence_found': True,
         'evidence_excerpt': excerpt[:10000],
         'evidence_reference': result.get('evidence_reference') or task.get('requirement_label'),
         'evidence_payload': {
             'stage': 45,
-            'version': 'v7.10.5',
+            'version': 'v7.10.6',
             'strict_canonical_resolver': True,
             'history_used_as_seed': False,
             'search_api_is_evidence': False,
@@ -7952,7 +7980,7 @@ def s45v7105_save_verified_document(task, result):
     return saved[0] if saved else None
 
 
-def s45v7105_worker_payload(task, worker_run_id, result, source_row):
+def s45v7106_worker_payload(task, worker_run_id, result, source_row):
     evidence_url = normalize_text(result.get('evidence_url'))
     excerpt = normalize_text(result.get('evidence_excerpt'))[:10000]
     chain = result.get('provenance_chain') or []
@@ -7996,7 +8024,7 @@ def s45v7105_worker_payload(task, worker_run_id, result, source_row):
         'topic_identity': identity,
         'provenance_chain': chain,
         'documents_checked': [evidence_url],
-        'searches_attempted': s45v7105_search_urls(),
+        'searches_attempted': s45v7106_search_urls(),
         'transport_attempts': result.get('attempts', [])[-30:],
         # Use the existing DB-allowed resolution_method value.
         'resolution_method': 'OFFICIAL_DOCUMENTATION',
@@ -8007,7 +8035,7 @@ def s45v7105_worker_payload(task, worker_run_id, result, source_row):
         'official_document_status': 'EVIDENCE_FOUND',
         'official_document_payload': {
             'stage': 45,
-            'version': 'v7.10.5',
+            'version': 'v7.10.6',
             'handoff_target': 'STAGE_46',
             'strict_canonical_resolver': True,
             'history_used_as_seed': False,
@@ -8021,11 +8049,11 @@ def s45v7105_worker_payload(task, worker_run_id, result, source_row):
     }
 
 
-def s45v7105_persist_worker_item(task, worker_run_id, result, source_row):
+def s45v7106_persist_worker_item(task, worker_run_id, result, source_row):
     if normalize_text(result.get('status')).upper() != 'RESOLVED':
         return None
 
-    payload = s45v7105_worker_payload(task, worker_run_id, result, source_row)
+    payload = s45v7106_worker_payload(task, worker_run_id, result, source_row)
     existing = (
         supabase.table('locked_evidence_worker_items')
         .select('id')
@@ -8048,15 +8076,15 @@ def s45v7105_persist_worker_item(task, worker_run_id, result, source_row):
 
     saved = supabase.table('locked_evidence_worker_items').insert(payload).execute().data or []
     if not saved:
-        raise RuntimeError('v7.10.5 could not persist Stage 46 handoff worker item.')
+        raise RuntimeError('v7.10.6 could not persist Stage 46 handoff worker item.')
     return saved[0]
 
 
-def s45v7105_update_execution_task(task, worker_item):
+def s45v7106_update_execution_task(task, worker_item):
     payload = as_dict(task.get('completion_payload'))
     payload['stage45_evidence_candidate'] = {
         'stage': 45,
-        'version': 'v7.10.5',
+        'version': 'v7.10.6',
         'worker_item_id': worker_item.get('id'),
         'status': 'RESOLVED',
         'evidence_url': worker_item.get('evidence_url'),
@@ -8082,37 +8110,37 @@ def s45v7105_update_execution_task(task, worker_item):
 
 
 st.divider()
-st.subheader('Stage 45 v7.10.5 — Strict Canonical Document Resolver')
+st.subheader('Stage 45 v7.10.6 — Official Topic Document Discovery')
 st.info(
-    'v7.10.5 pornește numai din lock-ul canonic și discovery exact-topic, nu reciclează cele 128 de '
+    'v7.10.6 pornește numai din lock-ul canonic și discovery exact-topic, nu reciclează cele 128 de '
     'documente istorice. Search API este discovery-only; CAS/EU Login/auth/static assets sunt respinse. '
     'Un requirement devine candidat pentru Stage 46 numai dacă aceeași sursă oficială proaspăt citită '
     'conține topicul exact și pasajul explicit.'
 )
 
-_v7105_tasks = [
+_v7106_tasks = [
     t for t in current_tasks
     if normalize_text(t.get('route_type')).upper() == 'OFFICIAL_VERIFICATION'
 ]
 
-_v7105_seed_urls = s45v7105_url_from_lock_context()
+_v7106_seed_urls = s45v7106_url_from_lock_context()
 
 q1, q2, q3, q4 = st.columns(4)
-q1.metric('OFFICIAL requirements', len(_v7105_tasks))
-q2.metric('Canonical lock seeds', len(_v7105_seed_urls))
+q1.metric('OFFICIAL requirements', len(_v7106_tasks))
+q2.metric('Canonical lock seeds', len(_v7106_seed_urls))
 q3.metric('Historical docs as seeds', '0')
 q4.metric('Stage 46 target', 'STRICT')
 
-if _v7105_seed_urls:
-    st.caption('Primary canonical seed: ' + _v7105_seed_urls[0])
+if _v7106_seed_urls:
+    st.caption('Primary canonical seed: ' + _v7106_seed_urls[0])
 else:
-    st.warning('Nu există canonical seed valid în ACTIVE lock; v7.10.5 va rămâne fail-closed.')
+    st.warning('Nu există canonical seed valid în ACTIVE lock; v7.10.6 va rămâne fail-closed.')
 
 if st.button(
-    '🧭 Run Stage 45 v7.10.5 strict canonical resolver',
+    '🧭 Run Stage 45 v7.10.6 strict canonical resolver',
     type='primary',
     use_container_width=True,
-    key='stage45_v7105_run',
+    key='stage45_v7106_run',
 ):
     _run = (
         supabase.table('locked_evidence_worker_runs')
@@ -8122,17 +8150,17 @@ if st.button(
             'opportunity_lock_id': lock_id,
             'execution_run_id': execution_run_id,
             'opportunity_identity': identity,
-            'total_tasks': len(_v7105_tasks),
+            'total_tasks': len(_v7106_tasks),
             'worker_status': 'RUNNING',
-            'deep_resolution_version': 'v7.10.5',
+            'deep_resolution_version': 'v7.10.6',
             'diagnostic_status': 'CLEAN',
             'error_count': 0,
             'started_at': now_iso(),
             'summary': {
                 'stage': 45,
-                'version': 'v7.10.5',
+                'version': 'v7.10.6',
                 'purpose': 'STRICT_CANONICAL_DOCUMENT_RESOLVER',
-                'canonical_seed_urls': _v7105_seed_urls,
+                'canonical_seed_urls': _v7106_seed_urls,
                 'history_used_as_seed': False,
                 'search_api_is_evidence': False,
             },
@@ -8142,7 +8170,7 @@ if st.button(
     ).data or []
 
     if not _run:
-        st.error('Nu am putut crea Stage 45 v7.10.5 run.')
+        st.error('Nu am putut crea Stage 45 v7.10.6 run.')
     else:
         _run_id = str(_run[0]['id'])
         _resolved = 0
@@ -8151,9 +8179,9 @@ if st.button(
         _audit_rows = []
         _bar = st.progress(0)
 
-        for _idx, _task in enumerate(_v7105_tasks, 1):
+        for _idx, _task in enumerate(_v7106_tasks, 1):
             try:
-                _result = s45v7105_discover_and_verify(_task)
+                _result = s45v7106_discover_and_verify(_task)
                 _attempts = _result.get('attempts', []) or []
                 _rejected_auth_assets = sum(
                     1 for a in _attempts
@@ -8177,11 +8205,11 @@ if st.button(
                 })
 
                 if normalize_text(_result.get('status')).upper() == 'RESOLVED':
-                    _source_row = s45v7105_save_verified_document(_task, _result)
-                    _worker_item = s45v7105_persist_worker_item(
+                    _source_row = s45v7106_save_verified_document(_task, _result)
+                    _worker_item = s45v7106_persist_worker_item(
                         _task, _run_id, _result, _source_row
                     )
-                    s45v7105_update_execution_task(_task, _worker_item)
+                    s45v7106_update_execution_task(_task, _worker_item)
                     _resolved += 1
                 else:
                     _waiting += 1
@@ -8201,7 +8229,7 @@ if st.button(
                     'Reason': f'{type(_exc).__name__}: {str(_exc)[:1000]}',
                 })
 
-            _bar.progress(_idx / max(1, len(_v7105_tasks)))
+            _bar.progress(_idx / max(1, len(_v7106_tasks)))
 
         _final = (
             'FAILED'
@@ -8223,13 +8251,13 @@ if st.button(
             ),
             'official_tasks_resolved': _resolved,
             'official_tasks_waiting': _waiting,
-            'deep_resolution_version': 'v7.10.5',
+            'deep_resolution_version': 'v7.10.6',
             'provenance_summary': {
                 'stage': 45,
-                'version': 'v7.10.5',
+                'version': 'v7.10.6',
                 'strict_canonical_resolver': True,
                 'handoff_target': 'STAGE_46',
-                'canonical_seed_urls': _v7105_seed_urls,
+                'canonical_seed_urls': _v7106_seed_urls,
                 'history_used_as_seed': False,
                 'search_api_is_evidence': False,
                 'resolved': _resolved,
@@ -8242,7 +8270,7 @@ if st.button(
         }).eq('id', _run_id).eq('user_id', user_id).execute()
 
         st.success(
-            f'Stage 45 v7.10.5: {_final} — canonical RESOLVED {_resolved}, '
+            f'Stage 45 v7.10.6: {_final} — canonical RESOLVED {_resolved}, '
             f'waiting {_waiting}, failed {_failed}.'
         )
         if _audit_rows:
@@ -8250,7 +8278,7 @@ if st.button(
         st.rerun()
 
 
-_v7105_runs = rows(
+_v7106_runs = rows(
     'locked_evidence_worker_runs',
     {
         'user_id': user_id,
@@ -8260,24 +8288,24 @@ _v7105_runs = rows(
     'created_at',
     100,
 )
-_v7105_runs = [
-    r for r in _v7105_runs
-    if normalize_text(r.get('deep_resolution_version')).lower() == 'v7.10.5'
+_v7106_runs = [
+    r for r in _v7106_runs
+    if normalize_text(r.get('deep_resolution_version')).lower() == 'v7.10.6'
 ]
 
-if _v7105_runs:
-    _latest_v7105 = _v7105_runs[0]
-    st.subheader('Latest Stage 45 v7.10.5 Result')
+if _v7106_runs:
+    _latest_v7106 = _v7106_runs[0]
+    st.subheader('Latest Stage 45 v7.10.6 Result')
 
     z1, z2, z3, z4 = st.columns(4)
-    z1.metric('Status', _latest_v7105.get('worker_status') or '—')
-    z2.metric('Canonical RESOLVED', _latest_v7105.get('official_tasks_resolved') or 0)
-    z3.metric('Waiting', _latest_v7105.get('official_tasks_waiting') or 0)
-    z4.metric('Failed', _latest_v7105.get('failed_tasks') or 0)
+    z1.metric('Status', _latest_v7106.get('worker_status') or '—')
+    z2.metric('Canonical RESOLVED', _latest_v7106.get('official_tasks_resolved') or 0)
+    z3.metric('Waiting', _latest_v7106.get('official_tasks_waiting') or 0)
+    z4.metric('Failed', _latest_v7106.get('failed_tasks') or 0)
 
-    _summary = _latest_v7105.get('provenance_summary') or {}
+    _summary = _latest_v7106.get('provenance_summary') or {}
     if isinstance(_summary, dict) and _summary.get('audit'):
-        with st.expander('v7.10.5 strict canonical audit', expanded=False):
+        with st.expander('v7.10.6 strict canonical audit', expanded=False):
             st.dataframe(_summary.get('audit'), use_container_width=True, hide_index=True)
 
     _items = rows(
@@ -8286,7 +8314,7 @@ if _v7105_runs:
             'user_id': user_id,
             'project_id': project_id,
             'opportunity_lock_id': lock_id,
-            'worker_run_id': str(_latest_v7105.get('id')),
+            'worker_run_id': str(_latest_v7106.get('id')),
         },
         'created_at',
         100,
@@ -8313,11 +8341,10 @@ if _v7105_runs:
         )
 
 st.caption(
-    'v7.10.5 invariant: Search API, CAS/EU Login, auth/error pages, static assets and historical '
+    'v7.10.6 invariant: Search API, CAS/EU Login, auth/error pages, static assets and historical '
     'worker documents are never evidence seeds. Only a freshly fetched substantive official source '
     'that proves both the exact topic and the explicit requirement can be handed to Stage 46.'
 )
 # =====================================================================
-# END STAGE 45 v7.10.5
+# END STAGE 45 v7.10.6
 # =====================================================================
-
