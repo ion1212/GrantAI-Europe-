@@ -8345,6 +8345,61 @@ if _v7107_runs:
                     })
             if _diag_rows:
                 st.dataframe(_diag_rows, use_container_width=True, hide_index=True)
+
+                # Flat export: one URL attempt per CSV row.
+                # Avoids nested objects becoming "[object Object]" in exports.
+                import csv as _csv
+                import io as _io
+
+                _flat_buf = _io.StringIO()
+                _flat_fields = [
+                    'Requirement', 'Requested URL', 'Final URL', 'HTTP',
+                    'Content-Type', 'Bytes', 'Parser', 'Text chars',
+                    'Topic token', 'Exact topic', 'Explicit evidence',
+                    'Search only', 'Rejected', 'Error'
+                ]
+                _flat_writer = _csv.DictWriter(
+                    _flat_buf,
+                    fieldnames=_flat_fields,
+                    extrasaction='ignore'
+                )
+                _flat_writer.writeheader()
+                for _flat_row in _diag_rows:
+                    _flat_writer.writerow({
+                        _k: (
+                            '' if _flat_row.get(_k) is None
+                            else _flat_row.get(_k)
+                        )
+                        for _k in _flat_fields
+                    })
+
+                st.download_button(
+                    '⬇️ Export flat transport diagnostics CSV',
+                    data=_flat_buf.getvalue().encode('utf-8-sig'),
+                    file_name='stage45_v7_10_7_transport_diagnostics_flat.csv',
+                    mime='text/csv',
+                    use_container_width=True,
+                )
+
+                # Compact failure view: surfaces the decisive transport fields
+                # without requiring horizontal scrolling.
+                _compact_diag = []
+                for _d in _diag_rows:
+                    _compact_diag.append({
+                        'Requirement': _d.get('Requirement'),
+                        'HTTP': _d.get('HTTP'),
+                        'Type': _d.get('Content-Type'),
+                        'Bytes': _d.get('Bytes'),
+                        'Parser': _d.get('Parser'),
+                        'Chars': _d.get('Text chars'),
+                        'Topic': _d.get('Topic token'),
+                        'Exact': _d.get('Exact topic'),
+                        'Evidence': _d.get('Explicit evidence'),
+                        'Rejected': _d.get('Rejected'),
+                        'Error': _d.get('Error'),
+                    })
+                st.caption('Compact transport diagnosis')
+                st.dataframe(_compact_diag, use_container_width=True, hide_index=True)
             else:
                 st.info('No URL-level diagnostic rows were persisted for this run.')
 
