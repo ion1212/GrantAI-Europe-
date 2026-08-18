@@ -21,6 +21,18 @@ try:
     from pypdf import PdfReader
 except Exception:
     PdfReader = None
+try:
+    from PyPDF2 import PdfReader as PyPDF2Reader
+except Exception:
+    PyPDF2Reader = None
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+try:
+    import fitz
+except Exception:
+    fitz = None
 
 
 # ===== Stage 45 v3 official-source transport =====
@@ -7455,24 +7467,78 @@ def s45v7107_bad_content(text, title=''):
     return any(x in corpus for x in strong)
 
 
+def s45v7108_pdf_text(content, max_pages=350, max_chars=900000):
+    if not content:
+        return "", "NONE", "EMPTY_PDF_BYTES", 0
+    errors = []
+    readers = [("pypdf", PdfReader), ("PyPDF2", PyPDF2Reader)]
+    for name, Reader in readers:
+        if Reader is None:
+            continue
+        try:
+            reader = Reader(BytesIO(content), strict=False)
+            parts, total, pages = [], 0, 0
+            for idx, page in enumerate(reader.pages):
+                if idx >= max_pages or total >= max_chars:
+                    break
+                pages += 1
+                try:
+                    txt = page.extract_text() or ""
+                except Exception as exc:
+                    errors.append(f"{name}-page-{idx+1}:{type(exc).__name__}")
+                    txt = ""
+                if txt:
+                    parts.append(f"\\n[PDF PAGE {idx+1}]\\n{txt}")
+                    total += len(txt)
+            joined = "\\n".join(parts)[:max_chars]
+            if joined.strip():
+                return joined, name, "", pages
+            errors.append(f"{name}:NO_TEXT")
+        except Exception as exc:
+            errors.append(f"{name}:{type(exc).__name__}:{str(exc)[:160]}")
+    if pdfplumber is not None:
+        try:
+            parts, total, pages = [], 0, 0
+            with pdfplumber.open(BytesIO(content)) as pdf:
+                for idx, page in enumerate(pdf.pages):
+                    if idx >= max_pages or total >= max_chars:
+                        break
+                    pages += 1
+                    txt = page.extract_text() or ""
+                    if txt:
+                        parts.append(f"\\n[PDF PAGE {idx+1}]\\n{txt}")
+                        total += len(txt)
+            joined = "\\n".join(parts)[:max_chars]
+            if joined.strip():
+                return joined, "pdfplumber", "", pages
+            errors.append("pdfplumber:NO_TEXT")
+        except Exception as exc:
+            errors.append(f"pdfplumber:{type(exc).__name__}:{str(exc)[:160]}")
+    if fitz is not None:
+        try:
+            doc = fitz.open(stream=content, filetype="pdf")
+            parts, total, pages = [], 0, 0
+            for idx in range(min(len(doc), max_pages)):
+                if total >= max_chars:
+                    break
+                pages += 1
+                txt = doc[idx].get_text("text") or ""
+                if txt:
+                    parts.append(f"\\n[PDF PAGE {idx+1}]\\n{txt}")
+                    total += len(txt)
+            joined = "\\n".join(parts)[:max_chars]
+            if joined.strip():
+                return joined, "PyMuPDF", "", pages
+            errors.append("PyMuPDF:NO_TEXT")
+        except Exception as exc:
+            errors.append(f"PyMuPDF:{type(exc).__name__}:{str(exc)[:160]}")
+    available = [n for n,o in [("pypdf",PdfReader),("PyPDF2",PyPDF2Reader),("pdfplumber",pdfplumber),("PyMuPDF",fitz)] if o is not None]
+    if not available:
+        return "", "PDF-NO-PARSER", "NO_PDF_LIBRARY_AVAILABLE", 0
+    return "", "PDF-FAILED", " | ".join(errors)[-1800:], 0
+
 def s45v7107_pdf_text(content):
-    if not content or PdfReader is None:
-        return ''
-    try:
-        reader = PdfReader(BytesIO(content))
-        parts = []
-        for page in reader.pages[:350]:
-            try:
-                txt = page.extract_text() or ''
-            except Exception:
-                txt = ''
-            if txt:
-                parts.append(txt)
-            if sum(len(x) for x in parts) >= 350000:
-                break
-        return re.sub(r'\s+', ' ', '\n'.join(parts))[:350000]
-    except Exception:
-        return ''
+    return s45v7108_pdf_text(content)[0]
 
 
 def s45v7107_html_text(raw):
@@ -7544,8 +7610,12 @@ def s45v7107_fetch(url, timeout=45):
 
         ctype = out['content_type'].lower()
         if 'application/pdf' in ctype or out['final_url'].lower().split('?', 1)[0].endswith('.pdf'):
-            out['parser'] = 'PDF'
-            out['text'] = s45v7107_pdf_text(r.content)
+            _txt, _parser, _perr, _pages = s45v7108_pdf_text(r.content)
+            out['parser'] = _parser
+            out['text'] = _txt
+            out['pdf_pages_read'] = _pages
+            if _perr:
+                out['error'] = _perr
             out['raw'] = ''
         else:
             raw = r.text or ''
@@ -8320,10 +8390,10 @@ if _v7107_runs:
 
     _summary = _latest_v7107.get('provenance_summary') or {}
     if isinstance(_summary, dict) and _summary.get('audit'):
-        with st.expander('v7.10.7 diagnostic summary', expanded=False):
+        with st.expander('v7.10.8 PDF-fix diagnostic summary', expanded=False):
             st.dataframe(_summary.get('audit'), use_container_width=True, hide_index=True)
 
-        with st.expander('v7.10.7 URL-by-URL transport diagnostics', expanded=True):
+        with st.expander('v7.10.8 URL-by-URL transport diagnostics', expanded=True):
             _diag_rows = []
             for _req in (_summary.get('audit') or []):
                 for _a in (_req.get('Transport diagnostics') or []):
@@ -8376,7 +8446,7 @@ if _v7107_runs:
                 st.download_button(
                     '⬇️ Export flat transport diagnostics CSV',
                     data=_flat_buf.getvalue().encode('utf-8-sig'),
-                    file_name='stage45_v7_10_7_transport_diagnostics_flat.csv',
+                    file_name='stage45_v7_10_8_transport_diagnostics_flat.csv',
                     mime='text/csv',
                     use_container_width=True,
                 )
