@@ -30,6 +30,514 @@ try:
 except Exception:
     pdfplumber = None
 try:
+    # =====================================================================
+# STAGE 45 v7.10.9 — CANONICAL FINAL-PDF HANDOFF FIX
+# =====================================================================
+
+def s45v7109_is_real_official_pdf_url(url):
+    url = normalize_text(url)
+    if not url:
+        return False
+
+    try:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+
+        official_host = (
+            host.endswith("ec.europa.eu")
+            or host.endswith("europa.eu")
+            or host.endswith("funding-tenders.ec.europa.eu")
+        )
+
+        if not official_host:
+            return False
+
+        # Never promote transport/auth/search infrastructure as evidence.
+        bad = (
+            "login" in path
+            or "cas" in path
+            or "search-api" in url.lower()
+            or "/auth" in path
+            or "error" in path
+        )
+        if bad:
+            return False
+
+        return path.endswith(".pdf")
+
+    except Exception:
+        return False
+
+
+def s45v7109_transport_verify_pdf(url):
+    """
+    Freshly re-fetch the candidate evidence URL.
+    Returns the FINAL URL after redirects only when it is a substantive
+    official PDF that can be parsed.
+    """
+    result = {
+        "ok": False,
+        "requested_url": normalize_text(url),
+        "final_url": "",
+        "http_status": None,
+        "content_type": "",
+        "bytes_received": 0,
+        "parser": "",
+        "text_chars": 0,
+        "text": "",
+        "error": "",
+    }
+
+    if not s45v7109_is_real_official_pdf_url(url):
+        result["error"] = "NOT_CANONICAL_OFFICIAL_PDF_URL"
+        return result
+
+    try:
+        r = requests.get(
+            url,
+            timeout=45,
+            allow_redirects=True,
+            headers={
+                "User-Agent": "GreenRise/Stage45-v7.10.9",
+                "Accept": "application/pdf,*/*;q=0.8",
+                "Accept-Language": "en-GB,en;q=0.9",
+            },
+        )
+
+        result["http_status"] = r.status_code
+        result["final_url"] = normalize_text(r.url)
+        result["content_type"] = normalize_text(
+            r.headers.get("content-type")
+        ).lower()
+        result["bytes_received"] = len(r.content or b"")
+
+        if r.status_code != 200:
+            result["error"] = f"HTTP_{r.status_code}"
+            return result
+
+        if not s45v7109_is_real_official_pdf_url(result["final_url"]):
+            result["error"] = "FINAL_URL_NOT_OFFICIAL_PDF"
+            return result
+
+        raw = r.content or b""
+
+        if not raw.startswith(b"%PDF"):
+            result["error"] = "RESPONSE_NOT_PDF_BYTES"
+            return result
+
+        # Reuse the proven v7.10.8 PDF extraction path.
+        fetched = s45v7107_fetch_substantive(result["final_url"])
+
+        if not fetched or not fetched.get("ok"):
+            result["error"] = (
+                normalize_text(
+                    (fetched or {}).get("error")
+                )
+                or "V7108_PDF_PARSE_FAILED"
+            )
+            return result
+
+        text = normalize_text(fetched.get("text"))
+
+        result["parser"] = normalize_text(fetched.get("parser"))
+        result["text"] = text
+        result["text_chars"] = len(text)
+
+        if not text:
+            result["error"] = "EMPTY_PDF_TEXT"
+            return result
+
+        result["ok"] = True
+        return result
+
+    except Exception as exc:
+        result["error"] = (
+            f"{type(exc).__name__}: {str(exc)[:1000]}"
+        )
+        return result
+
+
+def s45v7109_revalidate_worker_item(item):
+    """
+    Stage 45 transport/provenance normalization only.
+
+    Does NOT manufacture a Stage 46 PASS.
+    It replaces an unsafe/redirect/auth evidence reference with the
+    freshly verified final official PDF URL.
+    """
+    evidence_url = normalize_text(item.get("evidence_url"))
+
+    out = {
+        "worker_item_id": item.get("id"),
+        "requirement": item.get("requirement_label"),
+        "status": "REJECTED",
+        "old_url": evidence_url,
+        "canonical_pdf_url": "",
+        "http_status": None,
+        "content_type": "",
+        "parser": "",
+        "text_chars": 0,
+        "exact_topic": False,
+        "explicit_evidence": False,
+        "reason": "",
+    }
+
+    transport = s45v7109_transport_verify_pdf(evidence_url)
+
+    out["http_status"] = transport.get("http_status")
+    out["content_type"] = transport.get("content_type")
+    out["parser"] = transport.get("parser")
+    out["text_chars"] = transport.get("text_chars") or 0
+
+    if not transport.get("ok"):
+        out["reason"] = (
+            transport.get("error")
+            or "PDF_TRANSPORT_VERIFICATION_FAILED"
+        )
+        return out
+
+    final_url = normalize_text(transport.get("final_url"))
+    text = normalize_text(transport.get("text"))
+
+    task_like = {
+        "requirement_key": item.get("requirement_key"),
+        "requirement_category": item.get("requirement_category"),
+        "requirement_label": item.get("requirement_label"),
+    }
+
+    exact_topic = s45v7107_exact_topic_in_substantive_source({
+        "text": text,
+        "final_url": final_url,
+        "url": final_url,
+        "title": item.get("source_title") or "",
+        "ok": True,
+    })
+
+    requirement_key = normalize_text(
+        item.get("requirement_key")
+    ).upper()
+
+    # Use the same conservative v7.10.8 requirement extractor.
+    topic_section = (
+        s45v7107_topic_section(text)
+        if exact_topic
+        else ""
+    )
+
+    excerpt = s45v7107_requirement_excerpt(
+        topic_section or text,
+        requirement_key,
+    )
+
+    # Special TRL case already defined by v7.10.8:
+    # absence of topic-specific TRL is only a candidate negative finding,
+    # never an inferred TRL value.
+    if (
+        requirement_key == "TRL_REQUIREMENTS"
+        and exact_topic
+        and not excerpt
+    ):
+        excerpt = s45v7107_negative_trl_evidence(text)
+
+    explicit = bool(normalize_text(excerpt))
+
+    out["canonical_pdf_url"] = final_url
+    out["exact_topic"] = bool(exact_topic)
+    out["explicit_evidence"] = explicit
+
+    if not exact_topic:
+        out["reason"] = "EXACT_TOPIC_NOT_REPRODUCED_FROM_FINAL_PDF"
+        return out
+
+    if not explicit:
+        out["reason"] = "EXPLICIT_REQUIREMENT_NOT_REPRODUCED_FROM_FINAL_PDF"
+        return out
+
+    # Important:
+    # update only the canonical Stage 45 candidate.
+    # Stage 46 still has to independently fetch and verify it.
+    metadata = as_dict(item.get("metadata"))
+    metadata.update({
+        "stage": 45,
+        "version": "v7.10.9",
+        "handoff_target": "STAGE_46",
+        "canonical_final_pdf_verified": True,
+        "stage46_must_refetch": True,
+        "search_api_is_evidence": False,
+        "history_used_as_seed": False,
+        "previous_evidence_url": evidence_url,
+        "canonical_evidence_url": final_url,
+        "verified_at": now_iso(),
+    })
+
+    provenance = item.get("provenance_chain")
+    if not isinstance(provenance, list):
+        provenance = []
+
+    provenance = [
+        normalize_text(x)
+        for x in provenance
+        if normalize_text(x)
+    ]
+
+    if final_url not in provenance:
+        provenance.append(final_url)
+
+    update_payload = {
+        "evidence_url": final_url,
+        "evidence_excerpt": normalize_text(excerpt)[:12000],
+        "exact_topic_verified": True,
+        "authoritative_source_verified": True,
+        "explicit_evidence_verified": True,
+        "official_verified": True,
+        "official_document_status": "VERIFIED",
+        "resolution_method": "OFFICIAL_FINAL_PDF",
+        "provenance_chain": provenance,
+        "metadata": metadata,
+        "retrieved_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    (
+        supabase.table("locked_evidence_worker_items")
+        .update(update_payload)
+        .eq("id", item.get("id"))
+        .eq("user_id", user_id)
+        .execute()
+    )
+
+    # Keep execution task WAITING until Stage 46 independently validates.
+    task_rows = (
+        supabase.table("locked_evidence_execution_tasks")
+        .select("*")
+        .eq("id", item.get("execution_task_id"))
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    ).data or []
+
+    if task_rows:
+        task = task_rows[0]
+        completion_payload = as_dict(task.get("completion_payload"))
+
+        candidate = as_dict(
+            completion_payload.get("stage45_evidence_candidate")
+        )
+
+        candidate.update({
+            "stage": 45,
+            "version": "v7.10.9",
+            "worker_item_id": item.get("id"),
+            "status": "RESOLVED",
+            "evidence_url": final_url,
+            "canonical_final_url": final_url,
+            "evidence_reference": item.get("evidence_reference"),
+            "evidence_excerpt": normalize_text(excerpt)[:12000],
+            "exact_topic_verified": True,
+            "authoritative_source_verified": True,
+            "explicit_evidence_verified": True,
+            "strict_canonical_source_verified": True,
+            "canonical_final_pdf_verified": True,
+            "stage46_must_refetch": True,
+            "handoff": "STAGE_46",
+            "updated_at": now_iso(),
+        })
+
+        completion_payload["stage45_evidence_candidate"] = candidate
+
+        (
+            supabase.table("locked_evidence_execution_tasks")
+            .update({
+                "task_status": "WAITING_OFFICIAL",
+                "completion_status": None,
+                "completion_source": None,
+                "completion_reference": None,
+                "completed_at": None,
+                "completion_payload": completion_payload,
+                "updated_at": now_iso(),
+            })
+            .eq("id", task.get("id"))
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+    out["status"] = "CANONICAL_PDF_READY"
+    out["reason"] = (
+        "Fresh final official PDF independently reproduced exact topic "
+        "and explicit requirement. Ready for Stage 46 re-fetch."
+    )
+
+    return out
+
+
+st.divider()
+st.subheader(
+    "Stage 45 v7.10.9 — Canonical Final-PDF Handoff Fix"
+)
+
+st.info(
+    "v7.10.9 nu schimbă verdictul Stage 46. "
+    "Re-fetch-uiește fiecare evidence URL v7.10.8, urmărește redirecturile, "
+    "acceptă numai PDF oficial EC real și persistă FINAL URL ca sursă "
+    "canonică pentru reverificarea independentă din Stage 46."
+)
+
+
+_v7109_items = rows(
+    "locked_evidence_worker_items",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    500,
+)
+
+_v7109_candidates = []
+
+for _item in _v7109_items:
+    _meta = as_dict(_item.get("metadata"))
+
+    version = normalize_text(_meta.get("version")).lower()
+
+    if version not in {"v7.10.8", "v7.10.9"}:
+        continue
+
+    if normalize_text(
+        _item.get("worker_status")
+    ).upper() != "RESOLVED":
+        continue
+
+    if not (
+        bool(_item.get("exact_topic_verified"))
+        and bool(_item.get("authoritative_source_verified"))
+        and bool(_item.get("explicit_evidence_verified"))
+    ):
+        continue
+
+    _v7109_candidates.append(_item)
+
+
+m1, m2 = st.columns(2)
+m1.metric(
+    "v7.10.8/9 canonical candidates",
+    len(_v7109_candidates),
+)
+m2.metric(
+    "Target",
+    "Stage 46 independent re-fetch",
+)
+
+
+if st.button(
+    "🔗 Run v7.10.9 canonical PDF handoff fix",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v7109_run",
+):
+    _results = []
+    _bar = st.progress(0)
+
+    for _idx, _item in enumerate(_v7109_candidates, 1):
+        try:
+            _result = s45v7109_revalidate_worker_item(_item)
+        except Exception as _exc:
+            _result = {
+                "worker_item_id": _item.get("id"),
+                "requirement": _item.get("requirement_label"),
+                "status": "ERROR",
+                "old_url": _item.get("evidence_url"),
+                "canonical_pdf_url": "",
+                "http_status": None,
+                "content_type": "",
+                "parser": "",
+                "text_chars": 0,
+                "exact_topic": False,
+                "explicit_evidence": False,
+                "reason": (
+                    f"{type(_exc).__name__}: "
+                    f"{str(_exc)[:1000]}"
+                ),
+            }
+
+        _results.append(_result)
+
+        if _v7109_candidates:
+            _bar.progress(
+                _idx / len(_v7109_candidates)
+            )
+
+    st.session_state[
+        "stage45_v7109_results"
+    ] = _results
+
+    st.rerun()
+
+
+_v7109_results = st.session_state.get(
+    "stage45_v7109_results",
+    [],
+)
+
+if _v7109_results:
+    st.subheader("v7.10.9 handoff result")
+
+    _ready = sum(
+        1
+        for x in _v7109_results
+        if x.get("status") == "CANONICAL_PDF_READY"
+    )
+
+    _rejected = sum(
+        1
+        for x in _v7109_results
+        if x.get("status") == "REJECTED"
+    )
+
+    _errors = sum(
+        1
+        for x in _v7109_results
+        if x.get("status") == "ERROR"
+    )
+
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Ready for Stage 46", _ready)
+    r2.metric("Rejected", _rejected)
+    r3.metric("Errors", _errors)
+
+    st.dataframe(
+        [
+            {
+                "Requirement": x.get("requirement"),
+                "Status": x.get("status"),
+                "HTTP": x.get("http_status"),
+                "Content-Type": x.get("content_type"),
+                "Parser": x.get("parser"),
+                "Chars": x.get("text_chars"),
+                "Exact topic": x.get("exact_topic"),
+                "Explicit evidence": x.get("explicit_evidence"),
+                "Canonical PDF URL": x.get("canonical_pdf_url"),
+                "Reason": x.get("reason"),
+            }
+            for x in _v7109_results
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+st.caption(
+    "v7.10.9 invariant: Stage 45 may normalize and persist a freshly "
+    "verified final official PDF URL, but it cannot grant Stage 46 PASS. "
+    "Stage 46 must independently GET the canonical PDF and reproduce "
+    "exact-topic applicability plus explicit evidence."
+)
+
+# =====================================================================
+# END STAGE 45 v7.10.9
+# =====================================================================
     import fitz
 except Exception:
     fitz = None
