@@ -8814,7 +8814,7 @@ def s45v7109_normalize_item(item):
 
 st.divider()
 st.subheader(
-    "Stage 45 v7.10.9 — Canonical Final-PDF Handoff Fix"
+    "Stage 45 v7.10.9 — Canonical Final-PDF Handoff Fix (selector fixed)"
 )
 
 st.info(
@@ -8836,14 +8836,9 @@ _v7109_items = rows(
 )
 
 _v7109_candidates = []
+_v7109_seen_requirements = set()
 
 for _item in _v7109_items:
-    _metadata = as_dict(_item.get("metadata"))
-    _version = normalize_text(_metadata.get("version")).lower()
-
-    if _version not in {"v7.10.8", "v7.10.9"}:
-        continue
-
     if normalize_text(_item.get("worker_status")).upper() != "RESOLVED":
         continue
 
@@ -8854,6 +8849,27 @@ for _item in _v7109_items:
     ):
         continue
 
+    if not normalize_text(_item.get("evidence_url")):
+        continue
+
+    if not normalize_text(_item.get("evidence_excerpt")):
+        continue
+
+    # Because rows() orders by created_at DESC, the first strict row
+    # encountered for a requirement is the newest canonical candidate.
+    _req_identity = (
+        normalize_text(_item.get("requirement_id"))
+        or normalize_text(_item.get("requirement_key")).lower()
+        or normalize_text(_item.get("requirement_label")).lower()
+    )
+
+    if not _req_identity:
+        continue
+
+    if _req_identity in _v7109_seen_requirements:
+        continue
+
+    _v7109_seen_requirements.add(_req_identity)
     _v7109_candidates.append(_item)
 
 c1, c2 = st.columns(2)
