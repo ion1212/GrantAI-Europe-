@@ -23,7 +23,7 @@ except Exception:
 
 
 # =====================================================================
-# STAGE 46 v2 — POST-RESOLUTION PROVENANCE VALIDATOR
+# STAGE 46 v2.4 — POST-RESOLUTION PROVENANCE VALIDATOR
 # Dedicated Supabase persistence:
 #   locked_evidence_provenance_runs
 #   locked_evidence_provenance_items
@@ -31,12 +31,12 @@ except Exception:
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 46 v2.3 — Provenance Validator",
+    page_title="Stage 46 v2.4 — Provenance Validator",
     page_icon="🛡️",
     layout="wide",
 )
 
-st.title("🛡️ Etapa 46 v2.3 — AI Post-Resolution Provenance Validator")
+st.title("🛡️ Etapa 46 v2.4 — AI Post-Resolution Provenance Validator")
 st.caption(
     "Etapa 46 v2 citește rezultatele Stage 45, dar își păstrează propriul audit în tabelele "
     "provenance. PASS este permis numai dacă toate cerințele OFFICIAL au dovadă RESOLVED "
@@ -492,54 +492,95 @@ def requirement_match_key(row: dict) -> list[str]:
 
 def _stage45_status(item: dict) -> str:
     return normalize_text(_first_value(item, [
-        "worker_status",
-        "resolution_status",
-        "status",
-        "task_status",
-        "validation_status",
+        "worker_status", "resolution_status", "status", "task_status",
+        "validation_status", "completion_status", "official_document_status",
+    ])).upper()
+
+
+def _stage45_resolution_method(item: dict) -> str:
+    return normalize_text(_first_value(item, [
+        "resolution_method", "evidence_method", "verification_method",
+        "completion_source", "source_method",
     ])).upper()
 
 
 def _stage45_url(item: dict) -> str:
     candidates = [
-        "evidence_url",
-        "official_url",
-        "source_url",
-        "resolved_url",
-        "document_url",
-        "requested_url",
-        "evidence_reference",
+        "final_url", "evidence_url", "official_url", "source_url", "resolved_url",
+        "document_url", "requested_url", "evidence_reference", "completion_reference",
+        "canonical_url", "final_pdf_url", "official_document_url",
     ]
     for field in candidates:
         value = normalize_text(item.get(field))
         if value.startswith(("http://", "https://")):
             return value
+
+    # Historical/current workers can persist the URL inside JSON payloads.
+    for container_name in (
+        "completion_payload", "resolution_payload", "validation_payload",
+        "evidence_payload", "source_snapshot", "worker_payload", "result_payload",
+    ):
+        payload = as_dict(item.get(container_name))
+        for field in candidates:
+            value = normalize_text(payload.get(field))
+            if value.startswith(("http://", "https://")):
+                return value
     return ""
 
 
 def _stage45_excerpt(item: dict) -> str:
-    return normalize_text(_first_value(item, [
-        "evidence_excerpt",
-        "explicit_evidence_excerpt",
-        "resolved_excerpt",
-        "source_excerpt",
-        "document_excerpt",
-        "evidence_text",
-        "passage",
-        "excerpt",
-    ]))
+    fields = [
+        "evidence_excerpt", "explicit_evidence_excerpt", "resolved_excerpt",
+        "source_excerpt", "document_excerpt", "evidence_text", "passage", "excerpt",
+        "official_excerpt", "final_excerpt", "completion_excerpt",
+    ]
+    value = _first_value(item, fields)
+    if value not in (None, ""):
+        return normalize_text(value)
+
+    for container_name in (
+        "completion_payload", "resolution_payload", "validation_payload",
+        "evidence_payload", "source_snapshot", "worker_payload", "result_payload",
+    ):
+        payload = as_dict(item.get(container_name))
+        value = _first_value(payload, fields)
+        if value not in (None, ""):
+            return normalize_text(value)
+    return ""
+
+
+def _stage45_bool(item: dict, names: list[str]) -> bool:
+    for name in names:
+        if item.get(name) is True:
+            return True
+    for container_name in (
+        "completion_payload", "resolution_payload", "validation_payload",
+        "evidence_payload", "source_snapshot", "worker_payload", "result_payload",
+    ):
+        payload = as_dict(item.get(container_name))
+        for name in names:
+            if payload.get(name) is True:
+                return True
+    return False
 
 
 def normalize_stage45_item(item: dict) -> dict:
-    """
-    Convert historical Stage 45 variants to the canonical shape consumed by
-    Stage 46. The original row is preserved and only missing canonical fields
-    are filled from known historical aliases.
-    """
+    """Normalize Stage 45 historical/current persistence into the Stage 46 handoff contract."""
     out = dict(item)
     out["worker_status"] = _stage45_status(item)
+    out["resolution_method"] = _stage45_resolution_method(item)
     out["evidence_url"] = _stage45_url(item)
     out["evidence_excerpt"] = _stage45_excerpt(item)
+
+    out["exact_topic_verified"] = _stage45_bool(item, [
+        "exact_topic_verified", "topic_verified", "exact_topic_match",
+    ])
+    out["authoritative_source_verified"] = _stage45_bool(item, [
+        "authoritative_source_verified", "official_source_verified", "official_host_verified",
+    ])
+    out["explicit_evidence_verified"] = _stage45_bool(item, [
+        "explicit_evidence_verified", "excerpt_verified", "evidence_verified",
+    ])
 
     if not out.get("worker_run_id"):
         out["worker_run_id"] = _first_value(item, [
@@ -548,7 +589,7 @@ def normalize_stage45_item(item: dict) -> dict:
 
     if not out.get("evidence_source"):
         out["evidence_source"] = _first_value(item, [
-            "source_type", "official_source", "document_source"
+            "source_type", "official_source", "document_source", "resolution_method"
         ])
 
     if not out.get("provenance_chain"):
@@ -561,30 +602,31 @@ def normalize_stage45_item(item: dict) -> dict:
 
 def is_stage45_resolved_evidence(item: dict) -> bool:
     item = normalize_stage45_item(item)
-
-    # Historical Stage 45 versions did not always persist the same route_type.
     route = normalize_text(item.get("route_type")).upper()
+    method = _stage45_resolution_method(item)
+
+    allowed_methods = {
+        "OFFICIAL_DOCUMENTATION", "STORED_EVIDENCE", "USER_EVIDENCE", "MANUAL_VERIFICATION"
+    }
+    if method and method not in allowed_methods:
+        return False
+
     if route and route not in {
-        "OFFICIAL_VERIFICATION",
-        "OFFICIAL",
-        "OFFICIAL_EVIDENCE",
-        "EVIDENCE_RESOLUTION",
-    }:
-        # Do not reject solely on route when the row has explicit official flags.
-        if not (
-            bool(item.get("authoritative_source_verified"))
-            or bool(item.get("explicit_evidence_verified"))
-            or bool(item.get("exact_topic_verified"))
-        ):
-            return False
+        "OFFICIAL_VERIFICATION", "OFFICIAL", "OFFICIAL_EVIDENCE", "EVIDENCE_RESOLUTION",
+    } and not (
+        item.get("authoritative_source_verified")
+        or item.get("explicit_evidence_verified")
+        or item.get("exact_topic_verified")
+        or method in allowed_methods
+    ):
+        return False
 
     resolved = (
         _stage45_status(item) in {"RESOLVED", "COMPLETED", "VERIFIED", "PASS", "PASSED"}
         or bool(item.get("explicit_evidence_verified"))
+        or normalize_text(item.get("official_document_status")).upper() in {"RESOLVED", "VERIFIED", "PASS", "PASSED"}
     )
-
     return bool(resolved and _stage45_url(item) and _stage45_excerpt(item))
-
 
 def load_stage45_history():
     """
@@ -684,26 +726,14 @@ def _candidate_score(task: dict, item: dict) -> int:
 
 
 def find_best_stage45_item(task: dict, history: list[dict]):
+    """Stage 46 v2.4 handoff selector.
+
+    Accepts the current Stage 45 canonical persistence contract, including the
+    resolution_method CHECK values, while keeping Stage 46 factually independent:
+    selection only hands over a candidate; Stage 46 still re-fetches and re-validates it.
     """
-    Stage 46 v2.3 — strict canonical Stage 45 handoff.
-
-    Selection order:
-    1. Match the same requirement by stable requirement identifiers.
-    2. Require Stage 45 RESOLVED + URL + excerpt.
-    3. Prefer rows already marked by Stage 45 as:
-       exact_topic_verified=True
-       authoritative_source_verified=True
-       explicit_evidence_verified=True
-    4. Among equally valid rows, the newest row wins.
-    5. Historical compatibility rows are used only when no strict canonical
-       row exists for that requirement.
-
-    This prevents stale CAS/login/auth worker rows from outranking a fresh
-    canonical EC/EU evidence row.
-    """
-
-    canonical = []
-    fallback = []
+    strict = []
+    compatible = []
 
     task_req_id = normalize_text(task.get("requirement_id"))
     task_req_key = normalize_text(task.get("requirement_key")).lower()
@@ -711,14 +741,8 @@ def find_best_stage45_item(task: dict, history: list[dict]):
 
     for raw in history:
         item = normalize_stage45_item(raw)
-
-        status = _stage45_status(item)
-        url = _stage45_url(item)
-        excerpt = _stage45_excerpt(item)
-
         item_req_id = normalize_text(item.get("requirement_id"))
         item_req_key = normalize_text(item.get("requirement_key")).lower()
-
         item_labels = {
             _canonical_requirement(item.get("requirement_label")),
             _canonical_requirement(item.get("requirement_category")),
@@ -729,52 +753,41 @@ def find_best_stage45_item(task: dict, history: list[dict]):
 
         requirement_match = bool(
             (task_req_id and item_req_id and task_req_id == item_req_id)
-            or (
-                task_req_key
-                and item_req_key
-                and task_req_key == item_req_key
-            )
-            or (
-                task_label
-                and task_label in item_labels
-            )
+            or (task_req_key and item_req_key and task_req_key == item_req_key)
+            or (task_label and task_label in item_labels)
         )
-
-        if not requirement_match:
+        if not requirement_match or not is_stage45_resolved_evidence(item):
             continue
 
-        if not url or not excerpt:
-            continue
-
-        canonical_ok = bool(
-            status == "RESOLVED"
-            and item.get("exact_topic_verified") is True
+        method = _stage45_resolution_method(item)
+        canonical_flags = bool(
+            item.get("exact_topic_verified") is True
             and item.get("authoritative_source_verified") is True
             and item.get("explicit_evidence_verified") is True
         )
+        canonical_method = method in {
+            "OFFICIAL_DOCUMENTATION", "STORED_EVIDENCE", "USER_EVIDENCE", "MANUAL_VERIFICATION"
+        }
 
-        if canonical_ok:
-            canonical.append(item)
-            continue
+        if canonical_flags or canonical_method:
+            strict.append(item)
+        else:
+            compatible.append(item)
 
-        # Historical compatibility only.
-        if is_stage45_resolved_evidence(item):
-            fallback.append(item)
+    def rank(item: dict):
+        current_lock = int(normalize_text(item.get("opportunity_lock_id")) == normalize_text(lock_id))
+        current_run = int(normalize_text(item.get("execution_run_id")) == normalize_text(execution_run_id))
+        official_method = int(_stage45_resolution_method(item) == "OFFICIAL_DOCUMENTATION")
+        flags = sum(int(bool(item.get(k))) for k in (
+            "exact_topic_verified", "authoritative_source_verified", "explicit_evidence_verified"
+        ))
+        return (current_lock, current_run, official_method, flags, normalize_text(item.get("created_at")))
 
-    def newest(items):
-        if not items:
-            return None
-        return sorted(
-            items,
-            key=lambda x: normalize_text(x.get("created_at")),
-            reverse=True,
-        )[0]
-
-    winner = newest(canonical)
-    if winner:
-        return winner
-
-    return newest(fallback)
+    if strict:
+        return sorted(strict, key=rank, reverse=True)[0]
+    if compatible:
+        return sorted(compatible, key=rank, reverse=True)[0]
+    return None
 
 
 # ---------------------------------------------------------------------
@@ -791,7 +804,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "execution_run_id": execution_run_id,
             "opportunity_identity": identity,
             "stage": 46,
-            "validator_version": "stage46-v2.3",
+            "validator_version": "stage46-v2.4",
             "run_status": "RUNNING",
             "total_requirements": total_requirements,
             "source_worker_items_found": source_items_found,
@@ -799,7 +812,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "error_count": 0,
             "summary": {
                 "stage": 46,
-                "version": "v2.3",
+                "version": "v2.4",
             },
             "diagnostics": [],
             "started_at": now_iso(),
@@ -919,7 +932,7 @@ def save_provenance_source(
         "topic_verified": bool(checks.get("exact_topic_in_source")),
         "provenance_chain": stage45_item.get("provenance_chain") or [],
         "fetch_payload": {
-            "version": "stage46-v2.3",
+            "version": "stage46-v2.4",
             "checks": checks,
         },
         "error_type": fetched.get("error_type"),
@@ -1216,7 +1229,7 @@ if not hard_gate:
     st.error("Etapa 46 v2 este BLOCKED de hard gate.")
     st.stop()
 
-st.success("Hard gate Etapa 46 v2.3: PASS.")
+st.success("Hard gate Etapa 46 v2.4: PASS.")
 st.write(f"**Locked opportunity:** {identity}")
 st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
@@ -1235,7 +1248,7 @@ for task in official_tasks:
         "stage45_item": item,
     })
 
-st.subheader("Stage 45 → Stage 46 v2.3 handoff")
+st.subheader("Stage 45 → Stage 46 v2.4 handoff")
 
 st.dataframe(
     [
@@ -1249,6 +1262,13 @@ st.dataframe(
                 and x["stage45_item"].get("exact_topic_verified") is True
                 and x["stage45_item"].get("authoritative_source_verified") is True
                 and x["stage45_item"].get("explicit_evidence_verified") is True
+                or (
+                    x["stage45_item"]
+                    and _stage45_resolution_method(x["stage45_item"]) in {
+                        "OFFICIAL_DOCUMENTATION", "STORED_EVIDENCE", "USER_EVIDENCE", "MANUAL_VERIFICATION"
+                    }
+                    and is_stage45_resolved_evidence(x["stage45_item"])
+                )
             ),
             "Worker item": x["stage45_item"].get("id") if x["stage45_item"] else None,
             "Evidence URL": x["stage45_item"].get("evidence_url") if x["stage45_item"] else None,
@@ -1267,14 +1287,14 @@ h4.metric("Stage 45 history rows", len(stage45_history))
 
 
 # ---------------------------------------------------------------------
-# Execute Stage 46 v2.3
+# Execute Stage 46 v2.4
 # ---------------------------------------------------------------------
 
 if st.button(
-    "🛡️ Run Stage 46 v2.3 provenance validation",
+    "🛡️ Run Stage 46 v2.4 provenance validation",
     type="primary",
     use_container_width=True,
-    key="stage46_v2_3_run",
+    key="stage46_v2_4_run",
 ):
     source_items_found = sum(1 for x in handoff if x["stage45_item"])
 
@@ -1389,7 +1409,7 @@ if st.button(
         "error_count": failed,
         "summary": {
             "stage": 46,
-            "version": "v2.3",
+            "version": "v2.4",
             "gate": run_status,
             "verified": verified,
             "rejected": rejected,
@@ -1404,15 +1424,15 @@ if st.button(
     }).eq("id", run_id).eq("user_id", user_id).execute()
 
     if run_status == "PASS":
-        st.success("Etapa 46 v2.3: PASS.")
+        st.success("Etapa 46 v2.4: PASS.")
     elif run_status == "WAITING":
         st.warning(
-            f"Etapa 46 v2.3: WAITING — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.4: WAITING — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
     else:
         st.error(
-            f"Etapa 46 v2.3: {run_status} — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.4: {run_status} — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
 
@@ -1439,7 +1459,7 @@ if provenance_runs:
     latest_run_id = str(latest["id"])
 
     st.divider()
-    st.subheader("Latest Stage 46 v2.3 Result")
+    st.subheader("Latest Stage 46 v2.4 Result")
 
     p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric("Gate", latest.get("run_status") or "—")
@@ -1533,173 +1553,9 @@ if provenance_runs:
 
 
 st.caption(
-    "Invariantă Etapa 46 v2.3: Stage 45 este sursa candidate evidence, dar verdictul provenance "
+    "Invariantă Etapa 46 v2.4: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
     "este păstrat separat. PASS necesită VERIFIED pentru fiecare requirement OFFICIAL."
 )
 # =====================================================================
 # END STAGE 46 v2
-# =====================================================================
-
-
-
-# =====================================================================
-# STAGE 46 v2.3 — STAGE 45 HANDOFF DIAGNOSTICS
-# =====================================================================
-
-def s46v22_safe(v):
-    try:
-        return str(v)
-    except Exception:
-        return ""
-
-
-def s46v22_bool(v):
-    return bool(v)
-
-
-def s46v22_collect_history_diagnostics(history: list[dict]):
-    rows_out = []
-
-    for item in history:
-        rows_out.append({
-            "id": item.get("id"),
-            "created_at": item.get("created_at"),
-            "opportunity_lock_id": item.get("opportunity_lock_id"),
-            "execution_run_id": item.get("execution_run_id"),
-            "execution_task_id": item.get("execution_task_id"),
-            "requirement_id": item.get("requirement_id"),
-            "requirement_key": item.get("requirement_key"),
-            "requirement_label": item.get("requirement_label"),
-            "requirement_category": item.get("requirement_category"),
-            "route_type": item.get("route_type"),
-            "worker_status": item.get("worker_status"),
-            "official_document_status": item.get("official_document_status"),
-            "exact_topic_verified": item.get("exact_topic_verified"),
-            "authoritative_source_verified": item.get("authoritative_source_verified"),
-            "explicit_evidence_verified": item.get("explicit_evidence_verified"),
-            "evidence_url": item.get("evidence_url"),
-            "evidence_excerpt_chars": len(normalize_text(item.get("evidence_excerpt"))),
-            "evidence_reference": item.get("evidence_reference"),
-            "topic_identity": item.get("topic_identity"),
-            "opportunity_identity": item.get("opportunity_identity"),
-            "resolution_method": item.get("resolution_method"),
-        })
-
-    return rows_out
-
-
-def s46v22_match_debug(task: dict, history: list[dict]):
-    debug_rows = []
-
-    for raw in history:
-        item = normalize_stage45_item(raw)
-        score = _candidate_score(task, item)
-        if score <= 0:
-            continue
-
-        debug_rows.append({
-            "score": score,
-            "item_id": item.get("id"),
-            "created_at": item.get("created_at"),
-            "worker_status": item.get("worker_status"),
-            "route_type": item.get("route_type"),
-            "execution_task_id": item.get("execution_task_id"),
-            "requirement_id": item.get("requirement_id"),
-            "requirement_key": item.get("requirement_key"),
-            "requirement_label": item.get("requirement_label"),
-            "evidence_url": item.get("evidence_url"),
-            "excerpt_chars": len(normalize_text(item.get("evidence_excerpt"))),
-            "exact_topic_verified": item.get("exact_topic_verified"),
-            "authoritative_source_verified": item.get("authoritative_source_verified"),
-            "explicit_evidence_verified": item.get("explicit_evidence_verified"),
-            "qualifies_as_resolved_evidence": is_stage45_resolved_evidence(item),
-        })
-
-    debug_rows.sort(
-        key=lambda r: (
-            r.get("score") or 0,
-            normalize_text(r.get("created_at")),
-        ),
-        reverse=True,
-    )
-    return debug_rows[:100]
-
-
-st.divider()
-st.subheader("Stage 46 v2.3 — Stage 45 Handoff Diagnostics")
-st.info(
-    "Acest diagnostic nu schimbă verdicturi. Arată exact ce rânduri Stage 45 există și de ce "
-    "sunt sau nu sunt selectate pentru Stage 46."
-)
-
-_v22_history = load_stage45_history()
-_v22_diag_rows = s46v22_collect_history_diagnostics(_v22_history)
-
-d1, d2, d3, d4 = st.columns(4)
-d1.metric("Stage 45 history rows", len(_v22_history))
-d2.metric(
-    "Rows with RESOLVED-like status",
-    sum(
-        1 for r in _v22_history
-        if _stage45_status(normalize_stage45_item(r))
-        in {"RESOLVED", "COMPLETED", "VERIFIED", "PASS", "PASSED"}
-    ),
-)
-d3.metric(
-    "Rows with explicit evidence flag",
-    sum(1 for r in _v22_history if bool(r.get("explicit_evidence_verified"))),
-)
-d4.metric(
-    "Rows with URL + excerpt",
-    sum(
-        1 for r in _v22_history
-        if _stage45_url(normalize_stage45_item(r))
-        and _stage45_excerpt(normalize_stage45_item(r))
-    ),
-)
-
-with st.expander("Raw Stage 45 worker history", expanded=False):
-    if _v22_diag_rows:
-        st.dataframe(
-            _v22_diag_rows,
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("No Stage 45 worker history rows found.")
-
-st.subheader("Per-requirement match diagnostics")
-
-for _task in official_tasks:
-    _matches = s46v22_match_debug(_task, _v22_history)
-
-    with st.expander(
-        f"{_task.get('requirement_label') or 'Requirement'} — "
-        f"{len(_matches)} candidate matches",
-        expanded=False,
-    ):
-        st.write(
-            {
-                "task_id": _task.get("id"),
-                "requirement_id": _task.get("requirement_id"),
-                "requirement_key": _task.get("requirement_key"),
-                "requirement_label": _task.get("requirement_label"),
-            }
-        )
-
-        if _matches:
-            st.dataframe(
-                _matches,
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.info("No candidate Stage 45 rows matched this requirement.")
-
-st.caption(
-    "v2.3 diagnostic invariant: no Stage 45 row is promoted or demoted here. "
-    "This panel is read-only and exists only to reveal the actual persisted schema/history."
-)
-# =====================================================================
-# END STAGE 46 v2.3 DIAGNOSTICS
 # =====================================================================
