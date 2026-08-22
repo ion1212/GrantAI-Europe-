@@ -31,12 +31,12 @@ except Exception:
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 46 v2.4 — Provenance Validator",
+    page_title="Stage 46 v2.5 — Provenance Validator",
     page_icon="🛡️",
     layout="wide",
 )
 
-st.title("🛡️ Etapa 46 v2.4 — AI Post-Resolution Provenance Validator")
+st.title("🛡️ Etapa 46 v2.5 — AI Post-Resolution Provenance Validator")
 st.caption(
     "Etapa 46 v2 citește rezultatele Stage 45, dar își păstrează propriul audit în tabelele "
     "provenance. PASS este permis numai dacă toate cerințele OFFICIAL au dovadă RESOLVED "
@@ -726,11 +726,18 @@ def _candidate_score(task: dict, item: dict) -> int:
 
 
 def find_best_stage45_item(task: dict, history: list[dict]):
-    """Stage 46 v2.4 handoff selector.
+    """
+    Stage 46 v2.5 — strict safe-canonical Stage 45 selector.
 
-    Accepts the current Stage 45 canonical persistence contract, including the
-    resolution_method CHECK values, while keeping Stage 46 factually independent:
-    selection only hands over a candidate; Stage 46 still re-fetches and re-validates it.
+    Selection rules:
+    - same requirement only;
+    - Stage 45 must already qualify as resolved evidence;
+    - candidate URL must be on an allowed official EC/EU host;
+    - CAS/login/auth/error infrastructure is NEVER selectable;
+    - prefer strict Stage 45 flags and OFFICIAL_DOCUMENTATION;
+    - prefer the current lock, then newest row.
+
+    Stage 46 still independently GETs and validates the selected source.
     """
     strict = []
     compatible = []
@@ -741,6 +748,7 @@ def find_best_stage45_item(task: dict, history: list[dict]):
 
     for raw in history:
         item = normalize_stage45_item(raw)
+
         item_req_id = normalize_text(item.get("requirement_id"))
         item_req_key = normalize_text(item.get("requirement_key")).lower()
         item_labels = {
@@ -756,7 +764,21 @@ def find_best_stage45_item(task: dict, history: list[dict]):
             or (task_req_key and item_req_key and task_req_key == item_req_key)
             or (task_label and task_label in item_labels)
         )
-        if not requirement_match or not is_stage45_resolved_evidence(item):
+        if not requirement_match:
+            continue
+
+        if not is_stage45_resolved_evidence(item):
+            continue
+
+        candidate_url = _stage45_url(item)
+
+        # Critical v2.5 invariant: auth/CAS/error infrastructure can never
+        # become the selected Stage 45 handoff, regardless of run/task match.
+        if not candidate_url:
+            continue
+        if not allowed_official_url(candidate_url):
+            continue
+        if auth_or_error_url(candidate_url):
             continue
 
         method = _stage45_resolution_method(item)
@@ -765,28 +787,55 @@ def find_best_stage45_item(task: dict, history: list[dict]):
             and item.get("authoritative_source_verified") is True
             and item.get("explicit_evidence_verified") is True
         )
-        canonical_method = method in {
-            "OFFICIAL_DOCUMENTATION", "STORED_EVIDENCE", "USER_EVIDENCE", "MANUAL_VERIFICATION"
-        }
 
-        if canonical_flags or canonical_method:
+        # Current Stage 45 canonical contract for official evidence.
+        canonical_method = method == "OFFICIAL_DOCUMENTATION"
+
+        # Strengthen obvious official PDF handoffs, but do not require .pdf
+        # because Stage 46 can also independently validate substantive HTML.
+        parsed = urlparse(candidate_url)
+        is_pdf = normalize_text(parsed.path).lower().endswith(".pdf")
+
+        item["_s46_v25_candidate_url"] = candidate_url
+        item["_s46_v25_is_pdf"] = is_pdf
+        item["_s46_v25_canonical_flags"] = canonical_flags
+        item["_s46_v25_canonical_method"] = canonical_method
+
+        if canonical_flags and canonical_method:
             strict.append(item)
-        else:
+        elif canonical_flags or canonical_method:
             compatible.append(item)
 
     def rank(item: dict):
-        current_lock = int(normalize_text(item.get("opportunity_lock_id")) == normalize_text(lock_id))
-        current_run = int(normalize_text(item.get("execution_run_id")) == normalize_text(execution_run_id))
-        official_method = int(_stage45_resolution_method(item) == "OFFICIAL_DOCUMENTATION")
-        flags = sum(int(bool(item.get(k))) for k in (
-            "exact_topic_verified", "authoritative_source_verified", "explicit_evidence_verified"
-        ))
-        return (current_lock, current_run, official_method, flags, normalize_text(item.get("created_at")))
+        # Evidence quality outranks run affinity.
+        strict_flags = int(bool(item.get("_s46_v25_canonical_flags")))
+        official_method = int(bool(item.get("_s46_v25_canonical_method")))
+        is_pdf = int(bool(item.get("_s46_v25_is_pdf")))
+        current_lock = int(
+            normalize_text(item.get("opportunity_lock_id")) == normalize_text(lock_id)
+        )
+        current_run = int(
+            normalize_text(item.get("execution_run_id")) == normalize_text(execution_run_id)
+        )
+        created_at = normalize_text(item.get("created_at"))
+        updated_at = normalize_text(item.get("updated_at"))
+
+        return (
+            strict_flags,
+            official_method,
+            is_pdf,
+            current_lock,
+            current_run,
+            updated_at,
+            created_at,
+        )
 
     if strict:
         return sorted(strict, key=rank, reverse=True)[0]
+
     if compatible:
         return sorted(compatible, key=rank, reverse=True)[0]
+
     return None
 
 
@@ -804,7 +853,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "execution_run_id": execution_run_id,
             "opportunity_identity": identity,
             "stage": 46,
-            "validator_version": "stage46-v2.4",
+            "validator_version": "stage46-v2.5",
             "run_status": "RUNNING",
             "total_requirements": total_requirements,
             "source_worker_items_found": source_items_found,
@@ -812,7 +861,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "error_count": 0,
             "summary": {
                 "stage": 46,
-                "version": "v2.4",
+                "version": "v2.5",
             },
             "diagnostics": [],
             "started_at": now_iso(),
@@ -932,7 +981,7 @@ def save_provenance_source(
         "topic_verified": bool(checks.get("exact_topic_in_source")),
         "provenance_chain": stage45_item.get("provenance_chain") or [],
         "fetch_payload": {
-            "version": "stage46-v2.4",
+            "version": "stage46-v2.5",
             "checks": checks,
         },
         "error_type": fetched.get("error_type"),
@@ -1229,7 +1278,7 @@ if not hard_gate:
     st.error("Etapa 46 v2 este BLOCKED de hard gate.")
     st.stop()
 
-st.success("Hard gate Etapa 46 v2.4: PASS.")
+st.success("Hard gate Etapa 46 v2.5: PASS.")
 st.write(f"**Locked opportunity:** {identity}")
 st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
@@ -1248,7 +1297,7 @@ for task in official_tasks:
         "stage45_item": item,
     })
 
-st.subheader("Stage 45 → Stage 46 v2.4 handoff")
+st.subheader("Stage 45 → Stage 46 v2.5 handoff")
 
 st.dataframe(
     [
@@ -1271,7 +1320,13 @@ st.dataframe(
                 )
             ),
             "Worker item": x["stage45_item"].get("id") if x["stage45_item"] else None,
-            "Evidence URL": x["stage45_item"].get("evidence_url") if x["stage45_item"] else None,
+            "Safe URL": bool(
+                x["stage45_item"]
+                and _stage45_url(x["stage45_item"])
+                and allowed_official_url(_stage45_url(x["stage45_item"]))
+                and not auth_or_error_url(_stage45_url(x["stage45_item"]))
+            ),
+            "Evidence URL": _stage45_url(x["stage45_item"]) if x["stage45_item"] else None,
         }
         for x in handoff
     ],
@@ -1287,14 +1342,14 @@ h4.metric("Stage 45 history rows", len(stage45_history))
 
 
 # ---------------------------------------------------------------------
-# Execute Stage 46 v2.4
+# Execute Stage 46 v2.5
 # ---------------------------------------------------------------------
 
 if st.button(
-    "🛡️ Run Stage 46 v2.4 provenance validation",
+    "🛡️ Run Stage 46 v2.5 provenance validation",
     type="primary",
     use_container_width=True,
-    key="stage46_v2_4_run",
+    key="stage46_v2_5_run",
 ):
     source_items_found = sum(1 for x in handoff if x["stage45_item"])
 
@@ -1409,7 +1464,7 @@ if st.button(
         "error_count": failed,
         "summary": {
             "stage": 46,
-            "version": "v2.4",
+            "version": "v2.5",
             "gate": run_status,
             "verified": verified,
             "rejected": rejected,
@@ -1424,15 +1479,15 @@ if st.button(
     }).eq("id", run_id).eq("user_id", user_id).execute()
 
     if run_status == "PASS":
-        st.success("Etapa 46 v2.4: PASS.")
+        st.success("Etapa 46 v2.5: PASS.")
     elif run_status == "WAITING":
         st.warning(
-            f"Etapa 46 v2.4: WAITING — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.5: WAITING — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
     else:
         st.error(
-            f"Etapa 46 v2.4: {run_status} — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.5: {run_status} — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
 
@@ -1459,7 +1514,7 @@ if provenance_runs:
     latest_run_id = str(latest["id"])
 
     st.divider()
-    st.subheader("Latest Stage 46 v2.4 Result")
+    st.subheader("Latest Stage 46 v2.5 Result")
 
     p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric("Gate", latest.get("run_status") or "—")
@@ -1553,7 +1608,7 @@ if provenance_runs:
 
 
 st.caption(
-    "Invariantă Etapa 46 v2.4: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
+    "Invariantă Etapa 46 v2.5: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
     "este păstrat separat. PASS necesită VERIFIED pentru fiecare requirement OFFICIAL."
 )
 # =====================================================================
