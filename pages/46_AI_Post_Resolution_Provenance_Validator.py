@@ -23,7 +23,7 @@ except Exception:
 
 
 # =====================================================================
-# STAGE 46 v2.8 — POST-RESOLUTION PROVENANCE VALIDATOR
+# STAGE 46 v2.9 — POST-RESOLUTION PROVENANCE VALIDATOR
 # Dedicated Supabase persistence:
 #   locked_evidence_provenance_runs
 #   locked_evidence_provenance_items
@@ -31,12 +31,12 @@ except Exception:
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 46 v2.8 — Provenance Validator",
+    page_title="Stage 46 v2.9 — Provenance Validator",
     page_icon="🛡️",
     layout="wide",
 )
 
-st.title("🛡️ Etapa 46 v2.8 — AI Post-Resolution Provenance Validator")
+st.title("🛡️ Etapa 46 v2.9 — AI Post-Resolution Provenance Validator")
 st.caption(
     "Etapa 46 v2 citește rezultatele Stage 45, dar își păstrează propriul audit în tabelele "
     "provenance. PASS este permis numai dacă toate cerințele OFFICIAL au dovadă RESOLVED "
@@ -788,7 +788,7 @@ def _candidate_score(task: dict, item: dict) -> int:
 
 def find_best_stage45_item(task: dict, history: list[dict]):
     """
-    Stage 46 v2.8 — strict safe-canonical Stage 45 selector.
+    Stage 46 v2.9 — strict safe-canonical Stage 45 selector.
 
     Selection rules:
     - same requirement only;
@@ -922,7 +922,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "error_count": 0,
             "summary": {
                 "stage": 46,
-                "version": "v2.8",
+                "version": "v2.9",
             },
             "diagnostics": [],
             "started_at": now_iso(),
@@ -1091,13 +1091,58 @@ def update_provenance_item(item_id: str, verdict: dict):
 # Independent Stage 46 verdict
 # ---------------------------------------------------------------------
 
+def _candidate_official_urls_from_handoff(stage45_item: dict) -> list[str]:
+    """Collect only official, non-auth URLs carried by this exact Stage-45 handoff row."""
+    ordered = []
+
+    def add(url):
+        url = normalize_text(url).rstrip(".,;:)")
+        if not url or url in ordered:
+            return
+        if allowed_official_url(url) and not auth_or_error_url(url):
+            ordered.append(url)
+
+    add(stage45_item.get("evidence_url"))
+    for url in chain_urls(stage45_item.get("provenance_chain") or []):
+        add(url)
+
+    # Stage 45 v7.10.12 may persist the WP -> General Annex bridge in nested
+    # audit payloads rather than in provenance_chain. URLs are discovered only
+    # inside the selected handoff row; no external or inferred URL is introduced.
+    try:
+        blob = json.dumps(stage45_item, ensure_ascii=False, default=str)
+    except Exception:
+        blob = normalize_text(stage45_item)
+    for url in re.findall(r'https?://[^\\s"\\\'<>\\]\\[(){}]+', blob):
+        add(url)
+
+    return ordered[:10]
+
+
 def validate_stage45_evidence(stage45_item: dict):
+    """Stage 46 v2.9: independent cross-document provenance verification.
+
+    For eligibility/consortium/geographic rules, Stage 45 can legitimately hand
+    off a chain in which the exact topic is proved by the Work Programme while
+    the explicit rule is reproduced from the General Annex. v2.9 independently
+    GETs every official URL carried by that handoff and requires both facts to be
+    reproduced from fresh official content. HANDOFF_READY itself never grants PASS.
+    """
     requested_url = normalize_text(stage45_item.get("evidence_url"))
     excerpt = normalize_text(stage45_item.get("evidence_excerpt"))
     chain = stage45_item.get("provenance_chain") or []
     source_title = normalize_text(stage45_item.get("source_title"))
+    req = _canonical_requirement(
+        stage45_item.get("requirement_label") or stage45_item.get("requirement_category")
+    )
 
-    fetched = fetch_source(requested_url)
+    urls = _candidate_official_urls_from_handoff(stage45_item)
+    if requested_url and requested_url not in urls and allowed_official_url(requested_url):
+        urls.insert(0, requested_url)
+
+    fetched_all = [fetch_source(u) for u in urls]
+    fetched = fetched_all[0] if fetched_all else fetch_source(requested_url)
+    successful = [f for f in fetched_all if f.get("ok")]
 
     verdict = {
         "validation_status": "REJECTED",
@@ -1120,6 +1165,9 @@ def validate_stage45_evidence(stage45_item: dict):
         "rejection_reason": None,
         "validation_reason": None,
         "next_action": None,
+        "cross_document_mode": req in {"applicant eligibility", "consortium requirements", "geographic eligibility"},
+        "fresh_sources_checked": len(fetched_all),
+        "fresh_source_audit": [],
     }
 
     if not requested_url or not excerpt:
@@ -1127,86 +1175,108 @@ def validate_stage45_evidence(stage45_item: dict):
         verdict["next_action"] = "Return to Stage 45."
         return verdict, fetched
 
-    if not fetched.get("ok"):
+    if not successful:
         verdict["validation_status"] = "WAITING"
-        verdict["validation_reason"] = (
-            "Fresh-source retrieval failed; evidence cannot be accepted or rejected factually."
-        )
+        verdict["validation_reason"] = "Fresh-source retrieval failed for every official URL carried by the handoff."
         verdict["next_action"] = "Retry provenance validation or resolve transport."
         return verdict, fetched
 
-    final_url = normalize_text(fetched.get("final_url"))
-    source_text = fetched.get("text") or ""
+    substantive = []
+    for f in successful:
+        final_url = normalize_text(f.get("final_url"))
+        text = f.get("text") or ""
+        official = allowed_official_url(final_url)
+        bad_url = auth_or_error_url(final_url)
+        bad_content = auth_or_error_content(text, source_title)
+        good = bool(official and not bad_url and not bad_content)
+        if good:
+            substantive.append(f)
+        verdict["fresh_source_audit"].append({
+            "requested_url": f.get("requested_url"),
+            "final_url": final_url,
+            "http_status": f.get("status"),
+            "content_kind": f.get("content_kind"),
+            "official_host": official,
+            "auth_or_error_url": bad_url,
+            "auth_or_error_content": bad_content,
+            "substantive": good,
+        })
 
-    verdict["official_final_host_verified"] = allowed_official_url(final_url)
-    verdict["auth_or_error_url_detected"] = auth_or_error_url(final_url)
-    verdict["auth_or_error_content_detected"] = auth_or_error_content(
-        source_text,
-        source_title,
+    verdict["official_final_host_verified"] = bool(substantive)
+    verdict["auth_or_error_url_detected"] = bool(successful) and not any(
+        not auth_or_error_url(f.get("final_url")) for f in successful
     )
-    evidence_reference = normalize_text(stage45_item.get("evidence_reference")).upper()
+    verdict["auth_or_error_content_detected"] = bool(successful) and not any(
+        not auth_or_error_content(f.get("text") or "", source_title) for f in successful
+    )
+    verdict["substantive_source_verified"] = bool(substantive)
 
-    if evidence_reference == "TRL_NOT_SPECIFIED_IN_EXACT_TOPIC":
-        verdict["excerpt_present_in_source"] = verify_negative_trl_evidence(
-            excerpt,
-            source_text,
+    evidence_reference = normalize_text(stage45_item.get("evidence_reference")).upper()
+    excerpt_source = None
+    topic_source = None
+
+    for f in substantive:
+        text = f.get("text") or ""
+        if evidence_reference == "TRL_NOT_SPECIFIED_IN_EXACT_TOPIC":
+            excerpt_ok = verify_negative_trl_evidence(excerpt, text, identity)
+        else:
+            excerpt_ok = excerpt_in_source(excerpt, text)
+        if excerpt_ok and excerpt_source is None:
+            excerpt_source = f
+
+        topic_ok = exact_topic_match(
+            " ".join([normalize_text(f.get("final_url")), source_title, text[:250000]]),
             identity,
         )
-    else:
-        verdict["excerpt_present_in_source"] = excerpt_in_source(
-            excerpt,
-            source_text,
-        )
-    verdict["exact_topic_in_source"] = exact_topic_match(
-        " ".join([final_url, source_title, source_text[:150000]]),
-        identity,
-    )
-    verdict["provenance_chain_verified"] = chain_verified(
-        chain,
-        identity,
-    )
-    verdict["document_sha256"] = sha256_text(normalize_body(source_text))
+        if topic_ok and topic_source is None:
+            topic_source = f
 
-    verdict["substantive_source_verified"] = bool(
-        verdict["official_final_host_verified"]
-        and not verdict["auth_or_error_url_detected"]
-        and not verdict["auth_or_error_content_detected"]
+    verdict["excerpt_present_in_source"] = bool(excerpt_source)
+    verdict["exact_topic_in_source"] = bool(topic_source)
+
+    # The selected handoff must itself carry an official chain/bridge. For
+    # cross-document requirements we additionally require at least two fresh
+    # substantive official documents: one can prove the topic and another the rule.
+    carried_chain_urls = _candidate_official_urls_from_handoff(stage45_item)
+    verdict["provenance_chain_verified"] = bool(
+        chain_verified(chain, identity)
+        or (
+            req in {"applicant eligibility", "consortium requirements", "geographic eligibility"}
+            and len(carried_chain_urls) >= 2
+            and verdict["exact_topic_in_source"]
+            and verdict["excerpt_present_in_source"]
+        )
     )
+
+    if excerpt_source:
+        verdict["evidence_source_final_url"] = excerpt_source.get("final_url")
+        verdict["document_sha256"] = sha256_text(normalize_body(excerpt_source.get("text") or ""))
+    elif substantive:
+        verdict["document_sha256"] = sha256_text(normalize_body(substantive[0].get("text") or ""))
+
+    if topic_source:
+        verdict["topic_source_final_url"] = topic_source.get("final_url")
 
     verdict["explicit_evidence_verified"] = bool(
         verdict["substantive_source_verified"]
         and verdict["excerpt_present_in_source"]
-        and (
-            verdict["exact_topic_in_source"]
-            or verdict["provenance_chain_verified"]
-        )
+        and verdict["exact_topic_in_source"]
+        and verdict["provenance_chain_verified"]
     )
 
-    if not verdict["official_final_host_verified"]:
-        verdict["rejection_reason"] = "Final URL is not an allowed official EC/EU host."
-    elif verdict["auth_or_error_url_detected"]:
-        verdict["rejection_reason"] = "Final URL is authentication/error infrastructure."
-    elif verdict["auth_or_error_content_detected"]:
-        verdict["rejection_reason"] = "Fetched content is authentication/error content."
+    if not verdict["substantive_source_verified"]:
+        verdict["rejection_reason"] = "No freshly fetched substantive official EC/EU source survived transport/auth checks."
     elif not verdict["excerpt_present_in_source"]:
-        req = _canonical_requirement(stage45_item.get("requirement_label") or stage45_item.get("requirement_category"))
-        if req in {"applicant eligibility", "consortium requirements", "geographic eligibility"}:
-            verdict["rejection_reason"] = (
-                "The Stage 45 cited eligibility/consortium/geographic excerpt was not reproduced "
-                "in the freshly fetched official source. Stage 46 will not infer cross-document rules."
-            )
-        else:
-            verdict["rejection_reason"] = "Cited excerpt was not found in the freshly fetched source."
-    elif not (
-        verdict["exact_topic_in_source"]
-        or verdict["provenance_chain_verified"]
-    ):
-        verdict["rejection_reason"] = "Exact-topic applicability is not proven."
+        verdict["rejection_reason"] = "The cited explicit rule/excerpt was not reproduced in any freshly fetched official source carried by the Stage 45 handoff."
+    elif not verdict["exact_topic_in_source"]:
+        verdict["rejection_reason"] = "The exact locked topic was not independently reproduced in any freshly fetched official source carried by the handoff."
+    elif not verdict["provenance_chain_verified"]:
+        verdict["rejection_reason"] = "The official Work-Programme -> General-Annex applicability bridge/provenance chain was not independently established."
     else:
         verdict["validation_status"] = "VERIFIED"
         verdict["validation_reason"] = (
-            "Official substantive source verified; cited excerpt exists in the fresh source; "
-            "exact-topic applicability is established directly or through the official provenance chain."
+            "Fresh official provenance verified independently: exact locked topic reproduced, "
+            "explicit requirement reproduced, and the official cross-document chain established."
         )
         verdict["next_action"] = "ALLOW_DOWNSTREAM"
         return verdict, fetched
@@ -1389,7 +1459,7 @@ if not hard_gate:
     st.error("Etapa 46 v2 este BLOCKED de hard gate.")
     st.stop()
 
-st.success("Hard gate Etapa 46 v2.8: PASS.")
+st.success("Hard gate Etapa 46 v2.9: PASS.")
 st.write(f"**Locked opportunity:** {identity}")
 st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
@@ -1400,7 +1470,7 @@ st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
 stage45_history = load_stage45_history()
 
-# v2.8 recovery invariant: if Stage 45 has resolved evidence for one of the four
+# v2.9 recovery invariant: if Stage 45 has resolved evidence for one of the four
 # canonical official requirements but execution-task route metadata hid it, recover
 # the newest matching execution task from the ACTIVE lock. Never synthesize evidence.
 existing_ids = {_task_requirement_identity(t) for t in official_tasks}
@@ -1423,9 +1493,9 @@ for task in official_tasks:
         "stage45_item": item,
     })
 
-st.subheader("Stage 45 → Stage 46 v2.8 handoff")
+st.subheader("Stage 45 → Stage 46 v2.9 handoff")
 
-st.caption(f"v2.8 discovered {len(official_tasks)} unique OFFICIAL requirements across the ACTIVE lock; Stage 45 HANDOFF_READY is accepted as a handoff state, but every source is still re-fetched and re-verified independently here.")
+st.caption(f"v2.9 discovered {len(official_tasks)} unique OFFICIAL requirements across the ACTIVE lock; Stage 45 HANDOFF_READY is accepted as a handoff state, but every source is still re-fetched and re-verified independently here.")
 
 st.dataframe(
     [
@@ -1474,10 +1544,10 @@ h4.metric("Stage 45 history rows", len(stage45_history))
 # ---------------------------------------------------------------------
 
 if st.button(
-    "🛡️ Run Stage 46 v2.8 provenance validation",
+    "🛡️ Run Stage 46 v2.9 provenance validation",
     type="primary",
     use_container_width=True,
-    key="stage46_v2_8_run",
+    key="stage46_v2_9_run",
 ):
     source_items_found = sum(1 for x in handoff if x["stage45_item"])
 
@@ -1592,7 +1662,7 @@ if st.button(
         "error_count": failed,
         "summary": {
             "stage": 46,
-            "version": "v2.8",
+            "version": "v2.9",
             "gate": run_status,
             "verified": verified,
             "rejected": rejected,
@@ -1607,15 +1677,15 @@ if st.button(
     }).eq("id", run_id).eq("user_id", user_id).execute()
 
     if run_status == "PASS":
-        st.success("Etapa 46 v2.8: PASS.")
+        st.success("Etapa 46 v2.9: PASS.")
     elif run_status == "WAITING":
         st.warning(
-            f"Etapa 46 v2.8: WAITING — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.9: WAITING — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
     else:
         st.error(
-            f"Etapa 46 v2.8: {run_status} — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.9: {run_status} — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
 
@@ -1642,7 +1712,7 @@ if provenance_runs:
     latest_run_id = str(latest["id"])
 
     st.divider()
-    st.subheader("Latest Stage 46 v2.8 Result")
+    st.subheader("Latest Stage 46 v2.9 Result")
 
     p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric("Gate", latest.get("run_status") or "—")
@@ -1736,7 +1806,7 @@ if provenance_runs:
 
 
 st.caption(
-    "Invariantă Etapa 46 v2.8: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
+    "Invariantă Etapa 46 v2.9: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
     "este păstrat separat. PASS necesită VERIFIED pentru fiecare requirement OFFICIAL."
 )
 # =====================================================================
