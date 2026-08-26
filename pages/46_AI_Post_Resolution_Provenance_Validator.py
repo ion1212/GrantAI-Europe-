@@ -23,7 +23,7 @@ except Exception:
 
 
 # =====================================================================
-# STAGE 46 v2.9 — POST-RESOLUTION PROVENANCE VALIDATOR
+# STAGE 46 v2.10 — POST-RESOLUTION PROVENANCE VALIDATOR
 # Dedicated Supabase persistence:
 #   locked_evidence_provenance_runs
 #   locked_evidence_provenance_items
@@ -31,12 +31,12 @@ except Exception:
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 46 v2.9 — Provenance Validator",
+    page_title="Stage 46 v2.10 — Provenance Validator",
     page_icon="🛡️",
     layout="wide",
 )
 
-st.title("🛡️ Etapa 46 v2.9 — AI Post-Resolution Provenance Validator")
+st.title("🛡️ Etapa 46 v2.10 — AI Post-Resolution Provenance Validator")
 st.caption(
     "Etapa 46 v2 citește rezultatele Stage 45, dar își păstrează propriul audit în tabelele "
     "provenance. PASS este permis numai dacă toate cerințele OFFICIAL au dovadă RESOLVED "
@@ -914,7 +914,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "execution_run_id": execution_run_id,
             "opportunity_identity": identity,
             "stage": 46,
-            "validator_version": "stage46-v2.8",
+            "validator_version": "stage46-v2.10",
             "run_status": "RUNNING",
             "total_requirements": total_requirements,
             "source_worker_items_found": source_items_found,
@@ -922,7 +922,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "error_count": 0,
             "summary": {
                 "stage": 46,
-                "version": "v2.9",
+                "version": "v2.10",
             },
             "diagnostics": [],
             "started_at": now_iso(),
@@ -1042,7 +1042,7 @@ def save_provenance_source(
         "topic_verified": bool(checks.get("exact_topic_in_source")),
         "provenance_chain": stage45_item.get("provenance_chain") or [],
         "fetch_payload": {
-            "version": "stage46-v2.8",
+            "version": "stage46-v2.10",
             "checks": checks,
         },
         "error_type": fetched.get("error_type"),
@@ -1120,7 +1120,7 @@ def _candidate_official_urls_from_handoff(stage45_item: dict) -> list[str]:
 
 
 def validate_stage45_evidence(stage45_item: dict):
-    """Stage 46 v2.9: independent cross-document provenance verification.
+    """Stage 46 v2.10: independent same-document/cross-document provenance verification.
 
     For eligibility/consortium/geographic rules, Stage 45 can legitimately hand
     off a chain in which the exact topic is proved by the Work Programme while
@@ -1238,15 +1238,40 @@ def validate_stage45_evidence(stage45_item: dict):
     # cross-document requirements we additionally require at least two fresh
     # substantive official documents: one can prove the topic and another the rule.
     carried_chain_urls = _candidate_official_urls_from_handoff(stage45_item)
-    verdict["provenance_chain_verified"] = bool(
-        chain_verified(chain, identity)
-        or (
-            req in {"applicant eligibility", "consortium requirements", "geographic eligibility"}
-            and len(carried_chain_urls) >= 2
+    # v2.10 provenance rule:
+    # - Applicant/consortium/geographic requirements may legitimately use the
+    #   Work-Programme -> General-Annex cross-document bridge.
+    # - TRL is different: Stage 45's negative TRL finding is bounded to the exact
+    #   topic section itself. If Stage 46 freshly re-fetches an official source,
+    #   reproduces the exact topic, and independently validates the bounded
+    #   negative-TRL section, that SAME document is sufficient provenance.
+    #
+    # This does not trust HANDOFF_READY or Stage-45 booleans; the facts below
+    # are all recomputed from freshly fetched official content in this run.
+    if req == "trl requirements":
+        verdict["provenance_chain_verified"] = bool(
+            evidence_reference == "TRL_NOT_SPECIFIED_IN_EXACT_TOPIC"
+            and verdict["substantive_source_verified"]
             and verdict["exact_topic_in_source"]
             and verdict["excerpt_present_in_source"]
+            and excerpt_source is not None
+            and topic_source is not None
+            and canonical_url(excerpt_source.get("final_url"))
+                == canonical_url(topic_source.get("final_url"))
         )
-    )
+        verdict["trl_same_document_provenance"] = bool(
+            verdict["provenance_chain_verified"]
+        )
+    else:
+        verdict["provenance_chain_verified"] = bool(
+            chain_verified(chain, identity)
+            or (
+                req in {"applicant eligibility", "consortium requirements", "geographic eligibility"}
+                and len(carried_chain_urls) >= 2
+                and verdict["exact_topic_in_source"]
+                and verdict["excerpt_present_in_source"]
+            )
+        )
 
     if excerpt_source:
         verdict["evidence_source_final_url"] = excerpt_source.get("final_url")
@@ -1271,12 +1296,12 @@ def validate_stage45_evidence(stage45_item: dict):
     elif not verdict["exact_topic_in_source"]:
         verdict["rejection_reason"] = "The exact locked topic was not independently reproduced in any freshly fetched official source carried by the handoff."
     elif not verdict["provenance_chain_verified"]:
-        verdict["rejection_reason"] = "The official Work-Programme -> General-Annex applicability bridge/provenance chain was not independently established."
+        verdict["rejection_reason"] = "The required official provenance path was not independently established for this requirement."
     else:
         verdict["validation_status"] = "VERIFIED"
         verdict["validation_reason"] = (
             "Fresh official provenance verified independently: exact locked topic reproduced, "
-            "explicit requirement reproduced, and the official cross-document chain established."
+            "explicit requirement reproduced, and the requirement-specific provenance path established."
         )
         verdict["next_action"] = "ALLOW_DOWNSTREAM"
         return verdict, fetched
@@ -1459,7 +1484,7 @@ if not hard_gate:
     st.error("Etapa 46 v2 este BLOCKED de hard gate.")
     st.stop()
 
-st.success("Hard gate Etapa 46 v2.9: PASS.")
+st.success("Hard gate Etapa 46 v2.10: PASS.")
 st.write(f"**Locked opportunity:** {identity}")
 st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
@@ -1493,9 +1518,9 @@ for task in official_tasks:
         "stage45_item": item,
     })
 
-st.subheader("Stage 45 → Stage 46 v2.9 handoff")
+st.subheader("Stage 45 → Stage 46 v2.10 handoff")
 
-st.caption(f"v2.9 discovered {len(official_tasks)} unique OFFICIAL requirements across the ACTIVE lock; Stage 45 HANDOFF_READY is accepted as a handoff state, but every source is still re-fetched and re-verified independently here.")
+st.caption(f"v2.10 discovered {len(official_tasks)} unique OFFICIAL requirements across the ACTIVE lock; Stage 45 HANDOFF_READY is accepted as a handoff state, but every source is still re-fetched and re-verified independently here.")
 
 st.dataframe(
     [
@@ -1540,14 +1565,14 @@ h4.metric("Stage 45 history rows", len(stage45_history))
 
 
 # ---------------------------------------------------------------------
-# Execute Stage 46 v2.5
+# Execute Stage 46 v2.10
 # ---------------------------------------------------------------------
 
 if st.button(
-    "🛡️ Run Stage 46 v2.9 provenance validation",
+    "🛡️ Run Stage 46 v2.10 provenance validation",
     type="primary",
     use_container_width=True,
-    key="stage46_v2_9_run",
+    key="stage46_v2_10_run",
 ):
     source_items_found = sum(1 for x in handoff if x["stage45_item"])
 
@@ -1662,7 +1687,7 @@ if st.button(
         "error_count": failed,
         "summary": {
             "stage": 46,
-            "version": "v2.9",
+            "version": "v2.10",
             "gate": run_status,
             "verified": verified,
             "rejected": rejected,
@@ -1677,15 +1702,15 @@ if st.button(
     }).eq("id", run_id).eq("user_id", user_id).execute()
 
     if run_status == "PASS":
-        st.success("Etapa 46 v2.9: PASS.")
+        st.success("Etapa 46 v2.10: PASS.")
     elif run_status == "WAITING":
         st.warning(
-            f"Etapa 46 v2.9: WAITING — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.10: WAITING — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
     else:
         st.error(
-            f"Etapa 46 v2.9: {run_status} — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.10: {run_status} — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
 
@@ -1712,7 +1737,7 @@ if provenance_runs:
     latest_run_id = str(latest["id"])
 
     st.divider()
-    st.subheader("Latest Stage 46 v2.9 Result")
+    st.subheader("Latest Stage 46 v2.10 Result")
 
     p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric("Gate", latest.get("run_status") or "—")
@@ -1806,7 +1831,7 @@ if provenance_runs:
 
 
 st.caption(
-    "Invariantă Etapa 46 v2.9: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
+    "Invariantă Etapa 46 v2.10: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
     "este păstrat separat. PASS necesită VERIFIED pentru fiecare requirement OFFICIAL."
 )
 # =====================================================================
