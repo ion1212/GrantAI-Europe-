@@ -23,7 +23,7 @@ except Exception:
 
 
 # =====================================================================
-# STAGE 46 v2.7 — POST-RESOLUTION PROVENANCE VALIDATOR
+# STAGE 46 v2.8 — POST-RESOLUTION PROVENANCE VALIDATOR
 # Dedicated Supabase persistence:
 #   locked_evidence_provenance_runs
 #   locked_evidence_provenance_items
@@ -31,12 +31,12 @@ except Exception:
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 46 v2.7 — Provenance Validator",
+    page_title="Stage 46 v2.8 — Provenance Validator",
     page_icon="🛡️",
     layout="wide",
 )
 
-st.title("🛡️ Etapa 46 v2.7 — AI Post-Resolution Provenance Validator")
+st.title("🛡️ Etapa 46 v2.8 — AI Post-Resolution Provenance Validator")
 st.caption(
     "Etapa 46 v2 citește rezultatele Stage 45, dar își păstrează propriul audit în tabelele "
     "provenance. PASS este permis numai dacă toate cerințele OFFICIAL au dovadă RESOLVED "
@@ -788,7 +788,7 @@ def _candidate_score(task: dict, item: dict) -> int:
 
 def find_best_stage45_item(task: dict, history: list[dict]):
     """
-    Stage 46 v2.7 — strict safe-canonical Stage 45 selector.
+    Stage 46 v2.8 — strict safe-canonical Stage 45 selector.
 
     Selection rules:
     - same requirement only;
@@ -914,7 +914,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "execution_run_id": execution_run_id,
             "opportunity_identity": identity,
             "stage": 46,
-            "validator_version": "stage46-v2.7",
+            "validator_version": "stage46-v2.8",
             "run_status": "RUNNING",
             "total_requirements": total_requirements,
             "source_worker_items_found": source_items_found,
@@ -922,7 +922,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "error_count": 0,
             "summary": {
                 "stage": 46,
-                "version": "v2.7",
+                "version": "v2.8",
             },
             "diagnostics": [],
             "started_at": now_iso(),
@@ -1042,7 +1042,7 @@ def save_provenance_source(
         "topic_verified": bool(checks.get("exact_topic_in_source")),
         "provenance_chain": stage45_item.get("provenance_chain") or [],
         "fetch_payload": {
-            "version": "stage46-v2.7",
+            "version": "stage46-v2.8",
             "checks": checks,
         },
         "error_type": fetched.get("error_type"),
@@ -1189,7 +1189,14 @@ def validate_stage45_evidence(stage45_item: dict):
     elif verdict["auth_or_error_content_detected"]:
         verdict["rejection_reason"] = "Fetched content is authentication/error content."
     elif not verdict["excerpt_present_in_source"]:
-        verdict["rejection_reason"] = "Cited excerpt was not found in the freshly fetched source."
+        req = _canonical_requirement(stage45_item.get("requirement_label") or stage45_item.get("requirement_category"))
+        if req in {"applicant eligibility", "consortium requirements", "geographic eligibility"}:
+            verdict["rejection_reason"] = (
+                "The Stage 45 cited eligibility/consortium/geographic excerpt was not reproduced "
+                "in the freshly fetched official source. Stage 46 will not infer cross-document rules."
+            )
+        else:
+            verdict["rejection_reason"] = "Cited excerpt was not found in the freshly fetched source."
     elif not (
         verdict["exact_topic_in_source"]
         or verdict["provenance_chain_verified"]
@@ -1308,7 +1315,7 @@ if not execution_runs:
     st.warning("Nu există execution run disponibil.")
     st.stop()
 
-# v2.7: Stage 45 may have completed a newer requirement set than the run that
+# v2.8: Stage 45 may have completed a newer requirement set than the run that
 # Stage 46 v2.6 happened to select. Use the newest execution run as the run
 # identity for this provenance pass, but discover OFFICIAL tasks across the
 # entire ACTIVE opportunity lock and keep only the newest task for each
@@ -1328,11 +1335,29 @@ all_lock_tasks = rows(
     5000,
 )
 
-official_candidates = [
-    t for t in all_lock_tasks
-    if normalize_text(t.get("route_type")).upper()
-    in {"OFFICIAL_VERIFICATION", "OFFICIAL", "OFFICIAL_EVIDENCE", "EVIDENCE_RESOLUTION"}
-]
+OFFICIAL_ROUTE_TYPES = {
+    "OFFICIAL_VERIFICATION", "OFFICIAL", "OFFICIAL_EVIDENCE", "EVIDENCE_RESOLUTION"
+}
+OFFICIAL_REQUIREMENT_IDENTITIES = {
+    "applicant eligibility",
+    "consortium requirements",
+    "trl requirements",
+    "geographic eligibility",
+}
+
+# v2.8: discover by route OR canonical requirement identity. Some Stage 45 rows can
+# retain a non-standard/older route_type even though they are official requirements.
+# Requirement identity is therefore authoritative for these four locked checks.
+official_candidates = []
+for t in all_lock_tasks:
+    route = normalize_text(t.get("route_type")).upper()
+    req_identity = (
+        _canonical_requirement(t.get("requirement_label"))
+        or _canonical_requirement(t.get("requirement_category"))
+        or _canonical_requirement(t.get("requirement"))
+    )
+    if route in OFFICIAL_ROUTE_TYPES or req_identity in OFFICIAL_REQUIREMENT_IDENTITIES:
+        official_candidates.append(t)
 
 def _task_requirement_identity(task: dict) -> str:
     return (
@@ -1364,7 +1389,7 @@ if not hard_gate:
     st.error("Etapa 46 v2 este BLOCKED de hard gate.")
     st.stop()
 
-st.success("Hard gate Etapa 46 v2.7: PASS.")
+st.success("Hard gate Etapa 46 v2.8: PASS.")
 st.write(f"**Locked opportunity:** {identity}")
 st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
@@ -1375,6 +1400,21 @@ st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
 stage45_history = load_stage45_history()
 
+# v2.8 recovery invariant: if Stage 45 has resolved evidence for one of the four
+# canonical official requirements but execution-task route metadata hid it, recover
+# the newest matching execution task from the ACTIVE lock. Never synthesize evidence.
+existing_ids = {_task_requirement_identity(t) for t in official_tasks}
+for canonical_req in OFFICIAL_REQUIREMENT_IDENTITIES:
+    if canonical_req in existing_ids:
+        continue
+    matching_tasks = [
+        t for t in all_lock_tasks
+        if _task_requirement_identity(t) == canonical_req
+    ]
+    if matching_tasks:
+        official_tasks.append(matching_tasks[0])
+        existing_ids.add(canonical_req)
+
 handoff = []
 for task in official_tasks:
     item = find_best_stage45_item(task, stage45_history)
@@ -1383,9 +1423,9 @@ for task in official_tasks:
         "stage45_item": item,
     })
 
-st.subheader("Stage 45 → Stage 46 v2.7 handoff")
+st.subheader("Stage 45 → Stage 46 v2.8 handoff")
 
-st.caption(f"v2.7 discovered {len(official_tasks)} unique OFFICIAL requirements across the ACTIVE lock; Stage 45 HANDOFF_READY is accepted as a handoff state, but every source is still re-fetched and re-verified independently here.")
+st.caption(f"v2.8 discovered {len(official_tasks)} unique OFFICIAL requirements across the ACTIVE lock; Stage 45 HANDOFF_READY is accepted as a handoff state, but every source is still re-fetched and re-verified independently here.")
 
 st.dataframe(
     [
@@ -1434,10 +1474,10 @@ h4.metric("Stage 45 history rows", len(stage45_history))
 # ---------------------------------------------------------------------
 
 if st.button(
-    "🛡️ Run Stage 46 v2.7 provenance validation",
+    "🛡️ Run Stage 46 v2.8 provenance validation",
     type="primary",
     use_container_width=True,
-    key="stage46_v2_7_run",
+    key="stage46_v2_8_run",
 ):
     source_items_found = sum(1 for x in handoff if x["stage45_item"])
 
@@ -1552,7 +1592,7 @@ if st.button(
         "error_count": failed,
         "summary": {
             "stage": 46,
-            "version": "v2.7",
+            "version": "v2.8",
             "gate": run_status,
             "verified": verified,
             "rejected": rejected,
@@ -1567,15 +1607,15 @@ if st.button(
     }).eq("id", run_id).eq("user_id", user_id).execute()
 
     if run_status == "PASS":
-        st.success("Etapa 46 v2.7: PASS.")
+        st.success("Etapa 46 v2.8: PASS.")
     elif run_status == "WAITING":
         st.warning(
-            f"Etapa 46 v2.7: WAITING — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.8: WAITING — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
     else:
         st.error(
-            f"Etapa 46 v2.7: {run_status} — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.8: {run_status} — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
 
@@ -1602,7 +1642,7 @@ if provenance_runs:
     latest_run_id = str(latest["id"])
 
     st.divider()
-    st.subheader("Latest Stage 46 v2.7 Result")
+    st.subheader("Latest Stage 46 v2.8 Result")
 
     p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric("Gate", latest.get("run_status") or "—")
@@ -1696,7 +1736,7 @@ if provenance_runs:
 
 
 st.caption(
-    "Invariantă Etapa 46 v2.7: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
+    "Invariantă Etapa 46 v2.8: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
     "este păstrat separat. PASS necesită VERIFIED pentru fiecare requirement OFFICIAL."
 )
 # =====================================================================
