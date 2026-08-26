@@ -31,12 +31,12 @@ except Exception:
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 46 v2.5 — Provenance Validator",
+    page_title="Stage 46 v2.6 — Provenance Validator",
     page_icon="🛡️",
     layout="wide",
 )
 
-st.title("🛡️ Etapa 46 v2.5 — AI Post-Resolution Provenance Validator")
+st.title("🛡️ Etapa 46 v2.6 — AI Post-Resolution Provenance Validator")
 st.caption(
     "Etapa 46 v2 citește rezultatele Stage 45, dar își păstrează propriul audit în tabelele "
     "provenance. PASS este permis numai dacă toate cerințele OFFICIAL au dovadă RESOLVED "
@@ -407,6 +407,57 @@ def excerpt_in_source(excerpt: Any, source_text: Any) -> bool:
     return hits >= required
 
 
+def verify_negative_trl_evidence(excerpt: Any, source_text: Any, topic_identity: Any) -> bool:
+    """
+    Strict Stage 46 verification for Stage 45's explicit negative TRL finding.
+
+    Stage 45 stores a synthetic audit prefix followed by the verbatim bounded
+    exact-topic section after 'SECTION:'. The prefix itself cannot occur in the
+    EC PDF, so ordinary literal excerpt matching would always reject it.
+
+    This verifier does NOT trust the synthetic conclusion. It independently:
+      1) requires the expected negative-TRL contract marker;
+      2) extracts only the cited bounded source section;
+      3) proves that cited section is present in the freshly fetched source;
+      4) proves exact-topic identity in the cited/fresh source;
+      5) re-checks that the cited bounded section itself contains no TRL marker.
+    """
+    raw = normalize_text(excerpt)
+    source = normalize_text(source_text)
+    if not raw or not source:
+        return False
+
+    upper = raw.upper()
+    if "NO_TOPIC_SPECIFIC_TRL_STATED" not in upper or "SECTION:" not in upper:
+        return False
+
+    # Preserve original case/content while locating the audit delimiter.
+    marker_index = upper.find("SECTION:")
+    section = raw[marker_index + len("SECTION:"):].strip()
+    if len(normalize_body(section)) < 120:
+        return False
+
+    # Fresh-source reproduction: only the source-derived section is matched.
+    if not excerpt_in_source(section, source):
+        return False
+
+    if not exact_topic_match(" ".join([section, source[:150000]]), topic_identity):
+        return False
+
+    section_low = f" {normalize_body(section).lower()} "
+    trl_markers = (
+        "technology readiness level",
+        "starting trl",
+        "target trl",
+        "reach trl",
+        " trl ",
+    )
+    if any(marker in section_low for marker in trl_markers):
+        return False
+
+    return True
+
+
 def chain_urls(chain: Any):
     urls = []
 
@@ -727,7 +778,7 @@ def _candidate_score(task: dict, item: dict) -> int:
 
 def find_best_stage45_item(task: dict, history: list[dict]):
     """
-    Stage 46 v2.5 — strict safe-canonical Stage 45 selector.
+    Stage 46 v2.6 — strict safe-canonical Stage 45 selector.
 
     Selection rules:
     - same requirement only;
@@ -853,7 +904,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "execution_run_id": execution_run_id,
             "opportunity_identity": identity,
             "stage": 46,
-            "validator_version": "stage46-v2.5",
+            "validator_version": "stage46-v2.6",
             "run_status": "RUNNING",
             "total_requirements": total_requirements,
             "source_worker_items_found": source_items_found,
@@ -861,7 +912,7 @@ def create_provenance_run(total_requirements: int, source_items_found: int):
             "error_count": 0,
             "summary": {
                 "stage": 46,
-                "version": "v2.5",
+                "version": "v2.6",
             },
             "diagnostics": [],
             "started_at": now_iso(),
@@ -981,7 +1032,7 @@ def save_provenance_source(
         "topic_verified": bool(checks.get("exact_topic_in_source")),
         "provenance_chain": stage45_item.get("provenance_chain") or [],
         "fetch_payload": {
-            "version": "stage46-v2.5",
+            "version": "stage46-v2.6",
             "checks": checks,
         },
         "error_type": fetched.get("error_type"),
@@ -1083,10 +1134,19 @@ def validate_stage45_evidence(stage45_item: dict):
         source_text,
         source_title,
     )
-    verdict["excerpt_present_in_source"] = excerpt_in_source(
-        excerpt,
-        source_text,
-    )
+    evidence_reference = normalize_text(stage45_item.get("evidence_reference")).upper()
+
+    if evidence_reference == "TRL_NOT_SPECIFIED_IN_EXACT_TOPIC":
+        verdict["excerpt_present_in_source"] = verify_negative_trl_evidence(
+            excerpt,
+            source_text,
+            identity,
+        )
+    else:
+        verdict["excerpt_present_in_source"] = excerpt_in_source(
+            excerpt,
+            source_text,
+        )
     verdict["exact_topic_in_source"] = exact_topic_match(
         " ".join([final_url, source_title, source_text[:150000]]),
         identity,
@@ -1278,7 +1338,7 @@ if not hard_gate:
     st.error("Etapa 46 v2 este BLOCKED de hard gate.")
     st.stop()
 
-st.success("Hard gate Etapa 46 v2.5: PASS.")
+st.success("Hard gate Etapa 46 v2.6: PASS.")
 st.write(f"**Locked opportunity:** {identity}")
 st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
 
@@ -1297,7 +1357,7 @@ for task in official_tasks:
         "stage45_item": item,
     })
 
-st.subheader("Stage 45 → Stage 46 v2.5 handoff")
+st.subheader("Stage 45 → Stage 46 v2.6 handoff")
 
 st.dataframe(
     [
@@ -1346,10 +1406,10 @@ h4.metric("Stage 45 history rows", len(stage45_history))
 # ---------------------------------------------------------------------
 
 if st.button(
-    "🛡️ Run Stage 46 v2.5 provenance validation",
+    "🛡️ Run Stage 46 v2.6 provenance validation",
     type="primary",
     use_container_width=True,
-    key="stage46_v2_5_run",
+    key="stage46_v2_6_run",
 ):
     source_items_found = sum(1 for x in handoff if x["stage45_item"])
 
@@ -1464,7 +1524,7 @@ if st.button(
         "error_count": failed,
         "summary": {
             "stage": 46,
-            "version": "v2.5",
+            "version": "v2.6",
             "gate": run_status,
             "verified": verified,
             "rejected": rejected,
@@ -1479,15 +1539,15 @@ if st.button(
     }).eq("id", run_id).eq("user_id", user_id).execute()
 
     if run_status == "PASS":
-        st.success("Etapa 46 v2.5: PASS.")
+        st.success("Etapa 46 v2.6: PASS.")
     elif run_status == "WAITING":
         st.warning(
-            f"Etapa 46 v2.5: WAITING — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.6: WAITING — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
     else:
         st.error(
-            f"Etapa 46 v2.5: {run_status} — Verified {verified}, Rejected {rejected}, "
+            f"Etapa 46 v2.6: {run_status} — Verified {verified}, Rejected {rejected}, "
             f"Waiting {waiting}, Failed {failed}."
         )
 
@@ -1514,7 +1574,7 @@ if provenance_runs:
     latest_run_id = str(latest["id"])
 
     st.divider()
-    st.subheader("Latest Stage 46 v2.5 Result")
+    st.subheader("Latest Stage 46 v2.6 Result")
 
     p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric("Gate", latest.get("run_status") or "—")
@@ -1608,7 +1668,7 @@ if provenance_runs:
 
 
 st.caption(
-    "Invariantă Etapa 46 v2.5: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
+    "Invariantă Etapa 46 v2.6: Stage 45 furnizează doar candidate evidence, dar verdictul provenance "
     "este păstrat separat. PASS necesită VERIFIED pentru fiecare requirement OFFICIAL."
 )
 # =====================================================================
