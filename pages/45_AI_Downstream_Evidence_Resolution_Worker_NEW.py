@@ -9905,3 +9905,1029 @@ st.caption(
 # =====================================================================
 # END STAGE 45 v7.10.11
 # =====================================================================
+
+# =====================================================================
+# STAGE 45 v7.10.12 — WORK-PROGRAMME-SCOPE GENERAL-ANNEX BRIDGE
+# =====================================================================
+# Fix:
+#   v7.10.11 required the General Annex reference to occur inside the bounded
+#   exact-topic section. Horizon Work Programmes may state the applicable
+#   "General conditions / General Annexes" at call/work-programme scope instead.
+#
+# Safety model:
+#   1) the same freshly fetched official Work Programme must contain the exact
+#      locked topic identity;
+#   2) that Work Programme must itself contain an explicit General Annex /
+#      General conditions applicability statement;
+#   3) a freshly fetched official General Annexes PDF must contain the explicit
+#      substantive rule for Applicant / Consortium / Geographic eligibility;
+#   4) both official URLs are retained in provenance_chain;
+#   5) Stage 46 still has to re-fetch and independently reproduce the proof;
+#   6) no inferred eligibility and no Stage 46 PASS is manufactured here.
+
+
+def s45v71012_gate_task(task):
+    return s45v7107_requirement_key(task) in {
+        "APPLICANT_ELIGIBILITY",
+        "CONSORTIUM_REQUIREMENTS",
+        "GEOGRAPHIC_ELIGIBILITY",
+        "TRL_REQUIREMENTS",
+    }
+
+
+def s45v71012_is_work_programme_url(url):
+    low = normalize_text(url).lower().split("?", 1)[0]
+    return (
+        low.endswith(".pdf")
+        and (
+            "/horizon/wp-call/" in low
+            or "work-programme" in low
+            or "/wp-" in low
+        )
+        and "general-annex" not in low
+        and "general_annex" not in low
+    )
+
+
+def s45v71012_is_general_annex_url(url):
+    low = normalize_text(url).lower().split("?", 1)[0]
+    return (
+        low.endswith(".pdf")
+        and (
+            "general-annex" in low
+            or "general_annex" in low
+            or "wp-15-general-annexes" in low
+        )
+    )
+
+
+def s45v71012_context_excerpt(text, patterns, before=1800, after=5000):
+    body = re.sub(r"\s+", " ", normalize_text(text))
+    if not body:
+        return ""
+
+    low = body.lower()
+    best = ""
+    best_score = -1
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, low, flags=re.I):
+            a = max(0, match.start() - before)
+            b = min(len(body), match.end() + after)
+            excerpt = body[a:b].strip()
+
+            score = 1
+            score += sum(
+                1 for p in patterns
+                if re.search(p, excerpt.lower(), flags=re.I)
+            )
+            if score > best_score or (score == best_score and len(excerpt) > len(best)):
+                best = excerpt
+                best_score = score
+
+    return best[:9000]
+
+
+def s45v71012_work_programme_bridge(cluster_text):
+    """
+    Establish applicability at Work-Programme/call scope, not merely inside the
+    bounded topic section.
+
+    Fail-closed requirements:
+      * exact locked topic exists in this same official Work Programme;
+      * the document explicitly refers to General Annex(es)/Annex B;
+      * the nearby text also contains conditions/eligibility/admissibility/
+        participation language.
+    """
+    body = re.sub(r"\s+", " ", normalize_text(cluster_text))
+    topic = normalize_text(identity)
+
+    if not body or not topic:
+        return {"ok": False, "excerpt": "", "reason": "Missing Work Programme text/topic identity."}
+
+    if not s45v710_exact_topic_match(body, topic):
+        return {"ok": False, "excerpt": "", "reason": "Exact locked topic not reproduced in Work Programme."}
+
+    annex_patterns = (
+        r"general\s+annex(?:es)?\s+b\b",
+        r"general\s+annex(?:es)?\b",
+        r"\bannex\s+b\b",
+    )
+    applicability_patterns = (
+        r"general\s+conditions",
+        r"eligibilit",
+        r"admissibilit",
+        r"conditions?\s+for\s+participation",
+        r"participation\s+conditions?",
+        r"call\s+conditions?",
+        r"conditions?\s+are\s+described",
+        r"conditions?\s+are\s+set\s+out",
+        r"see\s+general\s+annex",
+        r"as\s+described\s+in\s+general\s+annex",
+    )
+
+    low = body.lower()
+    annex_matches = list(
+        re.finditer("|".join(f"(?:{p})" for p in annex_patterns), low, flags=re.I)
+    )
+    if not annex_matches:
+        return {
+            "ok": False,
+            "excerpt": "",
+            "reason": "Work Programme contains the exact topic but no explicit General Annex/Annex B reference.",
+        }
+
+    # Require applicability language in a bounded neighbourhood around an Annex reference.
+    for m in annex_matches:
+        a = max(0, m.start() - 4500)
+        b = min(len(body), m.end() + 6500)
+        window = body[a:b].strip()
+        wlow = window.lower()
+
+        if any(re.search(p, wlow, flags=re.I) for p in applicability_patterns):
+            return {
+                "ok": True,
+                "excerpt": window[:10000],
+                "reason": (
+                    "The freshly fetched exact-topic Work Programme explicitly links "
+                    "applicable/general conditions to General Annexes/Annex B at "
+                    "work-programme or call scope."
+                ),
+            }
+
+    return {
+        "ok": False,
+        "excerpt": "",
+        "reason": (
+            "General Annex wording was found in the Work Programme, but no bounded "
+            "applicability/conditions context was reproduced around it."
+        ),
+    }
+
+
+def s45v71012_annex_excerpt(text, requirement_key):
+    """
+    Extract explicit substantive text from General Annexes.
+    This function returns text only; it never decides that the applicant/project
+    satisfies the rule.
+    """
+    body = re.sub(r"\s+", " ", normalize_text(text))
+    if not body:
+        return ""
+
+    key = normalize_text(requirement_key).upper()
+
+    patterns = {
+        "APPLICANT_ELIGIBILITY": (
+            r"eligible\s+(?:applicants|entities|participants)",
+            r"legal\s+entities\s+(?:are\s+)?eligible",
+            r"eligibility\s+conditions",
+            r"conditions\s+for\s+participation",
+            r"beneficiaries\s+and\s+affiliated\s+entities",
+            r"who\s+can\s+apply",
+        ),
+        "CONSORTIUM_REQUIREMENTS": (
+            r"at\s+least\s+three\s+independent\s+legal\s+entities",
+            r"three\s+independent\s+legal\s+entities",
+            r"minimum\s+number\s+of",
+            r"consortium\s+composition",
+            r"composition\s+of\s+the\s+consortium",
+            r"consortium",
+        ),
+        "GEOGRAPHIC_ELIGIBILITY": (
+            r"member\s+states",
+            r"associated\s+countries",
+            r"eligible\s+countries",
+            r"eligible\s+for\s+funding",
+            r"entities\s+established\s+in",
+            r"third\s+countries",
+        ),
+    }.get(key, ())
+
+    if not patterns:
+        return ""
+
+    return s45v71012_context_excerpt(
+        body,
+        patterns,
+        before=2200,
+        after=6500,
+    )[:12000]
+
+
+def s45v71012_candidate_urls():
+    """
+    Deterministic authoritative seeds first. Search API remains discovery-only.
+    """
+    urls = []
+
+    def add(u):
+        u = normalize_text(u)
+        if not u or u in urls:
+            return
+        if not s45v7107_allowed_official_host(u):
+            return
+        if s45v7107_bad_url(u):
+            return
+        urls.append(u)
+
+    for u in s45v7107_url_from_lock_context():
+        add(u)
+
+    for u in s45v7107_authoritative_reference_urls():
+        add(u)
+
+    for u in s45v7107_search_urls():
+        add(u)
+
+    return urls
+
+
+def s45v71012_discover_and_verify(task):
+    requirement_key = s45v7107_requirement_key(task)
+
+    if requirement_key not in {
+        "APPLICANT_ELIGIBILITY",
+        "CONSORTIUM_REQUIREMENTS",
+        "GEOGRAPHIC_ELIGIBILITY",
+        "TRL_REQUIREMENTS",
+    }:
+        return {
+            "status": "WAITING_OFFICIAL",
+            "requirement_key": requirement_key,
+            "reason": "Requirement family is not handled by v7.10.12.",
+            "attempts": [],
+        }
+
+    # Do not disturb the TRL path that already produced the valid candidate.
+    if requirement_key == "TRL_REQUIREMENTS":
+        return s45v7107_discover_and_verify(task)
+
+    queue = list(s45v71012_candidate_urls())
+    visited = set()
+    attempts = []
+    work_programmes = []
+    annex_documents = []
+    max_fetches = 55
+
+    while queue and len(visited) < max_fetches:
+        requested = queue.pop(0)
+        if not requested or requested in visited:
+            continue
+        visited.add(requested)
+
+        if s45v7107_bad_url(requested):
+            attempts.append({
+                "requested_url": requested,
+                "final_url": requested,
+                "rejected_reason": "PRE_FETCH_REJECTED_URL",
+                "exact_topic": False,
+                "document_role": "",
+            })
+            continue
+
+        fetched = s45v7107_fetch(requested, timeout=45)
+        final_url = normalize_text(fetched.get("final_url"))
+        is_search = (
+            s45v7107_is_search_api(requested)
+            or s45v7107_is_search_api(final_url)
+        )
+
+        audit = {
+            "requested_url": requested,
+            "final_url": final_url,
+            "http_status": fetched.get("status"),
+            "content_type": fetched.get("content_type"),
+            "bytes_received": fetched.get("bytes_received", 0),
+            "parser": fetched.get("parser"),
+            "text_chars": fetched.get("text_chars", 0),
+            "official_host": s45v7107_allowed_official_host(final_url),
+            "search_api_discovery_only": is_search,
+            "exact_topic": False,
+            "document_role": "",
+            "rejected_reason": fetched.get("rejected_reason"),
+            "error": fetched.get("error"),
+        }
+
+        if not fetched.get("ok"):
+            attempts.append(audit)
+            continue
+
+        # Search API can discover candidates but can never be evidence.
+        if is_search:
+            for discovered in s45v7107_discover_from_search_api(fetched):
+                if discovered not in visited and discovered not in queue:
+                    queue.append(discovered)
+            attempts.append(audit)
+            continue
+
+        exact_topic = s45v7107_exact_topic_in_substantive_source(fetched)
+        audit["exact_topic"] = exact_topic
+
+        if s45v71012_is_general_annex_url(final_url):
+            audit["document_role"] = "GENERAL_ANNEXES"
+            annex_documents.append(fetched)
+
+        elif s45v71012_is_work_programme_url(final_url) and exact_topic:
+            audit["document_role"] = "EXACT_TOPIC_WORK_PROGRAMME"
+            work_programmes.append(fetched)
+
+        elif exact_topic:
+            # A substantive exact-topic page can still disclose the canonical
+            # Work Programme PDF through its links.
+            audit["document_role"] = "EXACT_TOPIC_DISCOVERY_PAGE"
+
+        # Follow only the existing conservative official-document discovery.
+        for discovered in s45v7107_discover_links_from_substantive_source(fetched):
+            if discovered not in visited and discovered not in queue:
+                queue.append(discovered)
+
+        attempts.append(audit)
+
+    # De-duplicate by final URL.
+    def dedupe(docs):
+        out = []
+        seen = set()
+        for doc in docs:
+            u = normalize_text(doc.get("final_url"))
+            if u and u not in seen:
+                seen.add(u)
+                out.append(doc)
+        return out
+
+    work_programmes = dedupe(work_programmes)
+    annex_documents = dedupe(annex_documents)
+
+    if not work_programmes:
+        return {
+            "status": "WAITING_OFFICIAL",
+            "requirement_key": requirement_key,
+            "exact_topic_verified": False,
+            "authoritative_source_verified": False,
+            "explicit_evidence_verified": False,
+            "evidence_url": None,
+            "evidence_excerpt": None,
+            "reason": (
+                "No freshly fetched official Work Programme PDF reproduced the exact locked topic."
+            ),
+            "attempts": attempts,
+        }
+
+    # The canonical General Annexes URL is deterministic for Horizon 2026-2027.
+    # Fetch it explicitly if it was not already reached.
+    if not annex_documents:
+        for candidate in s45v7107_authoritative_reference_urls():
+            if not s45v71012_is_general_annex_url(candidate):
+                continue
+            fetched = s45v7107_fetch(candidate, timeout=45)
+            if fetched.get("ok"):
+                annex_documents.append(fetched)
+                attempts.append({
+                    "requested_url": candidate,
+                    "final_url": fetched.get("final_url"),
+                    "http_status": fetched.get("status"),
+                    "content_type": fetched.get("content_type"),
+                    "bytes_received": fetched.get("bytes_received", 0),
+                    "parser": fetched.get("parser"),
+                    "text_chars": fetched.get("text_chars", 0),
+                    "official_host": s45v7107_allowed_official_host(
+                        normalize_text(fetched.get("final_url"))
+                    ),
+                    "search_api_discovery_only": False,
+                    "exact_topic": False,
+                    "document_role": "GENERAL_ANNEXES",
+                    "rejected_reason": fetched.get("rejected_reason"),
+                    "error": fetched.get("error"),
+                })
+            break
+
+    annex_documents = dedupe(annex_documents)
+
+    if not annex_documents:
+        return {
+            "status": "WAITING_OFFICIAL",
+            "requirement_key": requirement_key,
+            "exact_topic_verified": True,
+            "authoritative_source_verified": True,
+            "explicit_evidence_verified": False,
+            "evidence_url": None,
+            "evidence_excerpt": None,
+            "reason": (
+                "Exact-topic Work Programme was verified, but the official General Annexes "
+                "document could not be freshly fetched."
+            ),
+            "attempts": attempts,
+        }
+
+    bridge_failures = []
+
+    for wp_doc in work_programmes:
+        wp_url = normalize_text(wp_doc.get("final_url"))
+        wp_text = normalize_text(wp_doc.get("text"))
+        bridge = s45v71012_work_programme_bridge(wp_text)
+
+        if not bridge.get("ok"):
+            bridge_failures.append({
+                "work_programme_url": wp_url,
+                "reason": bridge.get("reason"),
+            })
+            continue
+
+        for annex_doc in annex_documents:
+            annex_url = normalize_text(annex_doc.get("final_url"))
+            annex_text = normalize_text(annex_doc.get("text"))
+
+            if not (
+                annex_url
+                and annex_text
+                and s45v7107_allowed_official_host(annex_url)
+                and not s45v7107_bad_url(annex_url)
+            ):
+                continue
+
+            rule_excerpt = s45v71012_annex_excerpt(
+                annex_text,
+                requirement_key,
+            )
+            if not rule_excerpt:
+                continue
+
+            combined = (
+                "EXACT_TOPIC_WORK_PROGRAMME_APPLICABILITY_BRIDGE:\n"
+                + normalize_text(bridge.get("excerpt"))[:10000]
+                + "\n\nGENERAL_ANNEX_SUBSTANTIVE_RULE:\n"
+                + rule_excerpt[:12000]
+            )
+
+            return {
+                "status": "RESOLVED",
+                "requirement_key": requirement_key,
+                "exact_topic_verified": True,
+                "authoritative_source_verified": True,
+                "explicit_evidence_verified": True,
+                "evidence_url": annex_url,
+                "evidence_excerpt": combined[:20000],
+                "evidence_reference": "EXACT_TOPIC_WP_SCOPE_TO_GENERAL_ANNEX",
+                "source_title": (
+                    annex_doc.get("title")
+                    or "Horizon Europe Work Programme — General Annexes"
+                ),
+                "document_type": "OFFICIAL_EC_GENERAL_ANNEXES",
+                "source_authority": "EUROPEAN_COMMISSION",
+                "provenance_chain": [wp_url, annex_url],
+                "reason": (
+                    "v7.10.12 verified the exact locked topic in the freshly fetched "
+                    "official Work Programme, reproduced the Work-Programme/call-scope "
+                    "General Annex applicability statement, and extracted the explicit "
+                    "substantive requirement from freshly fetched official General Annexes. "
+                    "No applicant/project compliance verdict is inferred; Stage 46 must "
+                    "independently re-fetch both documents."
+                ),
+                "attempts": attempts,
+            }
+
+    return {
+        "status": "WAITING_OFFICIAL",
+        "requirement_key": requirement_key,
+        "exact_topic_verified": True,
+        "authoritative_source_verified": True,
+        "explicit_evidence_verified": False,
+        "evidence_url": None,
+        "evidence_excerpt": None,
+        "reason": (
+            "The exact-topic Work Programme and General Annexes were fetched, but "
+            "v7.10.12 could not reproduce both a Work-Programme-scope applicability "
+            "bridge and an explicit General Annex substantive rule for this requirement."
+        ),
+        "bridge_failures": bridge_failures,
+        "attempts": attempts,
+    }
+
+
+def s45v71012_candidate_ready(result):
+    if normalize_text(result.get("status")).upper() != "RESOLVED":
+        return False
+
+    if not (
+        bool(result.get("exact_topic_verified"))
+        and bool(result.get("authoritative_source_verified"))
+        and bool(result.get("explicit_evidence_verified"))
+    ):
+        return False
+
+    evidence_url = normalize_text(result.get("evidence_url"))
+    excerpt = normalize_text(result.get("evidence_excerpt"))
+
+    if not evidence_url or not excerpt:
+        return False
+
+    key = normalize_text(result.get("requirement_key")).upper()
+    chain = result.get("provenance_chain")
+    if not isinstance(chain, list):
+        chain = []
+
+    urls = [normalize_text(x) for x in chain if normalize_text(x)]
+
+    if key in {
+        "APPLICANT_ELIGIBILITY",
+        "CONSORTIUM_REQUIREMENTS",
+        "GEOGRAPHIC_ELIGIBILITY",
+    }:
+        if normalize_text(result.get("evidence_reference")).upper() != (
+            "EXACT_TOPIC_WP_SCOPE_TO_GENERAL_ANNEX"
+        ):
+            return False
+
+        if len(urls) < 2:
+            return False
+
+        if not all(s45v7107_allowed_official_host(u) for u in urls):
+            return False
+
+        if not s45v71012_is_work_programme_url(urls[0]):
+            return False
+
+        if not s45v71012_is_general_annex_url(urls[-1]):
+            return False
+
+    return True
+
+
+def s45v71012_save_verified_document(task, result):
+    """
+    Same DB schema as the existing strict saver, but records the actual v7.10.12
+    provenance semantics instead of labelling the row as v7.10.8.
+    """
+    url = normalize_text(result.get("evidence_url"))
+    excerpt = normalize_text(result.get("evidence_excerpt"))
+
+    if not url or not excerpt:
+        return None
+
+    chain = result.get("provenance_chain") or [url]
+    if not isinstance(chain, list):
+        chain = [chain]
+
+    row = {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+        "execution_run_id": execution_run_id,
+        "execution_task_id": task.get("id"),
+        "requirement_id": task.get("requirement_id"),
+        "opportunity_identity": identity,
+        "requirement_key": task.get("requirement_key"),
+        "requirement_category": task.get("requirement_category"),
+        "requirement_label": task.get("requirement_label"),
+        "source_url": url,
+        "source_title": result.get("source_title") or "Official European Commission source",
+        "document_type": result.get("document_type") or "OFFICIAL_EC_DOCUMENT",
+        "source_authority": result.get("source_authority") or "EUROPEAN_COMMISSION",
+        "topic_identity": identity,
+        "exact_topic_verified": True,
+        "applicability_verified": True,
+        "applicability_reason": (
+            "v7.10.12 exact-topic Work Programme + Work-Programme-scope "
+            "General Annex applicability bridge verified."
+        ),
+        "evidence_found": True,
+        "evidence_excerpt": excerpt[:10000],
+        "evidence_reference": result.get("evidence_reference") or task.get("requirement_label"),
+        "evidence_payload": {
+            "stage": 45,
+            "version": "v7.10.12",
+            "work_programme_scope_bridge": True,
+            "stage46_must_refetch": True,
+            "search_api_is_evidence": False,
+            "attempts": result.get("attempts", [])[-40:],
+        },
+        "provenance_chain": chain,
+        "retrieval_status": "VERIFIED",
+        "retrieved_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    existing = (
+        supabase.table("locked_evidence_official_documents")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("opportunity_lock_id", lock_id)
+        .eq("execution_task_id", task.get("id"))
+        .eq("source_url", url)
+        .limit(1)
+        .execute()
+    ).data or []
+
+    if existing:
+        saved = (
+            supabase.table("locked_evidence_official_documents")
+            .update(row)
+            .eq("id", existing[0]["id"])
+            .eq("user_id", user_id)
+            .execute()
+        ).data or []
+        return saved[0] if saved else {**row, "id": existing[0]["id"]}
+
+    saved = (
+        supabase.table("locked_evidence_official_documents")
+        .insert(row)
+        .execute()
+    ).data or []
+
+    return saved[0] if saved else None
+
+
+def s45v71012_worker_payload(task, worker_run_id, result, source_row):
+    evidence_url = normalize_text(result.get("evidence_url"))
+    excerpt = normalize_text(result.get("evidence_excerpt"))[:10000]
+
+    chain = result.get("provenance_chain") or []
+    if not isinstance(chain, list):
+        chain = [chain] if chain else []
+    if evidence_url and evidence_url not in chain:
+        chain.append(evidence_url)
+
+    return {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+        "execution_run_id": execution_run_id,
+        "worker_run_id": worker_run_id,
+        "execution_task_id": task.get("id"),
+        "requirement_id": task.get("requirement_id"),
+        "opportunity_identity": identity,
+        "requirement_key": task.get("requirement_key"),
+        "requirement_category": task.get("requirement_category"),
+        "requirement_label": task.get("requirement_label"),
+        "route_type": task.get("route_type"),
+        "destination_module": task.get("destination_module"),
+        "worker_action": "WORK_PROGRAMME_SCOPE_GENERAL_ANNEX_HANDOFF",
+        "worker_status": "RESOLVED",
+        "resolved_value": {
+            "stage45_candidate": True,
+            "requirement": task.get("requirement_label"),
+            "work_programme_scope_bridge_verified": True,
+        },
+        "evidence_source": "OFFICIAL_DOCUMENTATION",
+        "evidence_reference": result.get("evidence_reference") or task.get("requirement_label"),
+        "evidence_url": evidence_url,
+        "evidence_excerpt": excerpt,
+        "confidence": "High",
+        # Stage 45 candidate only. Stage 46 remains independent final verifier.
+        "official_verified": False,
+        "reason": result.get("reason"),
+        "next_action": "VALIDATE_IN_STAGE_46",
+        "source_title": result.get("source_title") or "Official European Commission source",
+        "document_type": result.get("document_type") or "OFFICIAL_EC_DOCUMENT",
+        "source_authority": result.get("source_authority") or "EUROPEAN_COMMISSION",
+        "topic_identity": identity,
+        "provenance_chain": chain,
+        "documents_checked": chain,
+        "searches_attempted": s45v7107_search_urls(),
+        "transport_attempts": result.get("attempts", [])[-40:],
+        "resolution_method": "OFFICIAL_DOCUMENTATION",
+        "retrieved_at": now_iso(),
+        "exact_topic_verified": True,
+        "authoritative_source_verified": True,
+        "explicit_evidence_verified": True,
+        "official_document_status": "EVIDENCE_FOUND",
+        "official_document_payload": {
+            "stage": 45,
+            "version": "v7.10.12",
+            "handoff_target": "STAGE_46",
+            "work_programme_scope_bridge": True,
+            "stage46_must_refetch": True,
+            "search_api_is_evidence": False,
+            "source_document_id": source_row.get("id") if source_row else None,
+            "source_document_status": (
+                source_row.get("retrieval_status") if source_row else None
+            ),
+            "attempts": result.get("attempts", [])[-40:],
+        },
+        "resolved_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+
+def s45v71012_persist_worker_item(task, worker_run_id, result, source_row):
+    if normalize_text(result.get("status")).upper() != "RESOLVED":
+        return None
+
+    payload = s45v71012_worker_payload(
+        task,
+        worker_run_id,
+        result,
+        source_row,
+    )
+
+    existing = (
+        supabase.table("locked_evidence_worker_items")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("worker_run_id", worker_run_id)
+        .eq("execution_task_id", task.get("id"))
+        .limit(1)
+        .execute()
+    ).data or []
+
+    if existing:
+        saved = (
+            supabase.table("locked_evidence_worker_items")
+            .update(payload)
+            .eq("id", existing[0]["id"])
+            .eq("user_id", user_id)
+            .execute()
+        ).data or []
+        return saved[0] if saved else {**payload, "id": existing[0]["id"]}
+
+    saved = (
+        supabase.table("locked_evidence_worker_items")
+        .insert(payload)
+        .execute()
+    ).data or []
+
+    if not saved:
+        raise RuntimeError("v7.10.12 could not persist Stage 46 handoff worker item.")
+
+    return saved[0]
+
+
+def s45v71012_update_execution_task(task, worker_item):
+    payload = as_dict(task.get("completion_payload"))
+    payload["stage45_evidence_candidate"] = {
+        "stage": 45,
+        "version": "v7.10.12",
+        "worker_item_id": worker_item.get("id"),
+        "status": "RESOLVED",
+        "evidence_url": worker_item.get("evidence_url"),
+        "evidence_reference": worker_item.get("evidence_reference"),
+        "evidence_excerpt": worker_item.get("evidence_excerpt"),
+        "provenance_chain": worker_item.get("provenance_chain") or [],
+        "exact_topic_verified": True,
+        "authoritative_source_verified": True,
+        "explicit_evidence_verified": True,
+        "work_programme_scope_bridge_verified": True,
+        "handoff": "STAGE_46",
+        "stage46_must_refetch": True,
+    }
+
+    (
+        supabase.table("locked_evidence_execution_tasks")
+        .update({
+            "completion_payload": payload,
+            "updated_at": now_iso(),
+        })
+        .eq("id", task.get("id"))
+        .eq("user_id", user_id)
+        .execute()
+    )
+
+
+st.divider()
+st.subheader(
+    "Stage 45 v7.10.12 — Work-Programme-Scope General-Annex Bridge"
+)
+st.info(
+    "v7.10.12 repară blocajul v7.10.11 fără să slăbească gate-ul: "
+    "topic-ul exact trebuie să existe în Work Programme, iar același document "
+    "trebuie să reproducă explicit aplicabilitatea General Annexes/Annex B la "
+    "nivel de Work Programme/call. Regula Applicant/Consortium/Geographic este "
+    "apoi extrasă din General Annexes oficial. Stage 46 trebuie să re-descarce "
+    "independent ambele documente."
+)
+
+_v71012_tasks = [
+    t for t in current_tasks
+    if s45v71012_gate_task(t)
+]
+
+z1, z2, z3 = st.columns(3)
+z1.metric("Gate requirements", len(_v71012_tasks))
+z2.metric("Target handoff", len(_v71012_tasks))
+z3.metric("Stage 46", "Independent re-fetch")
+
+if st.button(
+    "🧭 Run Stage 45 v7.10.12 WP-scope provenance resolution",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v71012_run",
+):
+    _run_rows = (
+        supabase.table("locked_evidence_worker_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "total_tasks": len(_v71012_tasks),
+            "worker_status": "RUNNING",
+            "deep_resolution_version": "v7.10.12",
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "started_at": now_iso(),
+            "summary": {
+                "stage": 45,
+                "version": "v7.10.12",
+                "purpose": "WORK_PROGRAMME_SCOPE_GENERAL_ANNEX_PROVENANCE",
+                "stage46_must_refetch": True,
+                "fail_closed": True,
+            },
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not _run_rows:
+        st.error("Nu am putut crea Stage 45 v7.10.12 run.")
+    else:
+        _run_id = str(_run_rows[0]["id"])
+        _resolved = 0
+        _waiting = 0
+        _failed = 0
+        _audit = []
+        _bar = st.progress(0)
+
+        for _idx, _task in enumerate(_v71012_tasks, 1):
+            try:
+                _result = s45v71012_discover_and_verify(_task)
+                _ready = s45v71012_candidate_ready(_result)
+
+                if _ready:
+                    _source_row = s45v71012_save_verified_document(
+                        _task,
+                        _result,
+                    )
+                    _worker_item = s45v71012_persist_worker_item(
+                        _task,
+                        _run_id,
+                        _result,
+                        _source_row,
+                    )
+                    s45v71012_update_execution_task(
+                        _task,
+                        _worker_item,
+                    )
+                    _resolved += 1
+                    _status = "HANDOFF_READY"
+                else:
+                    _waiting += 1
+                    _status = (
+                        normalize_text(_result.get("status"))
+                        or "WAITING_OFFICIAL"
+                    )
+
+                _audit.append({
+                    "Requirement": _task.get("requirement_label"),
+                    "Requirement key": s45v7107_requirement_key(_task),
+                    "Status": _status,
+                    "Evidence reference": _result.get("evidence_reference"),
+                    "Evidence URL": _result.get("evidence_url"),
+                    "Provenance chain": _result.get("provenance_chain"),
+                    "Exact topic": _result.get("exact_topic_verified"),
+                    "Authoritative": _result.get("authoritative_source_verified"),
+                    "Explicit evidence": _result.get("explicit_evidence_verified"),
+                    "Excerpt chars": len(
+                        normalize_text(_result.get("evidence_excerpt"))
+                    ),
+                    "Reason": _result.get("reason"),
+                })
+
+            except Exception as _exc:
+                _failed += 1
+                _audit.append({
+                    "Requirement": _task.get("requirement_label"),
+                    "Requirement key": s45v7107_requirement_key(_task),
+                    "Status": "FAILED",
+                    "Evidence reference": "",
+                    "Evidence URL": "",
+                    "Provenance chain": [],
+                    "Exact topic": False,
+                    "Authoritative": False,
+                    "Explicit evidence": False,
+                    "Excerpt chars": 0,
+                    "Reason": (
+                        f"{type(_exc).__name__}: {str(_exc)[:1600]}"
+                    ),
+                })
+
+            _bar.progress(
+                _idx / max(1, len(_v71012_tasks))
+            )
+
+        _final = (
+            "FAILED"
+            if _failed and not _resolved and not _waiting
+            else "PARTIAL_FAILURE"
+            if _failed
+            else "COMPLETED"
+            if _resolved == len(_v71012_tasks)
+            else "WAITING"
+        )
+
+        (
+            supabase.table("locked_evidence_worker_runs")
+            .update({
+                "resolved_tasks": _resolved,
+                "waiting_tasks": _waiting,
+                "failed_tasks": _failed,
+                "worker_status": _final,
+                "diagnostic_status": (
+                    "FAILED"
+                    if _final == "FAILED"
+                    else "PARTIAL_FAILURE"
+                    if _final == "PARTIAL_FAILURE"
+                    else "CLEAN"
+                ),
+                "official_tasks_resolved": _resolved,
+                "official_tasks_waiting": _waiting,
+                "deep_resolution_version": "v7.10.12",
+                "provenance_summary": {
+                    "stage": 45,
+                    "version": "v7.10.12",
+                    "handoff_target": "STAGE_46",
+                    "stage46_must_refetch": True,
+                    "fail_closed": True,
+                    "bridge_scope": "WORK_PROGRAMME_OR_CALL_SCOPE",
+                    "resolved": _resolved,
+                    "waiting": _waiting,
+                    "failed": _failed,
+                    "audit": _audit,
+                },
+                "completed_at": now_iso(),
+                "updated_at": now_iso(),
+            })
+            .eq("id", _run_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        st.session_state["stage45_v71012_results"] = _audit
+
+        st.success(
+            f"Stage 45 v7.10.12: {_final} — handoff ready {_resolved}, "
+            f"waiting {_waiting}, failed {_failed}."
+        )
+        st.rerun()
+
+
+_v71012_runs = rows(
+    "locked_evidence_worker_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    100,
+)
+
+_v71012_runs = [
+    r for r in _v71012_runs
+    if normalize_text(
+        r.get("deep_resolution_version")
+    ).lower() == "v7.10.12"
+]
+
+if _v71012_runs:
+    _latest_v71012 = _v71012_runs[0]
+    _sum = _latest_v71012.get("provenance_summary") or {}
+    if not isinstance(_sum, dict):
+        _sum = {}
+
+    st.subheader("Latest Stage 45 v7.10.12 Result")
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric(
+        "Status",
+        _latest_v71012.get("worker_status") or "—",
+    )
+    q2.metric(
+        "Handoff ready",
+        _latest_v71012.get("official_tasks_resolved") or 0,
+    )
+    q3.metric(
+        "Waiting",
+        _latest_v71012.get("official_tasks_waiting") or 0,
+    )
+    q4.metric(
+        "Failed",
+        _latest_v71012.get("failed_tasks") or 0,
+    )
+
+    if _sum.get("audit"):
+        st.dataframe(
+            _sum["audit"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+st.caption(
+    "v7.10.12 invariant: exact topic + Work-Programme/call-scope General Annex "
+    "applicability + explicit General Annex rule are all required. Applicant, "
+    "Consortium and Geographic compliance are never inferred. Stage 46 remains "
+    "the independent final re-fetch gate."
+)
+
+# =====================================================================
+# END STAGE 45 v7.10.12
+# =====================================================================
