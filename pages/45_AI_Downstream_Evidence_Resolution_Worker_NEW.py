@@ -7728,10 +7728,44 @@ def s45v7107_topic_section(text):
 
 
 def s45v7107_applicability_bridge(cluster_text):
-    """Prove that the exact topic delegates eligibility to General Annex B."""
+    """Prove from the bounded exact-topic section that General Annex B applies.
+
+    Horizon work programmes do not use one invariant wording.  The previous
+    implementation required both the literal word 'eligibility' and
+    'General Annex B', which caused false WAITING results when the topic used
+    wording such as 'General conditions' / 'General Annexes' while still
+    explicitly delegating the applicable conditions to Annex B.
+
+    This remains fail-closed: a bridge is returned only when the bounded
+    exact-topic section itself contains an explicit Annex-B reference.
+    """
     section = s45v7107_topic_section(cluster_text)
-    low = section.lower()
-    return bool(section and 'eligibility' in low and 'general annex b' in low)
+    if not section:
+        return False
+
+    low = re.sub(r'\s+', ' ', section.lower())
+
+    annex_b_patterns = (
+        r'general\s+annex(?:es)?\s+b\b',
+        r'general\s+annex\s+b\b',
+        r'annex\s+b\b',
+    )
+    annex_b = any(re.search(p, low, flags=re.I) for p in annex_b_patterns)
+    if not annex_b:
+        return False
+
+    applicability_terms = (
+        'eligibility',
+        'eligible',
+        'general conditions',
+        'conditions',
+        'admissibility',
+        'participation',
+        'applicant',
+        'beneficiar',
+        'consortium',
+    )
+    return any(term in low for term in applicability_terms)
 
 
 def s45v7107_negative_trl_evidence(cluster_text):
@@ -8964,4 +8998,265 @@ st.caption(
 
 # =====================================================================
 # END STAGE 45 v7.10.9
+# =====================================================================
+# =====================================================================
+# STAGE 45 v7.10.10 — CROSS-DOCUMENT ANNEX-B PROVENANCE RESOLUTION
+# =====================================================================
+# Purpose:
+#   * rerun the strict fresh-document resolver for the three gate requirements;
+#   * allow an exact-topic Work Programme -> General Annex B provenance bridge;
+#   * persist only evidence actually reproduced from freshly fetched official docs;
+#   * never manufacture Stage 46 PASS.
+#
+# Important provenance model:
+#   TRL: exact-topic Work Programme PDF is the evidence document.
+#   Applicant/Consortium: exact-topic Work Programme proves applicability and
+#   General Annexes PDF supplies the substantive rule.  Both URLs are retained
+#   in provenance_chain for Stage 46 to re-fetch independently.
+
+def s45v71010_gate_task(task):
+    return s45v7107_requirement_key(task) in {
+        "APPLICANT_ELIGIBILITY",
+        "CONSORTIUM_REQUIREMENTS",
+        "TRL_REQUIREMENTS",
+    }
+
+
+def s45v71010_provenance_kind(result):
+    ref = normalize_text(result.get("evidence_reference")).upper()
+    if ref == "EXACT_TOPIC_TO_GENERAL_ANNEX_B":
+        return "CROSS_DOCUMENT_GENERAL_ANNEX_B"
+    if ref == "TRL_NOT_SPECIFIED_IN_EXACT_TOPIC":
+        return "EXACT_TOPIC_NEGATIVE_TRL"
+    return "EXACT_TOPIC_DIRECT"
+
+
+def s45v71010_candidate_ready(result):
+    if normalize_text(result.get("status")).upper() != "RESOLVED":
+        return False
+    if not (
+        bool(result.get("exact_topic_verified"))
+        and bool(result.get("authoritative_source_verified"))
+        and bool(result.get("explicit_evidence_verified"))
+    ):
+        return False
+    if not normalize_text(result.get("evidence_url")):
+        return False
+    if not normalize_text(result.get("evidence_excerpt")):
+        return False
+
+    chain = result.get("provenance_chain")
+    if not isinstance(chain, list):
+        chain = []
+
+    kind = s45v71010_provenance_kind(result)
+    if kind == "CROSS_DOCUMENT_GENERAL_ANNEX_B":
+        # Cross-document proof must retain BOTH official documents.
+        urls = [normalize_text(x) for x in chain if normalize_text(x)]
+        if len(urls) < 2:
+            return False
+        if not all(s45v7107_allowed_official_host(u) for u in urls):
+            return False
+
+    return True
+
+
+st.divider()
+st.subheader("Stage 45 v7.10.10 — Annex-B Cross-Document Provenance Resolver")
+st.info(
+    "v7.10.10 rezolvă fail-closed cele 3 gate requirements. "
+    "Pentru Applicant/Consortium acceptă numai lanțul explicit: exact-topic Work Programme "
+    "→ General Annex B → regula extrasă din General Annexes. "
+    "Stage 46 trebuie să re-descarce independent documentele din provenance_chain."
+)
+
+_v71010_tasks = [t for t in current_tasks if s45v71010_gate_task(t)]
+
+u1, u2, u3 = st.columns(3)
+u1.metric("Gate requirements", len(_v71010_tasks))
+u2.metric("Expected handoff", "3 evidence candidates")
+u3.metric("Stage 46", "Independent re-fetch required")
+
+if st.button(
+    "🧭 Run Stage 45 v7.10.10 Annex-B provenance resolution",
+    type="primary",
+    use_container_width=True,
+    key="stage45_v71010_run",
+):
+    _run_rows = (
+        supabase.table("locked_evidence_worker_runs")
+        .insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "execution_run_id": execution_run_id,
+            "opportunity_identity": identity,
+            "total_tasks": len(_v71010_tasks),
+            "worker_status": "RUNNING",
+            "deep_resolution_version": "v7.10.10",
+            "diagnostic_status": "CLEAN",
+            "error_count": 0,
+            "started_at": now_iso(),
+            "summary": {
+                "stage": 45,
+                "version": "v7.10.10",
+                "purpose": "CROSS_DOCUMENT_ANNEX_B_PROVENANCE_RESOLUTION",
+                "stage46_must_refetch": True,
+                "fail_closed": True,
+            },
+            "updated_at": now_iso(),
+        })
+        .execute()
+    ).data or []
+
+    if not _run_rows:
+        st.error("Nu am putut crea Stage 45 v7.10.10 run.")
+    else:
+        _run_id = str(_run_rows[0]["id"])
+        _resolved = 0
+        _waiting = 0
+        _failed = 0
+        _audit = []
+        _bar = st.progress(0)
+
+        for _idx, _task in enumerate(_v71010_tasks, 1):
+            try:
+                _result = s45v7107_discover_and_verify(_task)
+                _ready = s45v71010_candidate_ready(_result)
+                _kind = s45v71010_provenance_kind(_result)
+
+                if _ready:
+                    _source_row = s45v7107_save_verified_document(_task, _result)
+                    _worker_item = s45v7107_persist_worker_item(
+                        _task, _run_id, _result, _source_row
+                    )
+                    s45v7107_update_execution_task(_task, _worker_item)
+                    _resolved += 1
+                    _status = "HANDOFF_READY"
+                else:
+                    _waiting += 1
+                    _status = normalize_text(_result.get("status")) or "WAITING_OFFICIAL"
+
+                _audit.append({
+                    "Requirement": _task.get("requirement_label"),
+                    "Requirement key": s45v7107_requirement_key(_task),
+                    "Status": _status,
+                    "Provenance type": _kind,
+                    "Evidence URL": _result.get("evidence_url"),
+                    "Provenance chain": _result.get("provenance_chain"),
+                    "Exact topic": _result.get("exact_topic_verified"),
+                    "Authoritative": _result.get("authoritative_source_verified"),
+                    "Explicit evidence": _result.get("explicit_evidence_verified"),
+                    "Evidence reference": _result.get("evidence_reference"),
+                    "Excerpt chars": len(normalize_text(_result.get("evidence_excerpt"))),
+                    "Reason": _result.get("reason"),
+                })
+
+            except Exception as _exc:
+                _failed += 1
+                _audit.append({
+                    "Requirement": _task.get("requirement_label"),
+                    "Requirement key": s45v7107_requirement_key(_task),
+                    "Status": "FAILED",
+                    "Provenance type": "",
+                    "Evidence URL": "",
+                    "Provenance chain": [],
+                    "Exact topic": False,
+                    "Authoritative": False,
+                    "Explicit evidence": False,
+                    "Evidence reference": "",
+                    "Excerpt chars": 0,
+                    "Reason": f"{type(_exc).__name__}: {str(_exc)[:1200]}",
+                })
+
+            _bar.progress(_idx / max(1, len(_v71010_tasks)))
+
+        _final = (
+            "FAILED" if _failed and not _resolved and not _waiting
+            else "PARTIAL_FAILURE" if _failed
+            else "COMPLETED" if _resolved == len(_v71010_tasks)
+            else "WAITING"
+        )
+
+        (
+            supabase.table("locked_evidence_worker_runs")
+            .update({
+                "resolved_tasks": _resolved,
+                "waiting_tasks": _waiting,
+                "failed_tasks": _failed,
+                "worker_status": _final,
+                "diagnostic_status": (
+                    "FAILED" if _final == "FAILED"
+                    else "PARTIAL_FAILURE" if _final == "PARTIAL_FAILURE"
+                    else "CLEAN"
+                ),
+                "official_tasks_resolved": _resolved,
+                "official_tasks_waiting": _waiting,
+                "deep_resolution_version": "v7.10.10",
+                "provenance_summary": {
+                    "stage": 45,
+                    "version": "v7.10.10",
+                    "handoff_target": "STAGE_46",
+                    "stage46_must_refetch": True,
+                    "fail_closed": True,
+                    "resolved": _resolved,
+                    "waiting": _waiting,
+                    "failed": _failed,
+                    "audit": _audit,
+                },
+                "completed_at": now_iso(),
+                "updated_at": now_iso(),
+            })
+            .eq("id", _run_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        st.session_state["stage45_v71010_results"] = _audit
+        st.success(
+            f"Stage 45 v7.10.10: {_final} — handoff ready {_resolved}, "
+            f"waiting {_waiting}, failed {_failed}."
+        )
+        st.rerun()
+
+
+_v71010_runs = rows(
+    "locked_evidence_worker_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    100,
+)
+_v71010_runs = [
+    r for r in _v71010_runs
+    if normalize_text(r.get("deep_resolution_version")).lower() == "v7.10.10"
+]
+
+if _v71010_runs:
+    _latest_v71010 = _v71010_runs[0]
+    _sum = _latest_v71010.get("provenance_summary") or {}
+    if not isinstance(_sum, dict):
+        _sum = {}
+
+    st.subheader("Latest Stage 45 v7.10.10 Result")
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("Status", _latest_v71010.get("worker_status") or "—")
+    v2.metric("Handoff ready", _latest_v71010.get("official_tasks_resolved") or 0)
+    v3.metric("Waiting", _latest_v71010.get("official_tasks_waiting") or 0)
+    v4.metric("Failed", _latest_v71010.get("failed_tasks") or 0)
+
+    if _sum.get("audit"):
+        st.dataframe(_sum["audit"], use_container_width=True, hide_index=True)
+
+st.caption(
+    "v7.10.10 invariant: Applicant/Consortium cross-document evidence is valid only "
+    "when the exact-topic Work Programme proves Annex-B applicability and the official "
+    "General Annexes supplies the explicit rule. Stage 46 remains the independent final gate."
+)
+
+# =====================================================================
+# END STAGE 45 v7.10.10
 # =====================================================================
