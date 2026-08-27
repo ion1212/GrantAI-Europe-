@@ -9,7 +9,7 @@ from supabase import create_client
 
 
 # =====================================================================
-# STAGE 47 v1.1 — FINAL OPPORTUNITY ELIGIBILITY DECISION GATE
+# STAGE 47 v1.2 — FINAL OPPORTUNITY ELIGIBILITY DECISION GATE
 #
 # Purpose:
 #   Consume ONLY a PASS from Stage 46 for the same user/project/ACTIVE lock.
@@ -34,12 +34,12 @@ from supabase import create_client
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 47 v1.1 — Final Eligibility Decision",
+    page_title="Stage 47 v1.2 — Final Eligibility Decision",
     page_icon="⚖️",
     layout="wide",
 )
 
-st.title("⚖️ Etapa 47 v1.1 — AI Final Opportunity Eligibility Decision Gate")
+st.title("⚖️ Etapa 47 v1.2 — AI Final Opportunity Eligibility Decision Gate")
 st.caption(
     "Etapa 47 consumă exclusiv un PASS valid din Stage 46 pentru același proiect și același "
     "opportunity lock. Decizia este fail-closed: orice lipsă, nepotrivire sau verdict neconfirmat "
@@ -516,10 +516,13 @@ else:
     )
 
 
-decision_payload = {
+# v1.2: separate volatile display metadata from the immutable decision input.
+# The v1.1 fingerprint included generated_at, so every Streamlit rerun generated
+# a different fingerprint. That made a successfully persisted decision look
+# "not persisted" immediately after st.rerun().
+decision_basis = {
     "stage": 47,
-    "version": "v1.1",
-    "generated_at": now_iso(),
+    "fingerprint_contract": "stage47-v1.2-stable",
     "user_id": user_id,
     "project_id": project_id,
     "opportunity_lock_id": lock_id,
@@ -540,7 +543,13 @@ decision_payload = {
     "checks": checks,
 }
 
-decision_fingerprint = sha256_json(decision_payload)
+decision_fingerprint = sha256_json(decision_basis)
+
+decision_payload = {
+    **decision_basis,
+    "version": "v1.2",
+    "generated_at": now_iso(),
+}
 
 # Keep a deterministic in-session handoff for a future Stage 48.
 st.session_state["stage47_final_decision"] = {
@@ -580,7 +589,7 @@ def persist_stage47_decision():
         "opportunity_lock_id": lock_id,
         "stage46_run_id": stage46_run_id,
         "stage": 47,
-        "validator_version": "stage47-v1.1",
+        "validator_version": "stage47-v1.2",
         "opportunity_identity": identity,
         "official_deadline": str(deadline or "")[:10] or None,
         "stage46_status": stage46_status,
@@ -762,7 +771,7 @@ if st.button(
     "💾 Persist Stage 47 decision in Supabase",
     type="primary",
     use_container_width=True,
-    key="stage47_v11_persist",
+    key="stage47_v12_persist",
 ):
     try:
         saved_run = persist_stage47_decision()
@@ -788,11 +797,11 @@ else:
     )
 
 st.caption(
-    "Invariantă Stage 47 v1.1: un PASS Stage 46 nu poate fi reutilizat între proiecte sau lock-uri. "
+    "Invariantă Stage 47 v1.2: un PASS Stage 46 nu poate fi reutilizat între proiecte sau lock-uri. "
     "ELIGIBLE necesită același ACTIVE lock, deadline valid, Stage 46 PASS și toate cele patru "
     "cerințe canonice VERIFIED cu provenance acceptat."
 )
 
 # =====================================================================
-# END STAGE 47 v1.1
+# END STAGE 47 v1.2
 # =====================================================================
