@@ -9,7 +9,7 @@ from supabase import create_client
 
 
 # =====================================================================
-# STAGE 47 v1.0 — FINAL OPPORTUNITY ELIGIBILITY DECISION GATE
+# STAGE 47 v1.1 — FINAL OPPORTUNITY ELIGIBILITY DECISION GATE
 #
 # Purpose:
 #   Consume ONLY a PASS from Stage 46 for the same user/project/ACTIVE lock.
@@ -27,18 +27,19 @@ from supabase import create_client
 #   or stale-run reuse.
 #
 # Persistence:
-#   No new Supabase table is required in v1.0. The final decision is computed
-#   deterministically from persisted Stage 46 tables and bound by a SHA256
-#   decision fingerprint shown in the UI.
+#   v1.1 persists the final gate in Supabase tables:
+#     final_opportunity_eligibility_runs
+#     final_opportunity_eligibility_items
+#   The decision remains deterministic and is bound by a SHA256 fingerprint.
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 47 v1.0 — Final Eligibility Decision",
+    page_title="Stage 47 v1.1 — Final Eligibility Decision",
     page_icon="⚖️",
     layout="wide",
 )
 
-st.title("⚖️ Etapa 47 v1.0 — AI Final Opportunity Eligibility Decision Gate")
+st.title("⚖️ Etapa 47 v1.1 — AI Final Opportunity Eligibility Decision Gate")
 st.caption(
     "Etapa 47 consumă exclusiv un PASS valid din Stage 46 pentru același proiect și același "
     "opportunity lock. Decizia este fail-closed: orice lipsă, nepotrivire sau verdict neconfirmat "
@@ -517,7 +518,7 @@ else:
 
 decision_payload = {
     "stage": 47,
-    "version": "v1.0",
+    "version": "v1.1",
     "generated_at": now_iso(),
     "user_id": user_id,
     "project_id": project_id,
@@ -546,6 +547,124 @@ st.session_state["stage47_final_decision"] = {
     **decision_payload,
     "decision_fingerprint": decision_fingerprint,
 }
+
+
+
+# ---------------------------------------------------------------------
+# Stage 47 Supabase persistence
+# ---------------------------------------------------------------------
+
+def load_existing_stage47_run(fingerprint: str):
+    if not fingerprint:
+        return None
+    data = (
+        supabase.table("final_opportunity_eligibility_runs")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("project_id", project_id)
+        .eq("opportunity_lock_id", lock_id)
+        .eq("stage46_run_id", stage46_run_id)
+        .eq("decision_fingerprint", fingerprint)
+        .limit(1)
+        .execute()
+    ).data or []
+    return data[0] if data else None
+
+
+def persist_stage47_decision():
+    existing = load_existing_stage47_run(decision_fingerprint)
+
+    run_payload = {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+        "stage46_run_id": stage46_run_id,
+        "stage": 47,
+        "validator_version": "stage47-v1.1",
+        "opportunity_identity": identity,
+        "official_deadline": str(deadline or "")[:10] or None,
+        "stage46_status": stage46_status,
+        "decision": final_decision,
+        "decision_reason": decision_reason,
+        "decision_fingerprint": decision_fingerprint,
+        "mandatory_requirements": decision_payload.get("mandatory_requirements") or {},
+        "checks": checks,
+        "decision_payload": decision_payload,
+        "completed_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    if existing:
+        run_id = str(existing["id"])
+        saved = (
+            supabase.table("final_opportunity_eligibility_runs")
+            .update(run_payload)
+            .eq("id", run_id)
+            .eq("user_id", user_id)
+            .execute()
+        ).data or []
+        run_row = saved[0] if saved else {**existing, **run_payload}
+    else:
+        run_payload["created_at"] = now_iso()
+        saved = (
+            supabase.table("final_opportunity_eligibility_runs")
+            .insert(run_payload)
+            .execute()
+        ).data or []
+        if not saved:
+            raise RuntimeError("Could not persist Stage 47 run.")
+        run_row = saved[0]
+        run_id = str(run_row["id"])
+
+    # Upsert one immutable-audit-style item per canonical requirement within this run.
+    for verdict in verdicts:
+        req = verdict["requirement"]
+        item_payload = {
+            "stage47_run_id": run_id,
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "stage46_run_id": stage46_run_id,
+            "stage46_provenance_item_id": verdict.get("item_id"),
+            "requirement_key": req,
+            "stage46_verdict": verdict.get("status"),
+            "stage47_accepted": bool(verdict.get("verified")),
+            "provenance_ok": bool(verdict.get("provenance_ok")),
+            "final_url": verdict.get("final_url"),
+            "reason": verdict.get("reason") or "",
+            "updated_at": now_iso(),
+        }
+
+        existing_item = (
+            supabase.table("final_opportunity_eligibility_items")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("stage47_run_id", run_id)
+            .eq("requirement_key", req)
+            .limit(1)
+            .execute()
+        ).data or []
+
+        if existing_item:
+            (
+                supabase.table("final_opportunity_eligibility_items")
+                .update(item_payload)
+                .eq("id", existing_item[0]["id"])
+                .eq("user_id", user_id)
+                .execute()
+            )
+        else:
+            item_payload["created_at"] = now_iso()
+            (
+                supabase.table("final_opportunity_eligibility_items")
+                .insert(item_payload)
+                .execute()
+            )
+
+    return run_row
+
+
+existing_stage47 = load_existing_stage47_run(decision_fingerprint)
 
 
 # ---------------------------------------------------------------------
@@ -626,10 +745,42 @@ with st.expander("Stage 47 decision payload", expanded=False):
         "decision_fingerprint": decision_fingerprint,
     })
 
+st.divider()
+st.subheader("Stage 47 persistence")
+
+if existing_stage47:
+    st.success(
+        f"Decizia Stage 47 este deja salvată în Supabase. Run ID: {existing_stage47.get('id')}"
+    )
+else:
+    st.info(
+        "Decizia curentă nu este încă persistată. Salveaz-o pentru ca o etapă viitoare "
+        "să poată verifica Stage 47 prin run_id + fingerprint."
+    )
+
+if st.button(
+    "💾 Persist Stage 47 decision in Supabase",
+    type="primary",
+    use_container_width=True,
+    key="stage47_v11_persist",
+):
+    try:
+        saved_run = persist_stage47_decision()
+        st.session_state["stage47_persisted_run_id"] = str(saved_run.get("id"))
+        st.success(
+            f"Stage 47 persisted: {saved_run.get('decision')} — run {saved_run.get('id')}"
+        )
+        st.rerun()
+    except Exception as exc:
+        st.error(
+            "Stage 47 persistence failed. Verifică dacă SQL-ul Stage 47 a fost rulat în Supabase. "
+            f"{type(exc).__name__}: {str(exc)[:1200]}"
+        )
+
 if final_decision == "ELIGIBLE":
     st.success(
-        "Stage 47 poate preda controlul unei viitoare Etape 48. "
-        "Stage 48 trebuie să verifice din nou lock_id + Stage 46 run_id + decision_fingerprint."
+        "Stage 47 poate preda controlul unei viitoare Etape 48 numai după persistență. "
+        "Stage 48 trebuie să verifice stage47_run_id + lock_id + Stage 46 run_id + decision_fingerprint."
     )
 else:
     st.info(
@@ -637,11 +788,11 @@ else:
     )
 
 st.caption(
-    "Invariantă Stage 47 v1.0: un PASS Stage 46 nu poate fi reutilizat între proiecte sau lock-uri. "
+    "Invariantă Stage 47 v1.1: un PASS Stage 46 nu poate fi reutilizat între proiecte sau lock-uri. "
     "ELIGIBLE necesită același ACTIVE lock, deadline valid, Stage 46 PASS și toate cele patru "
     "cerințe canonice VERIFIED cu provenance acceptat."
 )
 
 # =====================================================================
-# END STAGE 47 v1.0
+# END STAGE 47 v1.1
 # =====================================================================
