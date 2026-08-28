@@ -12,7 +12,7 @@ from supabase import create_client
 
 
 # =====================================================================
-# STAGE 64 v1.1 — AI EXTERNAL PORTAL PREFLIGHT VERIFICATION GATE
+# STAGE 64 v1.3 — AI EXTERNAL PORTAL PREFLIGHT VERIFICATION GATE
 #
 # Purpose:
 #   Consume ONLY a persisted Stage 63 READY_TO_EXECUTE authorization and
@@ -20,8 +20,9 @@ from supabase import create_client
 #   Tenders opportunity page before any external execution.
 #
 # Stage 64 MAY:
-#   - perform an unauthenticated HTTP GET to an official ec.europa.eu URL
-#   - verify that the locked opportunity identity appears on that page
+#   - perform unauthenticated HTTP GET requests to official EU endpoints
+#   - query the official EC Search API for topic discovery
+#   - verify the locked opportunity identity against official sources
 #   - capture HTTP status, final URL, page SHA256 and timestamp
 #
 # Stage 64 DOES NOT:
@@ -33,6 +34,15 @@ from supabase import create_client
 #   - create financial commitments
 #   - claim submission or European Commission receipt
 #
+# Identity policy v1.3:
+#   Exact identity may be established by:
+#     1. exact official EC Search API identifier; OR
+#     2. exact identity encoded in the official portal URL; OR
+#     3. exact identity present in the official portal response.
+#
+#   NO_EXACT_API_MATCH remains diagnostic evidence and does NOT override
+#   identity independently established from the official portal.
+#
 # Outcomes:
 #   EXTERNAL_PREFLIGHT_READY
 #   NEEDS_PORTAL_VERIFICATION
@@ -42,22 +52,25 @@ from supabase import create_client
 #   Stage 65 may consume ONLY EXTERNAL_PREFLIGHT_READY.
 # =====================================================================
 
+
 st.set_page_config(
-    page_title="Stage 64 v1.1 — External Portal Preflight Verification",
+    page_title="Stage 64 v1.3 — External Portal Preflight Verification",
     page_icon="🌐",
     layout="wide",
 )
 
-st.title("🌐 Etapa 64 v1.1 — AI External Portal Preflight Verification Gate")
+st.title("🌐 Etapa 64 v1.3 — AI External Portal Preflight Verification Gate")
+
 st.caption(
-    "Descoperă automat topicul oficial prin API-ul Funding & Tenders și face verificare publică read-only. "
+    "Descoperă automat topicul oficial prin sursele Funding & Tenders și "
+    "efectuează verificare publică read-only. "
     "Nu face login, upload sau submission."
 )
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # Helpers
-# ---------------------------------------------------------------------
+# =====================================================================
 
 OFFICIAL_HOST_SUFFIXES = (
     "ec.europa.eu",
@@ -89,39 +102,61 @@ def normalize_text(value: Any) -> str:
 
 
 def normalize_identity(value: str) -> str:
-    return re.sub(r"[^A-Z0-9]+", "", normalize_text(value).upper())
+    return re.sub(
+        r"[^A-Z0-9]+",
+        "",
+        normalize_text(value).upper(),
+    )
 
 
 def as_dict(value: Any) -> dict:
     if isinstance(value, dict):
         return value
+
     if isinstance(value, str) and value.strip():
         try:
             parsed = json.loads(value)
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
             return {}
+
     return {}
 
 
 def rows(table: str, filters=None, order="created_at", limit=1000):
     q = supabase.table(table).select("*")
+
     for key, value in (filters or {}).items():
         if value not in (None, ""):
             q = q.eq(key, value)
+
     if order:
         q = q.order(order, desc=True)
+
     if limit:
         q = q.limit(limit)
+
     return q.execute().data or []
 
 
 def restore_auth_session(sb) -> None:
     session = st.session_state.get("auth_session")
+
     if not session:
         return
-    access_token = session.get("access_token") if isinstance(session, dict) else getattr(session, "access_token", None)
-    refresh_token = session.get("refresh_token") if isinstance(session, dict) else getattr(session, "refresh_token", None)
+
+    access_token = (
+        session.get("access_token")
+        if isinstance(session, dict)
+        else getattr(session, "access_token", None)
+    )
+
+    refresh_token = (
+        session.get("refresh_token")
+        if isinstance(session, dict)
+        else getattr(session, "refresh_token", None)
+    )
+
     if access_token and refresh_token:
         try:
             sb.auth.set_session(access_token, refresh_token)
@@ -132,22 +167,28 @@ def restore_auth_session(sb) -> None:
 def current_user_id(sb):
     for key in ("auth_user", "user"):
         user = st.session_state.get(key)
+
         if isinstance(user, dict) and user.get("id"):
             return str(user["id"])
+
         if getattr(user, "id", None):
             return str(user.id)
 
     for key in ("user_id", "auth_user_id"):
         value = st.session_state.get(key)
+
         if value:
             return str(value)
 
     try:
         user = sb.auth.get_user().user
+
         if user and getattr(user, "id", None):
             return str(user.id)
+
     except Exception:
         pass
+
     return None
 
 
@@ -159,30 +200,49 @@ def stable_sha256(value: Any) -> str:
         separators=(",", ":"),
         default=str,
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    return hashlib.sha256(
+        payload.encode("utf-8")
+    ).hexdigest()
 
 
 def text_sha256(value: str) -> str:
-    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        (value or "").encode("utf-8")
+    ).hexdigest()
 
 
 def future_deadline(value: Any) -> bool:
     if not value:
         return False
+
     try:
-        return date.fromisoformat(str(value)[:10]) >= datetime.now(timezone.utc).date()
+        return (
+            date.fromisoformat(str(value)[:10])
+            >= datetime.now(timezone.utc).date()
+        )
     except Exception:
         return False
 
 
 def project_label(project: dict) -> str:
-    return f"{project.get('name') or 'Project'} — {str(project.get('id') or '')[:8]}"
+    return (
+        f"{project.get('name') or 'Project'} — "
+        f"{str(project.get('id') or '')[:8]}"
+    )
 
 
 def official_domain_ok(url: str) -> bool:
     try:
-        host = (urlparse(url).hostname or "").lower().strip(".")
-        return any(host == suffix or host.endswith("." + suffix) for suffix in OFFICIAL_HOST_SUFFIXES)
+        host = (
+            urlparse(url).hostname or ""
+        ).lower().strip(".")
+
+        return any(
+            host == suffix or host.endswith("." + suffix)
+            for suffix in OFFICIAL_HOST_SUFFIXES
+        )
+
     except Exception:
         return False
 
@@ -197,45 +257,58 @@ def infer_official_url(lock: dict) -> str:
         "url",
     ):
         value = normalize_text(lock.get(key))
+
         if value.startswith("http://") or value.startswith("https://"):
             return value
+
     return ""
 
 
+# =====================================================================
+# Official Funding & Tenders discovery
+# =====================================================================
 
-OFFICIAL_SEARCH_API = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
-PORTAL_TOPIC_BASE = "https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/topic-details/"
+OFFICIAL_SEARCH_API = (
+    "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
+)
+
+PORTAL_TOPIC_BASE = (
+    "https://ec.europa.eu/info/funding-tenders/opportunities/"
+    "portal/screen/opportunities/topic-details/"
+)
 
 
 def walk_json(value: Any):
-    """Yield every dict/list node recursively without assuming API response shape."""
     if isinstance(value, dict):
         yield value
+
         for child in value.values():
             yield from walk_json(child)
+
     elif isinstance(value, list):
         for child in value:
             yield from walk_json(child)
 
 
-def extract_first_text(obj: dict, keys: tuple[str, ...]) -> str:
+def extract_first_text(
+    obj: dict,
+    keys: tuple[str, ...],
+) -> str:
+
     for key in keys:
         value = obj.get(key)
+
         if value is not None and normalize_text(value):
             return normalize_text(value)
+
     return ""
 
 
-def discover_official_topic(identity: str, timeout_seconds: int = 20) -> dict:
-    """
-    Resolve the locked opportunity identity through the official Funding & Tenders
-    Search API documented by the European Commission.
+def discover_official_topic(
+    identity: str,
+    timeout_seconds: int = 20,
+) -> dict:
 
-    Fail-closed rule:
-    - API exact identifier match => VERIFIED_API_EXACT
-    - otherwise a canonical topic URL may be constructed, but it is only a
-      CANDIDATE until the subsequent live verification succeeds.
-    """
     identity = normalize_text(identity)
     normalized_target = normalize_identity(identity)
 
@@ -261,10 +334,16 @@ def discover_official_topic(identity: str, timeout_seconds: int = 20) -> dict:
     try:
         response = requests.get(
             OFFICIAL_SEARCH_API,
-            params={"apiKey": "SEDIA", "text": f'"{identity}"'},
+            params={
+                "apiKey": "SEDIA",
+                "text": f'"{identity}"',
+            },
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; Stage64Preflight/1.1)",
-                "Accept": "application/json,text/plain,*/*",
+                "User-Agent":
+                    "Mozilla/5.0 "
+                    "(compatible; Stage64Preflight/1.3)",
+                "Accept":
+                    "application/json,text/plain,*/*",
             },
             timeout=timeout_seconds,
             allow_redirects=True,
@@ -272,9 +351,13 @@ def discover_official_topic(identity: str, timeout_seconds: int = 20) -> dict:
 
         result["api_url"] = str(response.url or "")
         result["api_http_status"] = int(response.status_code)
-        result["api_response_sha256"] = text_sha256(response.text or "")
+
+        result["api_response_sha256"] = text_sha256(
+            response.text or ""
+        )
 
         payload = response.json() if response.ok else {}
+
         candidates = []
 
         for obj in walk_json(payload):
@@ -292,28 +375,55 @@ def discover_official_topic(identity: str, timeout_seconds: int = 20) -> dict:
                     "code",
                 ),
             )
+
             if not identifier:
                 continue
 
-            candidate = {
-                "identifier": identifier,
-                "title": extract_first_text(obj, ("title", "name", "topicTitle")),
-                "ccm2_id": extract_first_text(obj, ("ccm2Id", "ccm2id", "id")),
-            }
-            candidates.append(candidate)
+            candidates.append(
+                {
+                    "identifier": identifier,
+                    "title": extract_first_text(
+                        obj,
+                        (
+                            "title",
+                            "name",
+                            "topicTitle",
+                        ),
+                    ),
+                    "ccm2_id": extract_first_text(
+                        obj,
+                        (
+                            "ccm2Id",
+                            "ccm2id",
+                            "id",
+                        ),
+                    ),
+                }
+            )
 
-        # Deduplicate by normalized identifier + ccm2_id.
         unique = {}
-        for c in candidates:
-            k = (normalize_identity(c["identifier"]), c["ccm2_id"])
-            unique[k] = c
+
+        for candidate in candidates:
+            key = (
+                normalize_identity(
+                    candidate["identifier"]
+                ),
+                candidate["ccm2_id"],
+            )
+
+            unique[key] = candidate
+
         candidates = list(unique.values())
+
         result["candidate_count"] = len(candidates)
 
         exact = next(
             (
-                c for c in candidates
-                if normalize_identity(c["identifier"]) == normalized_target
+                candidate
+                for candidate in candidates
+                if normalize_identity(
+                    candidate["identifier"]
+                ) == normalized_target
             ),
             None,
         )
@@ -323,51 +433,122 @@ def discover_official_topic(identity: str, timeout_seconds: int = 20) -> dict:
             result["resolved_identifier"] = exact["identifier"]
             result["resolved_title"] = exact["title"]
             result["resolved_ccm2_id"] = exact["ccm2_id"]
-            result["resolved_url"] = PORTAL_TOPIC_BASE + exact["identifier"]
-            result["resolution_basis"] = "VERIFIED_API_EXACT"
+
+            result["resolved_url"] = (
+                PORTAL_TOPIC_BASE
+                + exact["identifier"]
+            )
+
+            result["resolution_basis"] = (
+                "VERIFIED_API_EXACT"
+            )
+
             return result
 
     except Exception as exc:
-        result["api_error"] = f"{type(exc).__name__}: {str(exc)[:1200]}"
+        result["api_error"] = (
+            f"{type(exc).__name__}: "
+            f"{str(exc)[:1200]}"
+        )
 
-    # Safe fallback: construct a candidate URL only for a plausible EU topic ID.
-    # This does not by itself verify identity; the live page/API checks below must pass.
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{5,200}", identity or ""):
+    # Safe fallback.
+    # This constructs only an official canonical candidate.
+    # Identity still has to be independently verified below.
+
+    if re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{5,200}",
+        identity or "",
+    ):
         result["resolved_identifier"] = identity
-        result["resolved_url"] = PORTAL_TOPIC_BASE + identity
-        result["resolution_basis"] = "CANONICAL_URL_CANDIDATE"
+
+        result["resolved_url"] = (
+            PORTAL_TOPIC_BASE + identity
+        )
+
+        result["resolution_basis"] = (
+            "CANONICAL_URL_CANDIDATE"
+        )
 
     return result
 
 
-def verify_identity_against_snapshot(identity: str, snapshot: dict, discovery: dict) -> tuple[bool, str]:
+# =====================================================================
+# Portal identity verification
+# =====================================================================
+
+def verify_identity_against_snapshot(
+    identity: str,
+    snapshot: dict,
+    discovery: dict,
+) -> tuple[bool, str]:
+
     normalized_target = normalize_identity(identity)
 
-    # Strongest route: the official API returned the exact topic identifier.
+    # Route 1 — exact official API identifier.
+
     if discovery.get("exact_match"):
-        resolved = normalize_identity(discovery.get("resolved_identifier"))
+        resolved = normalize_identity(
+            discovery.get("resolved_identifier")
+        )
+
         if normalized_target and resolved == normalized_target:
-            return True, "OFFICIAL_API_EXACT_IDENTIFIER"
+            return (
+                True,
+                "OFFICIAL_API_EXACT_IDENTIFIER",
+            )
 
-    # Portal route: identifier encoded in the final official topic URL.
-    final_url = normalize_text(snapshot.get("final_url") or snapshot.get("requested_url"))
-    if normalized_target and normalized_target in normalize_identity(final_url):
-        return True, "OFFICIAL_PORTAL_URL_IDENTITY"
+    # Route 2 — exact identity encoded in official final URL.
 
-    # Last route: identifier visible in returned public page content.
-    excerpt = normalize_text(snapshot.get("text_excerpt"))
-    if normalized_target and normalized_target in normalize_identity(excerpt):
-        return True, "OFFICIAL_PORTAL_BODY_IDENTITY"
+    final_url = normalize_text(
+        snapshot.get("final_url")
+        or snapshot.get("requested_url")
+    )
 
-    return False, "NO_EXACT_IDENTITY_MATCH"
+    if (
+        normalized_target
+        and normalized_target
+        in normalize_identity(final_url)
+    ):
+        return (
+            True,
+            "OFFICIAL_PORTAL_URL_IDENTITY",
+        )
 
-def fetch_public_portal_snapshot(url: str, timeout_seconds: int = 20) -> dict:
+    # Route 3 — identity visible in returned portal body.
+
+    excerpt = normalize_text(
+        snapshot.get("text_excerpt")
+    )
+
+    if (
+        normalized_target
+        and normalized_target
+        in normalize_identity(excerpt)
+    ):
+        return (
+            True,
+            "OFFICIAL_PORTAL_BODY_IDENTITY",
+        )
+
+    return (
+        False,
+        "NO_EXACT_IDENTITY_MATCH",
+    )
+
+
+def fetch_public_portal_snapshot(
+    url: str,
+    timeout_seconds: int = 20,
+) -> dict:
+
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (compatible; Stage64Preflight/1.0; "
-            "+read-only public opportunity verification)"
+            "Mozilla/5.0 "
+            "(compatible; Stage64Preflight/1.3; "
+            "+read-only-public-opportunity-verification)"
         ),
-        "Accept": "text/html,application/xhtml+xml",
+        "Accept":
+            "text/html,application/xhtml+xml",
     }
 
     result = {
@@ -392,73 +573,157 @@ def fetch_public_portal_snapshot(url: str, timeout_seconds: int = 20) -> dict:
         )
 
         body = response.text or ""
-        result["final_url"] = str(response.url or "")
-        result["http_status"] = int(response.status_code)
-        result["content_type"] = normalize_text(response.headers.get("content-type"))
+
+        result["final_url"] = str(
+            response.url or ""
+        )
+
+        result["http_status"] = int(
+            response.status_code
+        )
+
+        result["content_type"] = normalize_text(
+            response.headers.get("content-type")
+        )
+
         result["page_sha256"] = text_sha256(body)
+
         result["page_length"] = len(body)
 
-        clean_excerpt = re.sub(r"\s+", " ", body)
-        result["text_excerpt"] = clean_excerpt[:1000]
+        clean_excerpt = re.sub(
+            r"\s+",
+            " ",
+            body,
+        )
+
+        result["text_excerpt"] = (
+            clean_excerpt[:1000]
+        )
 
         return result
+
     except Exception as exc:
-        result["error"] = f"{type(exc).__name__}: {str(exc)[:1200]}"
+        result["error"] = (
+            f"{type(exc).__name__}: "
+            f"{str(exc)[:1200]}"
+        )
+
         return result
 
 
-# ---------------------------------------------------------------------
-# Supabase / auth
-# ---------------------------------------------------------------------
+# =====================================================================
+# Supabase / authentication
+# =====================================================================
 
 try:
     supabase = get_supabase()
+
 except Exception as exc:
-    st.error(f"Supabase initialization failed: {type(exc).__name__}: {exc}")
+    st.error(
+        "Supabase initialization failed: "
+        f"{type(exc).__name__}: {exc}"
+    )
     st.stop()
 
+
 restore_auth_session(supabase)
+
 user_id = current_user_id(supabase)
 
 if not user_id:
-    st.error("Stage 64 BLOCKED: utilizatorul autentificat nu poate fi identificat.")
+    st.error(
+        "Stage 64 BLOCKED: utilizatorul autentificat "
+        "nu poate fi identificat."
+    )
     st.stop()
 
-projects = rows("projects", {"user_id": user_id}, "updated_at", 200)
+
+projects = rows(
+    "projects",
+    {"user_id": user_id},
+    "updated_at",
+    200,
+)
+
 if not projects:
     st.warning("Nu există proiecte.")
     st.stop()
 
-project_map = {project_label(p): p for p in projects}
-project = project_map[st.selectbox("Project", list(project_map.keys()), key="stage64_project")]
+
+project_map = {
+    project_label(p): p
+    for p in projects
+}
+
+project = project_map[
+    st.selectbox(
+        "Project",
+        list(project_map.keys()),
+        key="stage64_project",
+    )
+]
+
 project_id = str(project["id"])
+
+
+# =====================================================================
+# Opportunity lock
+# =====================================================================
 
 locks = rows(
     "selected_opportunity_locks",
-    {"user_id": user_id, "project_id": project_id, "lock_status": "ACTIVE"},
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "lock_status": "ACTIVE",
+    },
     "created_at",
     10,
 )
 
 if not locks:
-    st.error("Stage 64 BLOCKED: nu există opportunity lock ACTIVE.")
+    st.error(
+        "Stage 64 BLOCKED: "
+        "nu există opportunity lock ACTIVE."
+    )
     st.stop()
 
+
 lock = locks[0]
+
 lock_id = str(lock["id"])
-identity = normalize_text(lock.get("opportunity_identity"))
+
+identity = normalize_text(
+    lock.get("opportunity_identity")
+)
+
 deadline = lock.get("official_deadline")
-workflow_allowed = bool(lock.get("workflow_allowed"))
+
+workflow_allowed = bool(
+    lock.get("workflow_allowed")
+)
+
 inferred_url = infer_official_url(lock)
 
-st.write(f"**Locked opportunity:** {identity or '—'}")
-st.write(f"**Deadline:** {str(deadline or '—')[:10]}")
-st.write(f"**Lock ID:** `{lock_id}`")
+
+st.write(
+    f"**Locked opportunity:** "
+    f"{identity or '—'}"
+)
+
+st.write(
+    f"**Deadline:** "
+    f"{str(deadline or '—')[:10]}"
+)
+
+st.write(
+    f"**Lock ID:** `{lock_id}`"
+)
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # Load Stage 63 READY_TO_EXECUTE
-# ---------------------------------------------------------------------
+# =====================================================================
 
 stage63_candidates = rows(
     "stage63_external_execution_authorization_runs",
@@ -473,27 +738,69 @@ stage63_candidates = rows(
 
 stage63 = next(
     (
-        r for r in stage63_candidates
-        if normalize_text(r.get("run_status")).upper() == "COMPLETED"
-        and normalize_text(r.get("authorization_outcome")).upper() == "READY_TO_EXECUTE"
-        and not bool(r.get("external_execution_started"))
-        and not bool(r.get("external_submission_performed"))
+        r
+        for r in stage63_candidates
+        if normalize_text(
+            r.get("run_status")
+        ).upper() == "COMPLETED"
+
+        and normalize_text(
+            r.get("authorization_outcome")
+        ).upper() == "READY_TO_EXECUTE"
+
+        and not bool(
+            r.get("external_execution_started")
+        )
+
+        and not bool(
+            r.get("external_submission_performed")
+        )
     ),
     None,
 )
 
-if stage63:
-    stage63_run_id = str(stage63.get("id") or "")
-    stage63_status = normalize_text(stage63.get("run_status")).upper()
-    stage63_outcome = normalize_text(stage63.get("authorization_outcome")).upper()
-    stage63_run_fingerprint = normalize_text(stage63.get("run_fingerprint"))
-    stage63_authorization_sha256 = normalize_text(stage63.get("authorization_sha256"))
 
-    stage62_run_id = str(stage63.get("stage62_run_id") or "")
-    stage61_run_id = str(stage63.get("stage61_run_id") or "")
-    stage60_run_id = str(stage63.get("stage60_run_id") or "")
-    stage59_run_id = str(stage63.get("stage59_run_id") or "")
-    stage57_run_id = str(stage63.get("stage57_run_id") or "")
+if stage63:
+    stage63_run_id = str(
+        stage63.get("id") or ""
+    )
+
+    stage63_status = normalize_text(
+        stage63.get("run_status")
+    ).upper()
+
+    stage63_outcome = normalize_text(
+        stage63.get("authorization_outcome")
+    ).upper()
+
+    stage63_run_fingerprint = normalize_text(
+        stage63.get("run_fingerprint")
+    )
+
+    stage63_authorization_sha256 = normalize_text(
+        stage63.get("authorization_sha256")
+    )
+
+    stage62_run_id = str(
+        stage63.get("stage62_run_id") or ""
+    )
+
+    stage61_run_id = str(
+        stage63.get("stage61_run_id") or ""
+    )
+
+    stage60_run_id = str(
+        stage63.get("stage60_run_id") or ""
+    )
+
+    stage59_run_id = str(
+        stage63.get("stage59_run_id") or ""
+    )
+
+    stage57_run_id = str(
+        stage63.get("stage57_run_id") or ""
+    )
+
 else:
     stage63_run_id = ""
     stage63_status = "MISSING"
@@ -508,13 +815,14 @@ else:
     stage57_run_id = ""
 
 
-# ---------------------------------------------------------------------
-# Load bound upstream chain
-# ---------------------------------------------------------------------
+# =====================================================================
+# Bound upstream chain
+# =====================================================================
 
 def get_bound(table: str, row_id: str):
     if not row_id:
         return None
+
     data = rows(
         table,
         {
@@ -525,66 +833,178 @@ def get_bound(table: str, row_id: str):
         "created_at",
         200,
     )
-    return next((r for r in data if str(r.get("id") or "") == row_id), None)
+
+    return next(
+        (
+            r
+            for r in data
+            if str(r.get("id") or "") == row_id
+        ),
+        None,
+    )
 
 
-stage62 = get_bound("stage62_controlled_submission_handoff_runs", stage62_run_id)
-stage61 = get_bound("stage61_human_approval_runs", stage61_run_id)
-stage60 = get_bound("stage60_submission_package_runs", stage60_run_id)
-stage59 = get_bound("stage59_submission_readiness_runs", stage59_run_id)
-stage57 = get_bound("stage57_revalidation_runs", stage57_run_id)
+stage62 = get_bound(
+    "stage62_controlled_submission_handoff_runs",
+    stage62_run_id,
+)
+
+stage61 = get_bound(
+    "stage61_human_approval_runs",
+    stage61_run_id,
+)
+
+stage60 = get_bound(
+    "stage60_submission_package_runs",
+    stage60_run_id,
+)
+
+stage59 = get_bound(
+    "stage59_submission_readiness_runs",
+    stage59_run_id,
+)
+
+stage57 = get_bound(
+    "stage57_revalidation_runs",
+    stage57_run_id,
+)
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # Integrity verification
-# ---------------------------------------------------------------------
+# =====================================================================
 
-stage63_run_payload = as_dict(stage63.get("run_payload")) if stage63 else {}
+stage63_run_payload = (
+    as_dict(stage63.get("run_payload"))
+    if stage63
+    else {}
+)
+
 recomputed_stage63_run_fingerprint = (
-    stable_sha256(stage63_run_payload) if stage63_run_payload else ""
+    stable_sha256(stage63_run_payload)
+    if stage63_run_payload
+    else ""
 )
 
-stage63_authorization_manifest = as_dict(stage63.get("authorization_manifest")) if stage63 else {}
+
+stage63_authorization_manifest = (
+    as_dict(stage63.get("authorization_manifest"))
+    if stage63
+    else {}
+)
+
 recomputed_stage63_authorization_sha256 = (
-    stable_sha256(stage63_authorization_manifest) if stage63_authorization_manifest else ""
+    stable_sha256(stage63_authorization_manifest)
+    if stage63_authorization_manifest
+    else ""
 )
 
-stage62_handoff_manifest = as_dict(stage62.get("handoff_manifest")) if stage62 else {}
-stored_stage62_handoff_sha256 = normalize_text(stage62.get("handoff_sha256")) if stage62 else ""
+
+stage62_handoff_manifest = (
+    as_dict(stage62.get("handoff_manifest"))
+    if stage62
+    else {}
+)
+
+stored_stage62_handoff_sha256 = (
+    normalize_text(stage62.get("handoff_sha256"))
+    if stage62
+    else ""
+)
+
 recomputed_stage62_handoff_sha256 = (
-    stable_sha256(stage62_handoff_manifest) if stage62_handoff_manifest else ""
+    stable_sha256(stage62_handoff_manifest)
+    if stage62_handoff_manifest
+    else ""
 )
 
-stage61_decision_payload = as_dict(stage61.get("decision_payload")) if stage61 else {}
-stored_stage61_approval_fingerprint = normalize_text(stage61.get("approval_fingerprint")) if stage61 else ""
+
+stage61_decision_payload = (
+    as_dict(stage61.get("decision_payload"))
+    if stage61
+    else {}
+)
+
+stored_stage61_approval_fingerprint = (
+    normalize_text(
+        stage61.get("approval_fingerprint")
+    )
+    if stage61
+    else ""
+)
+
 recomputed_stage61_approval_fingerprint = (
-    stable_sha256(stage61_decision_payload) if stage61_decision_payload else ""
+    stable_sha256(stage61_decision_payload)
+    if stage61_decision_payload
+    else ""
 )
 
-stage60_manifest = as_dict(stage60.get("manifest")) if stage60 else {}
-stored_stage60_package_sha256 = normalize_text(stage60.get("package_sha256")) if stage60 else ""
+
+stage60_manifest = (
+    as_dict(stage60.get("manifest"))
+    if stage60
+    else {}
+)
+
+stored_stage60_package_sha256 = (
+    normalize_text(stage60.get("package_sha256"))
+    if stage60
+    else ""
+)
+
 recomputed_stage60_package_sha256 = (
-    stable_sha256(stage60_manifest) if stage60_manifest else ""
+    stable_sha256(stage60_manifest)
+    if stage60_manifest
+    else ""
 )
 
-stage59_outcome = normalize_text(stage59.get("readiness_outcome")).upper() if stage59 else "MISSING"
-stage57_outcome = normalize_text(stage57.get("global_verdict")).upper() if stage57 else "MISSING"
+
+stage59_outcome = (
+    normalize_text(
+        stage59.get("readiness_outcome")
+    ).upper()
+    if stage59
+    else "MISSING"
+)
+
+stage57_outcome = (
+    normalize_text(
+        stage57.get("global_verdict")
+    ).upper()
+    if stage57
+    else "MISSING"
+)
 
 
-# ---------------------------------------------------------------------
-# Preflight base gate
-# ---------------------------------------------------------------------
+# =====================================================================
+# Base hard gate
+# =====================================================================
 
 base_checks = []
 
-def add_check(name: str, passed: bool, detail: str):
-    base_checks.append({"Check": name, "PASS": bool(passed), "Detail": detail})
+
+def add_check(
+    name: str,
+    passed: bool,
+    detail: str,
+):
+    base_checks.append(
+        {
+            "Check": name,
+            "PASS": bool(passed),
+            "Detail": detail,
+        }
+    )
 
 
 add_check(
     "ACTIVE lock",
-    normalize_text(lock.get("lock_status")).upper() == "ACTIVE",
-    normalize_text(lock.get("lock_status")).upper(),
+    normalize_text(
+        lock.get("lock_status")
+    ).upper() == "ACTIVE",
+    normalize_text(
+        lock.get("lock_status")
+    ).upper(),
 )
 
 add_check(
@@ -619,72 +1039,152 @@ add_check(
 
 add_check(
     "Stage 63 external execution not started",
-    bool(stage63) and not bool(stage63.get("external_execution_started")),
-    f"external_execution_started={bool(stage63.get('external_execution_started')) if stage63 else None}",
+    bool(stage63)
+    and not bool(
+        stage63.get("external_execution_started")
+    ),
+    (
+        "external_execution_started="
+        f"{bool(stage63.get('external_execution_started')) if stage63 else None}"
+    ),
 )
 
 add_check(
     "Stage 63 submission not performed",
-    bool(stage63) and not bool(stage63.get("external_submission_performed")),
-    f"external_submission_performed={bool(stage63.get('external_submission_performed')) if stage63 else None}",
+    bool(stage63)
+    and not bool(
+        stage63.get("external_submission_performed")
+    ),
+    (
+        "external_submission_performed="
+        f"{bool(stage63.get('external_submission_performed')) if stage63 else None}"
+    ),
 )
 
 add_check(
     "Stage 63 run fingerprint stable",
     bool(stage63_run_fingerprint)
-    and stage63_run_fingerprint == recomputed_stage63_run_fingerprint,
-    f"stored={stage63_run_fingerprint[:16]}..., recomputed={recomputed_stage63_run_fingerprint[:16]}...",
+    and (
+        stage63_run_fingerprint
+        == recomputed_stage63_run_fingerprint
+    ),
+    (
+        f"stored={stage63_run_fingerprint[:16]}..., "
+        f"recomputed={recomputed_stage63_run_fingerprint[:16]}..."
+    ),
 )
 
 add_check(
     "Stage 63 authorization SHA256 stable",
     bool(stage63_authorization_sha256)
-    and stage63_authorization_sha256 == recomputed_stage63_authorization_sha256,
-    f"stored={stage63_authorization_sha256[:16]}..., recomputed={recomputed_stage63_authorization_sha256[:16]}...",
+    and (
+        stage63_authorization_sha256
+        == recomputed_stage63_authorization_sha256
+    ),
+    (
+        f"stored={stage63_authorization_sha256[:16]}..., "
+        f"recomputed={recomputed_stage63_authorization_sha256[:16]}..."
+    ),
 )
 
 add_check(
     "Stage 62 HANDOFF_READY",
-    normalize_text(stage62.get("handoff_outcome")).upper() == "HANDOFF_READY" if stage62 else False,
-    normalize_text(stage62.get("handoff_outcome")).upper() if stage62 else "MISSING",
+    (
+        normalize_text(
+            stage62.get("handoff_outcome")
+        ).upper() == "HANDOFF_READY"
+        if stage62
+        else False
+    ),
+    (
+        normalize_text(
+            stage62.get("handoff_outcome")
+        ).upper()
+        if stage62
+        else "MISSING"
+    ),
 )
 
 add_check(
     "Stage 62 handoff SHA256 stable",
     bool(stored_stage62_handoff_sha256)
-    and stored_stage62_handoff_sha256 == recomputed_stage62_handoff_sha256,
-    f"stored={stored_stage62_handoff_sha256[:16]}..., recomputed={recomputed_stage62_handoff_sha256[:16]}...",
+    and (
+        stored_stage62_handoff_sha256
+        == recomputed_stage62_handoff_sha256
+    ),
+    (
+        f"stored={stored_stage62_handoff_sha256[:16]}..., "
+        f"recomputed={recomputed_stage62_handoff_sha256[:16]}..."
+    ),
 )
 
 add_check(
     "Stage 61 APPROVED_FOR_SUBMISSION_HANDOFF",
-    normalize_text(stage61.get("approval_outcome")).upper() == "APPROVED_FOR_SUBMISSION_HANDOFF" if stage61 else False,
-    normalize_text(stage61.get("approval_outcome")).upper() if stage61 else "MISSING",
+    (
+        normalize_text(
+            stage61.get("approval_outcome")
+        ).upper()
+        == "APPROVED_FOR_SUBMISSION_HANDOFF"
+        if stage61
+        else False
+    ),
+    (
+        normalize_text(
+            stage61.get("approval_outcome")
+        ).upper()
+        if stage61
+        else "MISSING"
+    ),
 )
 
 add_check(
     "Stage 61 approval fingerprint stable",
     bool(stored_stage61_approval_fingerprint)
-    and stored_stage61_approval_fingerprint == recomputed_stage61_approval_fingerprint,
-    f"stored={stored_stage61_approval_fingerprint[:16]}..., recomputed={recomputed_stage61_approval_fingerprint[:16]}...",
+    and (
+        stored_stage61_approval_fingerprint
+        == recomputed_stage61_approval_fingerprint
+    ),
+    (
+        f"stored={stored_stage61_approval_fingerprint[:16]}..., "
+        f"recomputed={recomputed_stage61_approval_fingerprint[:16]}..."
+    ),
 )
 
 add_check(
     "Stage 60 PACKAGE_READY",
-    normalize_text(stage60.get("package_outcome")).upper() == "PACKAGE_READY" if stage60 else False,
-    normalize_text(stage60.get("package_outcome")).upper() if stage60 else "MISSING",
+    (
+        normalize_text(
+            stage60.get("package_outcome")
+        ).upper() == "PACKAGE_READY"
+        if stage60
+        else False
+    ),
+    (
+        normalize_text(
+            stage60.get("package_outcome")
+        ).upper()
+        if stage60
+        else "MISSING"
+    ),
 )
 
 add_check(
     "Stage 60 package SHA256 stable",
     bool(stored_stage60_package_sha256)
-    and stored_stage60_package_sha256 == recomputed_stage60_package_sha256,
-    f"stored={stored_stage60_package_sha256[:16]}..., recomputed={recomputed_stage60_package_sha256[:16]}...",
+    and (
+        stored_stage60_package_sha256
+        == recomputed_stage60_package_sha256
+    ),
+    (
+        f"stored={stored_stage60_package_sha256[:16]}..., "
+        f"recomputed={recomputed_stage60_package_sha256[:16]}..."
+    ),
 )
 
 add_check(
     "Stage 59 READY_FOR_SUBMISSION_PREP",
-    stage59_outcome == "READY_FOR_SUBMISSION_PREP",
+    stage59_outcome
+    == "READY_FOR_SUBMISSION_PREP",
     stage59_outcome,
 )
 
@@ -694,39 +1194,71 @@ add_check(
     stage57_outcome,
 )
 
-base_gate = "READY" if all(c["PASS"] for c in base_checks) else "BLOCKED"
+
+base_gate = (
+    "READY"
+    if all(
+        c["PASS"]
+        for c in base_checks
+    )
+    else "BLOCKED"
+)
 
 
-# ---------------------------------------------------------------------
-# Automatic official topic discovery + live verification
-# ---------------------------------------------------------------------
+# =====================================================================
+# Automatic official topic discovery
+# =====================================================================
 
 st.divider()
-st.subheader("Automatic official portal discovery")
 
-existing_lock_url = inferred_url if inferred_url and official_domain_ok(inferred_url) else ""
+st.subheader(
+    "Automatic official portal discovery"
+)
 
-st.write(f"**Locked opportunity identity:** `{identity}`")
+existing_lock_url = (
+    inferred_url
+    if inferred_url
+    and official_domain_ok(inferred_url)
+    else ""
+)
+
+st.write(
+    f"**Locked opportunity identity:** "
+    f"`{identity}`"
+)
+
 if existing_lock_url:
-    st.success("An official URL already exists in the opportunity lock and will be preferred.")
-    st.write(f"`{existing_lock_url}`")
+    st.success(
+        "An official URL already exists in the "
+        "opportunity lock and will be preferred."
+    )
+
+    st.write(
+        f"`{existing_lock_url}`"
+    )
+
 else:
     st.info(
-        "No URL is stored in the lock. Stage 64 v1.1 will resolve the topic automatically "
-        "through the official Funding & Tenders Search API, then verify the public topic page."
+        "No URL is stored in the lock. "
+        "Stage 64 will attempt official EC Search API "
+        "discovery and then independently verify the "
+        "official public portal page."
     )
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # Existing Stage 64
-# ---------------------------------------------------------------------
+# =====================================================================
 
 def load_existing_stage64():
     if not stage63_run_id:
         return None
 
     data = (
-        supabase.table("stage64_external_portal_preflight_runs")
+        supabase
+        .table(
+            "stage64_external_portal_preflight_runs"
+        )
         .select("*")
         .eq("user_id", user_id)
         .eq("project_id", project_id)
@@ -743,13 +1275,31 @@ def load_existing_stage64():
 existing_stage64 = load_existing_stage64()
 
 
+# =====================================================================
+# Live verification
+# =====================================================================
+
 st.divider()
-st.subheader("Read-only live portal verification")
 
-with st.expander("Stage 64 upstream hard-gate checks", expanded=False):
-    st.dataframe(base_checks, use_container_width=True, hide_index=True)
+st.subheader(
+    "Read-only live portal verification"
+)
 
-st.write(f"**Base gate:** `{base_gate}`")
+with st.expander(
+    "Stage 64 upstream hard-gate checks",
+    expanded=False,
+):
+    st.dataframe(
+        base_checks,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+st.write(
+    f"**Base gate:** `{base_gate}`"
+)
+
 
 if st.button(
     "🌐 Auto-resolve official topic & verify preflight",
@@ -758,285 +1308,858 @@ if st.button(
     key="stage64_auto_verify",
     disabled=(base_gate != "READY"),
 ):
-    discovery = discover_official_topic(identity)
 
-    # Prefer an already persisted official lock URL. Otherwise use the exact
-    # official API result, then finally a canonical candidate URL.
+    discovery = discover_official_topic(
+        identity
+    )
+
+    # Priority:
+    # 1. persisted official lock URL
+    # 2. exact API URL
+    # 3. canonical official candidate URL
+
     portal_url = (
         existing_lock_url
-        or normalize_text(discovery.get("resolved_url"))
+        or normalize_text(
+            discovery.get("resolved_url")
+        )
     )
 
     if not portal_url:
         st.error(
-            "Stage 64 could not resolve an official topic URL from the locked opportunity identity. "
-            "The workflow remains fail-closed."
+            "Stage 64 could not resolve an official "
+            "topic URL from the locked opportunity "
+            "identity. Workflow remains fail-closed."
         )
         st.stop()
 
     if not official_domain_ok(portal_url):
-        st.error("Resolved URL is not on an allowed official EU domain.")
+        st.error(
+            "Resolved URL is not on an allowed "
+            "official EU domain."
+        )
         st.stop()
 
-    snapshot = fetch_public_portal_snapshot(portal_url)
 
-    identity_ok, identity_basis = verify_identity_against_snapshot(
-        identity,
-        snapshot,
-        discovery,
+    snapshot = fetch_public_portal_snapshot(
+        portal_url
     )
-    snapshot["identity_found"] = bool(identity_ok)
-    snapshot["identity_verification_basis"] = identity_basis
 
-    final_url = normalize_text(snapshot.get("final_url") or portal_url)
-    final_domain_ok = official_domain_ok(final_url)
-    http_ok = snapshot.get("http_status") == 200
-    page_hash_ok = bool(snapshot.get("page_sha256"))
 
-    # An exact official API match is accepted as live identity evidence even
-    # when the Funding & Tenders SPA does not render the topic code server-side.
-    official_api_exact_ok = bool(discovery.get("exact_match"))
+    identity_ok, identity_basis = (
+        verify_identity_against_snapshot(
+            identity,
+            snapshot,
+            discovery,
+        )
+    )
+
+
+    snapshot["identity_found"] = bool(
+        identity_ok
+    )
+
+    snapshot[
+        "identity_verification_basis"
+    ] = identity_basis
+
+
+    final_url = normalize_text(
+        snapshot.get("final_url")
+        or portal_url
+    )
+
+    final_domain_ok = official_domain_ok(
+        final_url
+    )
+
+    http_ok = (
+        snapshot.get("http_status") == 200
+    )
+
+    page_hash_ok = bool(
+        snapshot.get("page_sha256")
+    )
+
+    official_api_exact_ok = bool(
+        discovery.get("exact_match")
+    )
+
+
+    # ================================================================
+    # v1.3 live checks
+    #
+    # IMPORTANT:
+    # API exact match is diagnostic only.
+    #
+    # It cannot override exact identity already verified from an
+    # official portal URL or official portal response.
+    # ================================================================
 
     live_checks = [
         {
-            "Check": "Official discovery source",
-            "PASS": bool(existing_lock_url or discovery.get("resolved_url")),
-            "Detail": (
-                "PERSISTED_OFFICIAL_LOCK_URL"
-                if existing_lock_url
-                else discovery.get("resolution_basis")
-            ),
+            "Check":
+                "Official discovery source",
+
+            "PASS":
+                bool(
+                    existing_lock_url
+                    or discovery.get(
+                        "resolved_url"
+                    )
+                ),
+
+            "Detail":
+                (
+                    "PERSISTED_OFFICIAL_LOCK_URL"
+                    if existing_lock_url
+                    else discovery.get(
+                        "resolution_basis"
+                    )
+                ),
+
+            "Blocking": True,
         },
+
         {
-            "Check": "Official EU final domain",
-            "PASS": bool(final_domain_ok),
-            "Detail": final_url,
+            "Check":
+                "Official EU final domain",
+
+            "PASS":
+                bool(final_domain_ok),
+
+            "Detail":
+                final_url,
+
+            "Blocking": True,
         },
+
         {
-            "Check": "Public portal HTTP 200",
-            "PASS": bool(http_ok),
-            "Detail": str(snapshot.get("http_status")),
+            "Check":
+                "Public portal HTTP 200",
+
+            "PASS":
+                bool(http_ok),
+
+            "Detail":
+                str(
+                    snapshot.get(
+                        "http_status"
+                    )
+                ),
+
+            "Blocking": True,
         },
+
         {
-            "Check": "Portal page SHA256 captured",
-            "PASS": bool(page_hash_ok),
-            "Detail": snapshot.get("page_sha256", "")[:16] + "...",
+            "Check":
+                "Portal page SHA256 captured",
+
+            "PASS":
+                bool(page_hash_ok),
+
+            "Detail":
+                (
+                    snapshot.get(
+                        "page_sha256",
+                        "",
+                    )[:16]
+                    + "..."
+                ),
+
+            "Blocking": True,
         },
+
         {
-            "Check": "Locked opportunity identity verified",
-            "PASS": bool(identity_ok),
-            "Detail": identity_basis,
+            "Check":
+                "Locked opportunity identity verified",
+
+            "PASS":
+                bool(identity_ok),
+
+            "Detail":
+                identity_basis,
+
+            "Blocking": True,
         },
+
         {
-            "Check": "Official API exact topic match",
-            "PASS": bool(official_api_exact_ok or existing_lock_url),
-            "Detail": (
-                discovery.get("resolved_identifier")
-                if official_api_exact_ok
-                else ("LOCK_URL_PRESENT" if existing_lock_url else "NO_EXACT_API_MATCH")
-            ),
+            "Check":
+                "Official API exact topic match (diagnostic)",
+
+            "PASS":
+                bool(
+                    official_api_exact_ok
+                ),
+
+            "Detail":
+                (
+                    discovery.get(
+                        "resolved_identifier"
+                    )
+                    if official_api_exact_ok
+                    else "NO_EXACT_API_MATCH"
+                ),
+
+            # KEY v1.3 CHANGE
+            "Blocking": False,
         },
+
         {
-            "Check": "Deadline still valid",
-            "PASS": future_deadline(deadline),
-            "Detail": str(deadline or "")[:10],
+            "Check":
+                "Deadline still valid",
+
+            "PASS":
+                future_deadline(
+                    deadline
+                ),
+
+            "Detail":
+                str(
+                    deadline or ""
+                )[:10],
+
+            "Blocking": True,
         },
     ]
 
+
+    blocking_live_checks = [
+        check
+        for check in live_checks
+        if check.get(
+            "Blocking",
+            True,
+        )
+    ]
+
+
+    blocking_pass = all(
+        bool(check.get("PASS"))
+        for check
+        in blocking_live_checks
+    )
+
+
     outcome = (
         "EXTERNAL_PREFLIGHT_READY"
-        if base_gate == "READY" and all(c["PASS"] for c in live_checks)
+        if (
+            base_gate == "READY"
+            and blocking_pass
+        )
         else "NEEDS_PORTAL_VERIFICATION"
     )
 
+
+    # ================================================================
+    # Verification payload
+    # ================================================================
+
     verification_payload = {
         "stage": 64,
-        "verification_version": "stage64-v1.1",
-        "discovery_contract": "official-search-api-exact-or-fail-closed",
-        "user_id": user_id,
-        "project_id": project_id,
-        "opportunity_lock_id": lock_id,
-        "opportunity_identity": identity,
-        "official_deadline": str(deadline or "")[:10],
-        "stage63_run_id": stage63_run_id,
-        "stage63_authorization_sha256": stage63_authorization_sha256,
-        "portal_url": portal_url,
-        "discovery": discovery,
-        "portal_snapshot": snapshot,
-        "live_checks": live_checks,
-        "outcome": outcome,
+
+        "verification_version":
+            "stage64-v1.3",
+
+        "identity_policy":
+            "official-api-or-official-portal-exact",
+
+        "api_exact_match_policy":
+            "diagnostic-non-blocking-if-official-portal-identity-verified",
+
+        "user_id":
+            user_id,
+
+        "project_id":
+            project_id,
+
+        "opportunity_lock_id":
+            lock_id,
+
+        "opportunity_identity":
+            identity,
+
+        "official_deadline":
+            str(deadline or "")[:10],
+
+        "stage63_run_id":
+            stage63_run_id,
+
+        "stage63_authorization_sha256":
+            stage63_authorization_sha256,
+
+        "portal_url":
+            portal_url,
+
+        "discovery":
+            discovery,
+
+        "portal_snapshot":
+            snapshot,
+
+        "live_checks":
+            live_checks,
+
+        "blocking_live_checks":
+            blocking_live_checks,
+
+        "outcome":
+            outcome,
     }
 
-    verification_fingerprint = stable_sha256(verification_payload)
+
+    verification_fingerprint = (
+        stable_sha256(
+            verification_payload
+        )
+    )
+
+
+    # ================================================================
+    # Run fingerprint basis
+    # ================================================================
 
     run_basis = {
         "stage": 64,
-        "fingerprint_contract": "stage64-v1.1-auto-discovery-preflight",
-        "stage63_run_id": stage63_run_id,
-        "stage63_authorization_sha256": stage63_authorization_sha256,
-        "portal_url": portal_url,
-        "resolved_identifier": normalize_text(discovery.get("resolved_identifier")) or identity,
-        "api_response_sha256": normalize_text(discovery.get("api_response_sha256")) or None,
-        "portal_page_sha256": snapshot.get("page_sha256"),
-        "verification_fingerprint": verification_fingerprint,
-        "outcome": outcome,
+
+        "fingerprint_contract":
+            "stage64-v1.3-official-portal-identity-preflight",
+
+        "stage63_run_id":
+            stage63_run_id,
+
+        "stage63_authorization_sha256":
+            stage63_authorization_sha256,
+
+        "portal_url":
+            portal_url,
+
+        "resolved_identifier":
+            (
+                normalize_text(
+                    discovery.get(
+                        "resolved_identifier"
+                    )
+                )
+                or identity
+            ),
+
+        "api_response_sha256":
+            (
+                normalize_text(
+                    discovery.get(
+                        "api_response_sha256"
+                    )
+                )
+                or None
+            ),
+
+        "portal_page_sha256":
+            snapshot.get(
+                "page_sha256"
+            ),
+
+        "identity_verification_basis":
+            identity_basis,
+
+        "verification_fingerprint":
+            verification_fingerprint,
+
+        "outcome":
+            outcome,
     }
 
-    run_fingerprint = stable_sha256(run_basis)
+
+    run_fingerprint = stable_sha256(
+        run_basis
+    )
+
+
+    # ================================================================
+    # Persistence payload
+    # ================================================================
 
     payload = {
-        "user_id": user_id,
-        "project_id": project_id,
-        "opportunity_lock_id": lock_id,
+        "user_id":
+            user_id,
 
-        "stage57_run_id": stage57_run_id,
-        "stage59_run_id": stage59_run_id,
-        "stage60_run_id": stage60_run_id,
-        "stage61_run_id": stage61_run_id,
-        "stage62_run_id": stage62_run_id,
-        "stage63_run_id": stage63_run_id,
+        "project_id":
+            project_id,
 
-        "stage": 64,
-        "verification_version": "stage64-v1.1",
+        "opportunity_lock_id":
+            lock_id,
 
-        "opportunity_identity": identity,
-        "official_deadline": str(deadline or "")[:10] or None,
+        "stage57_run_id":
+            stage57_run_id,
 
-        "stage60_package_sha256": stored_stage60_package_sha256,
-        "stage61_approval_fingerprint": stored_stage61_approval_fingerprint,
-        "stage62_handoff_sha256": stored_stage62_handoff_sha256,
-        "stage63_authorization_sha256": stage63_authorization_sha256,
+        "stage59_run_id":
+            stage59_run_id,
 
-        "run_status": "COMPLETED",
-        "preflight_outcome": outcome,
+        "stage60_run_id":
+            stage60_run_id,
 
-        "portal_url": portal_url,
-        "portal_final_url": final_url or None,
-        "portal_http_status": snapshot.get("http_status"),
-        "portal_content_type": normalize_text(snapshot.get("content_type")) or None,
-        "portal_page_sha256": normalize_text(snapshot.get("page_sha256")) or None,
-        "portal_page_length": int(snapshot.get("page_length") or 0),
+        "stage61_run_id":
+            stage61_run_id,
 
-        "portal_state_verified": bool(http_ok and final_domain_ok),
-        "topic_identity_verified_live": bool(identity_ok),
-        "external_execution_started": False,
-        "external_submission_performed": False,
-        "external_receipt_obtained": False,
+        "stage62_run_id":
+            stage62_run_id,
 
-        "verification_error": normalize_text(snapshot.get("error")) or None,
-        "text_excerpt": normalize_text(snapshot.get("text_excerpt")) or None,
+        "stage63_run_id":
+            stage63_run_id,
 
-        "run_fingerprint": run_fingerprint,
-        "verification_fingerprint": verification_fingerprint,
+        "stage":
+            64,
 
-        "verification_payload": verification_payload,
-        "run_payload": run_basis,
+        "verification_version":
+            "stage64-v1.3",
 
-        "verified_at": snapshot.get("verified_at"),
-        "completed_at": now_iso(),
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
+        "opportunity_identity":
+            identity,
+
+        "official_deadline":
+            (
+                str(deadline or "")[:10]
+                or None
+            ),
+
+        "stage60_package_sha256":
+            stored_stage60_package_sha256,
+
+        "stage61_approval_fingerprint":
+            stored_stage61_approval_fingerprint,
+
+        "stage62_handoff_sha256":
+            stored_stage62_handoff_sha256,
+
+        "stage63_authorization_sha256":
+            stage63_authorization_sha256,
+
+        "run_status":
+            "COMPLETED",
+
+        "preflight_outcome":
+            outcome,
+
+        "portal_url":
+            portal_url,
+
+        "portal_final_url":
+            final_url or None,
+
+        "portal_http_status":
+            snapshot.get(
+                "http_status"
+            ),
+
+        "portal_content_type":
+            (
+                normalize_text(
+                    snapshot.get(
+                        "content_type"
+                    )
+                )
+                or None
+            ),
+
+        "portal_page_sha256":
+            (
+                normalize_text(
+                    snapshot.get(
+                        "page_sha256"
+                    )
+                )
+                or None
+            ),
+
+        "portal_page_length":
+            int(
+                snapshot.get(
+                    "page_length"
+                )
+                or 0
+            ),
+
+        "portal_state_verified":
+            bool(
+                http_ok
+                and final_domain_ok
+            ),
+
+        "topic_identity_verified_live":
+            bool(identity_ok),
+
+        "external_execution_started":
+            False,
+
+        "external_submission_performed":
+            False,
+
+        "external_receipt_obtained":
+            False,
+
+        "verification_error":
+            (
+                normalize_text(
+                    snapshot.get(
+                        "error"
+                    )
+                )
+                or None
+            ),
+
+        "text_excerpt":
+            (
+                normalize_text(
+                    snapshot.get(
+                        "text_excerpt"
+                    )
+                )
+                or None
+            ),
+
+        "run_fingerprint":
+            run_fingerprint,
+
+        "verification_fingerprint":
+            verification_fingerprint,
+
+        "verification_payload":
+            verification_payload,
+
+        "run_payload":
+            run_basis,
+
+        "verified_at":
+            snapshot.get(
+                "verified_at"
+            ),
+
+        "completed_at":
+            now_iso(),
+
+        "created_at":
+            now_iso(),
+
+        "updated_at":
+            now_iso(),
     }
+
+
+    # ================================================================
+    # Persist
+    # ================================================================
 
     try:
         rpc_result = supabase.rpc(
             "persist_stage64_portal_preflight",
-            {"p_payload": payload},
+            {
+                "p_payload":
+                    payload
+            },
         ).execute()
+
 
         if not rpc_result.data:
             (
-                supabase.table("stage64_external_portal_preflight_runs")
+                supabase
+                .table(
+                    "stage64_external_portal_preflight_runs"
+                )
                 .insert(payload)
                 .execute()
             )
 
-        if outcome == "EXTERNAL_PREFLIGHT_READY":
+
+        if (
+            outcome
+            == "EXTERNAL_PREFLIGHT_READY"
+        ):
             st.success(
-                "Stage 64 auto-discovery and live verification passed — EXTERNAL_PREFLIGHT_READY."
+                "Stage 64 v1.3 passed — "
+                "EXTERNAL_PREFLIGHT_READY."
             )
+
         else:
             st.warning(
-                "Stage 64 completed fail-closed — NEEDS_PORTAL_VERIFICATION. "
+                "Stage 64 completed fail-closed — "
+                "NEEDS_PORTAL_VERIFICATION. "
                 "No external execution is authorized."
             )
+
+
         st.rerun()
+
 
     except Exception as exc:
         st.error(
             "Stage 64 persistence failed. "
-            f"{type(exc).__name__}: {str(exc)[:1800]}"
+            f"{type(exc).__name__}: "
+            f"{str(exc)[:1800]}"
         )
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # Outcome UI
-# ---------------------------------------------------------------------
+# =====================================================================
 
 existing_stage64 = load_existing_stage64()
 
+
 if existing_stage64:
+
     st.divider()
-    st.subheader("Stage 64 outcome")
+
+    st.subheader(
+        "Stage 64 outcome"
+    )
+
 
     o1, o2, o3, o4 = st.columns(4)
-    o1.metric("Outcome", existing_stage64.get("preflight_outcome"))
+
+
+    o1.metric(
+        "Outcome",
+        existing_stage64.get(
+            "preflight_outcome"
+        ),
+    )
+
+
     o2.metric(
         "Portal verified?",
-        "YES" if bool(existing_stage64.get("portal_state_verified")) else "NO",
+        (
+            "YES"
+            if bool(
+                existing_stage64.get(
+                    "portal_state_verified"
+                )
+            )
+            else "NO"
+        ),
     )
+
+
     o3.metric(
         "Topic identity?",
-        "YES" if bool(existing_stage64.get("topic_identity_verified_live")) else "NO",
+        (
+            "YES"
+            if bool(
+                existing_stage64.get(
+                    "topic_identity_verified_live"
+                )
+            )
+            else "NO"
+        ),
     )
+
+
     o4.metric(
         "Submitted?",
-        "YES" if bool(existing_stage64.get("external_submission_performed")) else "NO",
+        (
+            "YES"
+            if bool(
+                existing_stage64.get(
+                    "external_submission_performed"
+                )
+            )
+            else "NO"
+        ),
     )
 
-    st.write(f"**Run ID:** `{existing_stage64.get('id')}`")
-    st.write(f"**Portal URL:** `{existing_stage64.get('portal_final_url') or existing_stage64.get('portal_url')}`")
-    st.write(f"**HTTP status:** `{existing_stage64.get('portal_http_status')}`")
-    st.write(f"**Portal page SHA256:** `{existing_stage64.get('portal_page_sha256')}`")
-    st.write(f"**Verification fingerprint:** `{existing_stage64.get('verification_fingerprint')}`")
 
-    # Diagnostic: expose the exact persisted live checks that determined the outcome.
-    persisted_verification = as_dict(existing_stage64.get("verification_payload"))
-    persisted_live_checks = persisted_verification.get("live_checks", [])
-    if isinstance(persisted_live_checks, list) and persisted_live_checks:
-        st.markdown("### Stage 64 live verification checks")
-        st.dataframe(persisted_live_checks, use_container_width=True, hide_index=True)
+    st.write(
+        f"**Run ID:** "
+        f"`{existing_stage64.get('id')}`"
+    )
+
+    st.write(
+        f"**Portal URL:** "
+        f"`{existing_stage64.get('portal_final_url') or existing_stage64.get('portal_url')}`"
+    )
+
+    st.write(
+        f"**HTTP status:** "
+        f"`{existing_stage64.get('portal_http_status')}`"
+    )
+
+    st.write(
+        f"**Portal page SHA256:** "
+        f"`{existing_stage64.get('portal_page_sha256')}`"
+    )
+
+    st.write(
+        f"**Verification fingerprint:** "
+        f"`{existing_stage64.get('verification_fingerprint')}`"
+    )
+
+
+    # ================================================================
+    # Persisted diagnostics
+    # ================================================================
+
+    persisted_verification = as_dict(
+        existing_stage64.get(
+            "verification_payload"
+        )
+    )
+
+    persisted_live_checks = (
+        persisted_verification.get(
+            "live_checks",
+            [],
+        )
+    )
+
+
+    if (
+        isinstance(
+            persisted_live_checks,
+            list,
+        )
+        and persisted_live_checks
+    ):
+
+        st.markdown(
+            "### Stage 64 live verification checks"
+        )
+
+        st.dataframe(
+            persisted_live_checks,
+            use_container_width=True,
+            hide_index=True,
+        )
+
 
         failed_live_checks = [
-            c for c in persisted_live_checks
-            if isinstance(c, dict) and not bool(c.get("PASS"))
+            check
+            for check
+            in persisted_live_checks
+            if (
+                isinstance(
+                    check,
+                    dict,
+                )
+                and check.get(
+                    "Blocking",
+                    True,
+                )
+                and not bool(
+                    check.get("PASS")
+                )
+            )
         ]
+
+
+        diagnostic_failures = [
+            check
+            for check
+            in persisted_live_checks
+            if (
+                isinstance(
+                    check,
+                    dict,
+                )
+                and not check.get(
+                    "Blocking",
+                    True,
+                )
+                and not bool(
+                    check.get("PASS")
+                )
+            )
+        ]
+
+
         if failed_live_checks:
+
             st.error(
                 "Blocking live check(s): "
                 + "; ".join(
-                    f"{normalize_text(c.get('Check'))}: {normalize_text(c.get('Detail'))}"
-                    for c in failed_live_checks
+                    (
+                        f"{normalize_text(check.get('Check'))}: "
+                        f"{normalize_text(check.get('Detail'))}"
+                    )
+                    for check
+                    in failed_live_checks
                 )
             )
-        else:
-            st.success("All persisted Stage 64 live checks are PASS.")
-    else:
-        st.info("No persisted live_checks are available for this Stage 64 run.")
 
-    if normalize_text(existing_stage64.get("preflight_outcome")).upper() == "EXTERNAL_PREFLIGHT_READY":
-        st.success(
-            "Stage 64 EXTERNAL_PREFLIGHT_READY. The official topic was resolved automatically and the public portal page was verified read-only, "
-            "the locked opportunity identity matched, and no submission occurred. "
-            "A future Stage 65 may consume this preflight."
-        )
+        else:
+
+            st.success(
+                "All blocking Stage 64 "
+                "live checks are PASS."
+            )
+
+
+        if diagnostic_failures:
+
+            st.info(
+                "Non-blocking diagnostic(s): "
+                + "; ".join(
+                    (
+                        f"{normalize_text(check.get('Check'))}: "
+                        f"{normalize_text(check.get('Detail'))}"
+                    )
+                    for check
+                    in diagnostic_failures
+                )
+            )
+
+
     else:
-        st.warning(
-            "Stage 64 NEEDS_PORTAL_VERIFICATION. Do not proceed to external execution until the live official portal check passes."
+
+        st.info(
+            "No persisted live_checks are available "
+            "for this Stage 64 run."
         )
+
+
+    # ================================================================
+    # Final state
+    # ================================================================
+
+    if (
+        normalize_text(
+            existing_stage64.get(
+                "preflight_outcome"
+            )
+        ).upper()
+        == "EXTERNAL_PREFLIGHT_READY"
+    ):
+
+        st.success(
+            "Stage 64 EXTERNAL_PREFLIGHT_READY. "
+            "The official public portal is reachable, "
+            "the exact locked opportunity identity has "
+            "been verified through an accepted official "
+            "identity route, the deadline remains valid, "
+            "and no submission occurred. "
+            "Stage 65 may consume this preflight."
+        )
+
+    else:
+
+        st.warning(
+            "Stage 64 NEEDS_PORTAL_VERIFICATION. "
+            "Do not proceed to external execution "
+            "until all blocking official portal "
+            "verification checks pass."
+        )
+
+
+# =====================================================================
+# Invariant
+# =====================================================================
 
 st.caption(
-    "Invariantă Stage 64 v1.1: EXTERNAL_PREFLIGHT_READY requires official API/lock URL resolution plus read-only official-domain verification, "
-    "a captured portal-page SHA256, the locked opportunity identity found on the live page, and a valid deadline. "
+    "Invariantă Stage 64 v1.3: "
+    "EXTERNAL_PREFLIGHT_READY requires an official EU-domain "
+    "portal response, HTTP 200, captured portal-page SHA256, "
+    "exact locked opportunity identity verified through the "
+    "official API OR official portal URL/body, and a valid deadline. "
+    "An unavailable or non-exact Search API result is retained as "
+    "diagnostic provenance and cannot override an exact identity "
+    "independently established from the official portal. "
     "Stage 64 never logs in and never submits."
 )
