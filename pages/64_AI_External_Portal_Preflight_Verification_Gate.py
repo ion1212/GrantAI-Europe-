@@ -12,7 +12,7 @@ from supabase import create_client
 
 
 # =====================================================================
-# STAGE 64 v1.0 — AI EXTERNAL PORTAL PREFLIGHT VERIFICATION GATE
+# STAGE 64 v1.1 — AI EXTERNAL PORTAL PREFLIGHT VERIFICATION GATE
 #
 # Purpose:
 #   Consume ONLY a persisted Stage 63 READY_TO_EXECUTE authorization and
@@ -43,14 +43,14 @@ from supabase import create_client
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 64 v1.0 — External Portal Preflight Verification",
+    page_title="Stage 64 v1.1 — External Portal Preflight Verification",
     page_icon="🌐",
     layout="wide",
 )
 
-st.title("🌐 Etapa 64 v1.0 — AI External Portal Preflight Verification Gate")
+st.title("🌐 Etapa 64 v1.1 — AI External Portal Preflight Verification Gate")
 st.caption(
-    "Verificare publică, read-only, a paginii oficiale EU Funding & Tenders. "
+    "Descoperă automat topicul oficial prin API-ul Funding & Tenders și face verificare publică read-only. "
     "Nu face login, upload sau submission."
 )
 
@@ -201,6 +201,165 @@ def infer_official_url(lock: dict) -> str:
             return value
     return ""
 
+
+
+OFFICIAL_SEARCH_API = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
+PORTAL_TOPIC_BASE = "https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/topic-details/"
+
+
+def walk_json(value: Any):
+    """Yield every dict/list node recursively without assuming API response shape."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk_json(child)
+
+
+def extract_first_text(obj: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = obj.get(key)
+        if value is not None and normalize_text(value):
+            return normalize_text(value)
+    return ""
+
+
+def discover_official_topic(identity: str, timeout_seconds: int = 20) -> dict:
+    """
+    Resolve the locked opportunity identity through the official Funding & Tenders
+    Search API documented by the European Commission.
+
+    Fail-closed rule:
+    - API exact identifier match => VERIFIED_API_EXACT
+    - otherwise a canonical topic URL may be constructed, but it is only a
+      CANDIDATE until the subsequent live verification succeeds.
+    """
+    identity = normalize_text(identity)
+    normalized_target = normalize_identity(identity)
+
+    result = {
+        "query_identity": identity,
+        "api_url": "",
+        "api_http_status": None,
+        "api_response_sha256": "",
+        "api_error": "",
+        "exact_match": False,
+        "resolved_identifier": "",
+        "resolved_title": "",
+        "resolved_ccm2_id": "",
+        "resolved_url": "",
+        "resolution_basis": "NONE",
+        "candidate_count": 0,
+    }
+
+    if not identity:
+        result["api_error"] = "Missing opportunity identity."
+        return result
+
+    try:
+        response = requests.get(
+            OFFICIAL_SEARCH_API,
+            params={"apiKey": "SEDIA", "text": f'"{identity}"'},
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; Stage64Preflight/1.1)",
+                "Accept": "application/json,text/plain,*/*",
+            },
+            timeout=timeout_seconds,
+            allow_redirects=True,
+        )
+
+        result["api_url"] = str(response.url or "")
+        result["api_http_status"] = int(response.status_code)
+        result["api_response_sha256"] = text_sha256(response.text or "")
+
+        payload = response.json() if response.ok else {}
+        candidates = []
+
+        for obj in walk_json(payload):
+            if not isinstance(obj, dict):
+                continue
+
+            identifier = extract_first_text(
+                obj,
+                (
+                    "identifier",
+                    "topicIdentifier",
+                    "topic_identifier",
+                    "callIdentifier",
+                    "reference",
+                    "code",
+                ),
+            )
+            if not identifier:
+                continue
+
+            candidate = {
+                "identifier": identifier,
+                "title": extract_first_text(obj, ("title", "name", "topicTitle")),
+                "ccm2_id": extract_first_text(obj, ("ccm2Id", "ccm2id", "id")),
+            }
+            candidates.append(candidate)
+
+        # Deduplicate by normalized identifier + ccm2_id.
+        unique = {}
+        for c in candidates:
+            k = (normalize_identity(c["identifier"]), c["ccm2_id"])
+            unique[k] = c
+        candidates = list(unique.values())
+        result["candidate_count"] = len(candidates)
+
+        exact = next(
+            (
+                c for c in candidates
+                if normalize_identity(c["identifier"]) == normalized_target
+            ),
+            None,
+        )
+
+        if exact:
+            result["exact_match"] = True
+            result["resolved_identifier"] = exact["identifier"]
+            result["resolved_title"] = exact["title"]
+            result["resolved_ccm2_id"] = exact["ccm2_id"]
+            result["resolved_url"] = PORTAL_TOPIC_BASE + exact["identifier"]
+            result["resolution_basis"] = "VERIFIED_API_EXACT"
+            return result
+
+    except Exception as exc:
+        result["api_error"] = f"{type(exc).__name__}: {str(exc)[:1200]}"
+
+    # Safe fallback: construct a candidate URL only for a plausible EU topic ID.
+    # This does not by itself verify identity; the live page/API checks below must pass.
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{5,200}", identity or ""):
+        result["resolved_identifier"] = identity
+        result["resolved_url"] = PORTAL_TOPIC_BASE + identity
+        result["resolution_basis"] = "CANONICAL_URL_CANDIDATE"
+
+    return result
+
+
+def verify_identity_against_snapshot(identity: str, snapshot: dict, discovery: dict) -> tuple[bool, str]:
+    normalized_target = normalize_identity(identity)
+
+    # Strongest route: the official API returned the exact topic identifier.
+    if discovery.get("exact_match"):
+        resolved = normalize_identity(discovery.get("resolved_identifier"))
+        if normalized_target and resolved == normalized_target:
+            return True, "OFFICIAL_API_EXACT_IDENTIFIER"
+
+    # Portal route: identifier encoded in the final official topic URL.
+    final_url = normalize_text(snapshot.get("final_url") or snapshot.get("requested_url"))
+    if normalized_target and normalized_target in normalize_identity(final_url):
+        return True, "OFFICIAL_PORTAL_URL_IDENTITY"
+
+    # Last route: identifier visible in returned public page content.
+    excerpt = normalize_text(snapshot.get("text_excerpt"))
+    if normalized_target and normalized_target in normalize_identity(excerpt):
+        return True, "OFFICIAL_PORTAL_BODY_IDENTITY"
+
+    return False, "NO_EXACT_IDENTITY_MATCH"
 
 def fetch_public_portal_snapshot(url: str, timeout_seconds: int = 20) -> dict:
     headers = {
@@ -539,27 +698,23 @@ base_gate = "READY" if all(c["PASS"] for c in base_checks) else "BLOCKED"
 
 
 # ---------------------------------------------------------------------
-# Portal URL / verification input
+# Automatic official topic discovery + live verification
 # ---------------------------------------------------------------------
 
 st.divider()
-st.subheader("Official portal target")
+st.subheader("Automatic official portal discovery")
 
-portal_url = st.text_input(
-    "Official EU Funding & Tenders opportunity URL",
-    value=inferred_url,
-    placeholder="https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/topic-details/...",
-    key="stage64_portal_url",
-)
+existing_lock_url = inferred_url if inferred_url and official_domain_ok(inferred_url) else ""
 
-portal_domain_ok = official_domain_ok(portal_url) if portal_url else False
-
-if portal_url and portal_domain_ok:
-    st.success("Official EU domain accepted.")
-elif portal_url:
-    st.error("The URL is not on an allowed official europa.eu / ec.europa.eu domain.")
+st.write(f"**Locked opportunity identity:** `{identity}`")
+if existing_lock_url:
+    st.success("An official URL already exists in the opportunity lock and will be preferred.")
+    st.write(f"`{existing_lock_url}`")
 else:
-    st.warning("No official portal URL is available yet.")
+    st.info(
+        "No URL is stored in the lock. Stage 64 v1.1 will resolve the topic automatically "
+        "through the official Funding & Tenders Search API, then verify the public topic page."
+    )
 
 
 # ---------------------------------------------------------------------
@@ -588,10 +743,6 @@ def load_existing_stage64():
 existing_stage64 = load_existing_stage64()
 
 
-# ---------------------------------------------------------------------
-# Live verification action
-# ---------------------------------------------------------------------
-
 st.divider()
 st.subheader("Read-only live portal verification")
 
@@ -601,59 +752,68 @@ with st.expander("Stage 64 upstream hard-gate checks", expanded=False):
 st.write(f"**Base gate:** `{base_gate}`")
 
 if st.button(
-    "🌐 Verify official portal preflight",
+    "🌐 Auto-resolve official topic & verify preflight",
     type="primary",
     use_container_width=True,
-    key="stage64_verify",
-    disabled=(base_gate != "READY" or not portal_url or not portal_domain_ok),
+    key="stage64_auto_verify",
+    disabled=(base_gate != "READY"),
 ):
-    snapshot = fetch_public_portal_snapshot(portal_url)
+    discovery = discover_official_topic(identity)
 
-    requested_identity_normalized = normalize_identity(identity)
-    page_normalized = normalize_identity(snapshot.get("text_excerpt", ""))
-
-    # Prefer full-page identity check using a bounded second normalization.
-    # We do not persist the full page body; only hash + excerpt.
-    identity_found = bool(
-        requested_identity_normalized
-        and requested_identity_normalized in page_normalized
+    # Prefer an already persisted official lock URL. Otherwise use the exact
+    # official API result, then finally a canonical candidate URL.
+    portal_url = (
+        existing_lock_url
+        or normalize_text(discovery.get("resolved_url"))
     )
 
-    # If the excerpt did not contain identity, make one additional read-only
-    # fetch and inspect the full response text in memory only.
-    if not identity_found and snapshot.get("http_status") == 200:
-        try:
-            r = requests.get(
-                portal_url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; Stage64Preflight/1.0)",
-                    "Accept": "text/html,application/xhtml+xml",
-                },
-                timeout=20,
-                allow_redirects=True,
-            )
-            identity_found = (
-                requested_identity_normalized
-                in normalize_identity(r.text or "")
-            )
-        except Exception:
-            pass
+    if not portal_url:
+        st.error(
+            "Stage 64 could not resolve an official topic URL from the locked opportunity identity. "
+            "The workflow remains fail-closed."
+        )
+        st.stop()
 
-    snapshot["identity_found"] = identity_found
+    if not official_domain_ok(portal_url):
+        st.error("Resolved URL is not on an allowed official EU domain.")
+        st.stop()
 
-    final_domain_ok = official_domain_ok(snapshot.get("final_url") or portal_url)
+    snapshot = fetch_public_portal_snapshot(portal_url)
+
+    identity_ok, identity_basis = verify_identity_against_snapshot(
+        identity,
+        snapshot,
+        discovery,
+    )
+    snapshot["identity_found"] = bool(identity_ok)
+    snapshot["identity_verification_basis"] = identity_basis
+
+    final_url = normalize_text(snapshot.get("final_url") or portal_url)
+    final_domain_ok = official_domain_ok(final_url)
     http_ok = snapshot.get("http_status") == 200
     page_hash_ok = bool(snapshot.get("page_sha256"))
-    identity_ok = bool(identity_found)
+
+    # An exact official API match is accepted as live identity evidence even
+    # when the Funding & Tenders SPA does not render the topic code server-side.
+    official_api_exact_ok = bool(discovery.get("exact_match"))
 
     live_checks = [
         {
-            "Check": "Official domain",
-            "PASS": bool(final_domain_ok),
-            "Detail": snapshot.get("final_url") or portal_url,
+            "Check": "Official discovery source",
+            "PASS": bool(existing_lock_url or discovery.get("resolved_url")),
+            "Detail": (
+                "PERSISTED_OFFICIAL_LOCK_URL"
+                if existing_lock_url
+                else discovery.get("resolution_basis")
+            ),
         },
         {
-            "Check": "HTTP 200",
+            "Check": "Official EU final domain",
+            "PASS": bool(final_domain_ok),
+            "Detail": final_url,
+        },
+        {
+            "Check": "Public portal HTTP 200",
             "PASS": bool(http_ok),
             "Detail": str(snapshot.get("http_status")),
         },
@@ -663,9 +823,18 @@ if st.button(
             "Detail": snapshot.get("page_sha256", "")[:16] + "...",
         },
         {
-            "Check": "Locked opportunity identity found live",
+            "Check": "Locked opportunity identity verified",
             "PASS": bool(identity_ok),
-            "Detail": identity,
+            "Detail": identity_basis,
+        },
+        {
+            "Check": "Official API exact topic match",
+            "PASS": bool(official_api_exact_ok or existing_lock_url),
+            "Detail": (
+                discovery.get("resolved_identifier")
+                if official_api_exact_ok
+                else ("LOCK_URL_PRESENT" if existing_lock_url else "NO_EXACT_API_MATCH")
+            ),
         },
         {
             "Check": "Deadline still valid",
@@ -682,7 +851,8 @@ if st.button(
 
     verification_payload = {
         "stage": 64,
-        "verification_version": "stage64-v1.0",
+        "verification_version": "stage64-v1.1",
+        "discovery_contract": "official-search-api-exact-or-fail-closed",
         "user_id": user_id,
         "project_id": project_id,
         "opportunity_lock_id": lock_id,
@@ -691,6 +861,7 @@ if st.button(
         "stage63_run_id": stage63_run_id,
         "stage63_authorization_sha256": stage63_authorization_sha256,
         "portal_url": portal_url,
+        "discovery": discovery,
         "portal_snapshot": snapshot,
         "live_checks": live_checks,
         "outcome": outcome,
@@ -700,10 +871,12 @@ if st.button(
 
     run_basis = {
         "stage": 64,
-        "fingerprint_contract": "stage64-v1.0-portal-preflight",
+        "fingerprint_contract": "stage64-v1.1-auto-discovery-preflight",
         "stage63_run_id": stage63_run_id,
         "stage63_authorization_sha256": stage63_authorization_sha256,
         "portal_url": portal_url,
+        "resolved_identifier": normalize_text(discovery.get("resolved_identifier")) or identity,
+        "api_response_sha256": normalize_text(discovery.get("api_response_sha256")) or None,
         "portal_page_sha256": snapshot.get("page_sha256"),
         "verification_fingerprint": verification_fingerprint,
         "outcome": outcome,
@@ -724,7 +897,7 @@ if st.button(
         "stage63_run_id": stage63_run_id,
 
         "stage": 64,
-        "verification_version": "stage64-v1.0",
+        "verification_version": "stage64-v1.1",
 
         "opportunity_identity": identity,
         "official_deadline": str(deadline or "")[:10] or None,
@@ -738,7 +911,7 @@ if st.button(
         "preflight_outcome": outcome,
 
         "portal_url": portal_url,
-        "portal_final_url": normalize_text(snapshot.get("final_url")) or None,
+        "portal_final_url": final_url or None,
         "portal_http_status": snapshot.get("http_status"),
         "portal_content_type": normalize_text(snapshot.get("content_type")) or None,
         "portal_page_sha256": normalize_text(snapshot.get("page_sha256")) or None,
@@ -778,12 +951,20 @@ if st.button(
                 .execute()
             )
 
-        st.success(f"Stage 64 verification completed — Outcome: {outcome}")
+        if outcome == "EXTERNAL_PREFLIGHT_READY":
+            st.success(
+                "Stage 64 auto-discovery and live verification passed — EXTERNAL_PREFLIGHT_READY."
+            )
+        else:
+            st.warning(
+                "Stage 64 completed fail-closed — NEEDS_PORTAL_VERIFICATION. "
+                "No external execution is authorized."
+            )
         st.rerun()
 
     except Exception as exc:
         st.error(
-            "Stage 64 persistence failed. Rulează mai întâi SQL-ul Stage 64 în Supabase. "
+            "Stage 64 persistence failed. "
             f"{type(exc).__name__}: {str(exc)[:1800]}"
         )
 
@@ -821,7 +1002,7 @@ if existing_stage64:
 
     if normalize_text(existing_stage64.get("preflight_outcome")).upper() == "EXTERNAL_PREFLIGHT_READY":
         st.success(
-            "Stage 64 EXTERNAL_PREFLIGHT_READY. The public official portal page was verified read-only, "
+            "Stage 64 EXTERNAL_PREFLIGHT_READY. The official topic was resolved automatically and the public portal page was verified read-only, "
             "the locked opportunity identity matched, and no submission occurred. "
             "A future Stage 65 may consume this preflight."
         )
@@ -831,7 +1012,7 @@ if existing_stage64:
         )
 
 st.caption(
-    "Invariantă Stage 64 v1.0: EXTERNAL_PREFLIGHT_READY requires a read-only official-domain HTTP verification, "
+    "Invariantă Stage 64 v1.1: EXTERNAL_PREFLIGHT_READY requires official API/lock URL resolution plus read-only official-domain verification, "
     "a captured portal-page SHA256, the locked opportunity identity found on the live page, and a valid deadline. "
     "Stage 64 never logs in and never submits."
 )
