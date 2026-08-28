@@ -1000,6 +1000,30 @@ if existing_stage64:
     st.write(f"**Portal page SHA256:** `{existing_stage64.get('portal_page_sha256')}`")
     st.write(f"**Verification fingerprint:** `{existing_stage64.get('verification_fingerprint')}`")
 
+    # Diagnostic: expose the exact persisted live checks that determined the outcome.
+    persisted_verification = as_dict(existing_stage64.get("verification_payload"))
+    persisted_live_checks = persisted_verification.get("live_checks", [])
+    if isinstance(persisted_live_checks, list) and persisted_live_checks:
+        st.markdown("### Stage 64 live verification checks")
+        st.dataframe(persisted_live_checks, use_container_width=True, hide_index=True)
+
+        failed_live_checks = [
+            c for c in persisted_live_checks
+            if isinstance(c, dict) and not bool(c.get("PASS"))
+        ]
+        if failed_live_checks:
+            st.error(
+                "Blocking live check(s): "
+                + "; ".join(
+                    f"{normalize_text(c.get('Check'))}: {normalize_text(c.get('Detail'))}"
+                    for c in failed_live_checks
+                )
+            )
+        else:
+            st.success("All persisted Stage 64 live checks are PASS.")
+    else:
+        st.info("No persisted live_checks are available for this Stage 64 run.")
+
     if normalize_text(existing_stage64.get("preflight_outcome")).upper() == "EXTERNAL_PREFLIGHT_READY":
         st.success(
             "Stage 64 EXTERNAL_PREFLIGHT_READY. The official topic was resolved automatically and the public portal page was verified read-only, "
