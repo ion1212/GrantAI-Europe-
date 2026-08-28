@@ -10,7 +10,7 @@ from supabase import create_client
 
 
 # =====================================================================
-# STAGE 57 v1.0 — AI POST-UPDATE EVIDENCE REVALIDATION GATE
+# STAGE 57 v1.1 — AI POST-UPDATE EVIDENCE REVALIDATION GATE
 #
 # Purpose:
 #   Consume ONLY a persisted Stage 56 corrected draft and re-audit it
@@ -44,12 +44,12 @@ from supabase import create_client
 # =====================================================================
 
 st.set_page_config(
-    page_title="Stage 57 v1.0 — Post-Update Evidence Revalidation",
+    page_title="Stage 57 v1.1 — Post-Update Evidence Revalidation",
     page_icon="🔁",
     layout="wide",
 )
 
-st.title("🔁 Etapa 57 v1.0 — AI Post-Update Evidence Revalidation Gate")
+st.title("🔁 Etapa 57 v1.1 — AI Post-Update Evidence Revalidation Gate")
 st.caption(
     "Etapa 57 reauditează draftul corectat Stage 56. "
     "Nu permite ca afirmațiile respinse să reapară și nu transformă lipsa dovezilor în fapte confirmate."
@@ -365,7 +365,120 @@ stage52_candidates = rows(
 ) if stage52_run_id else []
 stage52 = next((r for r in stage52_candidates if str(r.get("id") or "") == stage52_run_id), None)
 
-source_registry = as_dict(stage52.get("source_registry")) if stage52 else {}
+base_source_registry = as_dict(stage52.get("source_registry")) if stage52 else {}
+
+# ---------------------------------------------------------------------
+# Optional Stage 58 re-audit handoff
+# ---------------------------------------------------------------------
+# Stage 58 points to the PRIOR Stage 57 run whose NEEDS_EVIDENCE claims
+# were resolved. Stage 57 v1.1 must never delete or overwrite that prior
+# audit trail. Instead, a READY_FOR_STAGE57_REAUDIT Stage 58 run creates
+# a NEW Stage 57 fingerprint/run generation.
+
+stage58_candidates = rows(
+    "stage58_evidence_gap_resolution_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+        "stage56_run_id": stage56_run_id,
+    },
+    "created_at",
+    100,
+)
+
+stage58 = next(
+    (
+        r for r in stage58_candidates
+        if normalize_text(r.get("run_status")).upper() == "COMPLETED"
+        and normalize_text(r.get("resolution_outcome")).upper() == "READY_FOR_STAGE57_REAUDIT"
+        and normalize_text(r.get("result_fingerprint"))
+    ),
+    None,
+)
+
+if stage58:
+    stage58_run_id = str(stage58.get("id") or "")
+    parent_stage57_run_id = str(stage58.get("stage57_run_id") or "")
+    stage58_result_fingerprint = normalize_text(stage58.get("result_fingerprint"))
+    stage58_result_payload = as_dict(stage58.get("result_payload"))
+    recomputed_stage58_result_fingerprint = (
+        stable_sha256(stage58_result_payload) if stage58_result_payload else ""
+    )
+    stage58_resolution_outcome = normalize_text(stage58.get("resolution_outcome")).upper()
+    stage58_items = rows(
+        "stage58_evidence_gap_resolution_items",
+        {
+            "user_id": user_id,
+            "project_id": project_id,
+            "opportunity_lock_id": lock_id,
+            "stage58_run_id": stage58_run_id,
+        },
+        "claim_no",
+        5000,
+    )
+else:
+    stage58_run_id = ""
+    parent_stage57_run_id = ""
+    stage58_result_fingerprint = ""
+    stage58_result_payload = {}
+    recomputed_stage58_result_fingerprint = ""
+    stage58_resolution_outcome = "NONE"
+    stage58_items = []
+
+# Build an effective registry for this Stage 57 generation.
+# Persisted Stage 52 source IDs are retained. Stage 58 user-provided
+# evidence is added as traceable synthetic source entries using the exact
+# user58:* IDs that Stage 58 persisted.
+effective_source_registry = dict(base_source_registry)
+
+for item in stage58_items:
+    if normalize_text(item.get("resolution_status")).upper() != "RESOLVED":
+        continue
+
+    basis = normalize_text(item.get("resolution_basis")).upper()
+    for source_id in as_list(item.get("resolved_source_ids")):
+        source_id = normalize_text(source_id)
+        if not source_id:
+            continue
+
+        if source_id in effective_source_registry:
+            # Existing Stage 52 source; keep the canonical record.
+            continue
+
+        if basis == "USER_PROVIDED_EVIDENCE" and source_id.startswith("user58:"):
+            effective_source_registry[source_id] = {
+                "source_id": source_id,
+                "source_type": "USER_PROVIDED_EVIDENCE",
+                "stage": 58,
+                "stage58_run_id": stage58_run_id,
+                "stage58_item_id": str(item.get("id") or ""),
+                "section_key": normalize_text(item.get("section_key")),
+                "claim_no": int(item.get("claim_no") or 0),
+                "claim_text": normalize_text(item.get("claim_text")),
+                "evidence_label": normalize_text(item.get("user_evidence_label")),
+                "confirmed_value": normalize_text(item.get("resolution_value")),
+                "provenance_note": normalize_text(item.get("resolution_note")),
+                "resolution_basis": basis,
+            }
+
+# Stage 58 resolutions are supplied separately to the auditor as a
+# downstream evidence-resolution overlay. They do not rewrite Stage 55.
+stage58_resolution_overlay = [
+    {
+        "stage58_item_id": str(item.get("id") or ""),
+        "section_key": normalize_text(item.get("section_key")),
+        "claim_no": int(item.get("claim_no") or 0),
+        "claim_text": normalize_text(item.get("claim_text")),
+        "resolution_status": normalize_text(item.get("resolution_status")).upper(),
+        "resolution_basis": normalize_text(item.get("resolution_basis")).upper(),
+        "resolved_source_ids": as_list(item.get("resolved_source_ids")),
+        "resolution_value": normalize_text(item.get("resolution_value")),
+        "resolution_note": normalize_text(item.get("resolution_note")),
+        "requires_draft_update": bool(item.get("requires_draft_update")),
+    }
+    for item in stage58_items
+]
 
 
 # ---------------------------------------------------------------------
@@ -504,6 +617,32 @@ add_check(
     f"open={len(stage55_open)}",
 )
 
+if stage58:
+    add_check(
+        "Stage 58 READY_FOR_STAGE57_REAUDIT",
+        stage58_resolution_outcome == "READY_FOR_STAGE57_REAUDIT",
+        stage58_resolution_outcome,
+    )
+    add_check(
+        "Stage 58 result fingerprint stable",
+        bool(stage58_result_fingerprint)
+        and stage58_result_fingerprint == recomputed_stage58_result_fingerprint,
+        f"stored={stage58_result_fingerprint[:16]}..., recomputed={recomputed_stage58_result_fingerprint[:16]}...",
+    )
+    add_check(
+        "Stage 58 has zero open gaps",
+        all(
+            normalize_text(i.get("resolution_status")).upper() != "OPEN"
+            for i in stage58_items
+        ),
+        f"items={len(stage58_items)}",
+    )
+    add_check(
+        "Stage 58 requires no draft update",
+        not any(bool(i.get("requires_draft_update")) for i in stage58_items),
+        f"requires_update={sum(1 for i in stage58_items if bool(i.get('requires_draft_update')))}",
+    )
+
 add_check(
     "Stage 54 bound run exists",
     bool(stage54),
@@ -550,7 +689,7 @@ gate_reason = (
 
 run_basis = {
     "stage": 57,
-    "fingerprint_contract": "stage57-v1.0-stable",
+    "fingerprint_contract": "stage57-v1.1-stage58-reaudit",
     "user_id": user_id,
     "project_id": project_id,
     "opportunity_lock_id": lock_id,
@@ -561,11 +700,14 @@ run_basis = {
     "stage54_run_id": stage54_run_id,
     "stage55_run_id": stage55_run_id,
     "stage56_run_id": stage56_run_id,
+    "parent_stage57_run_id": parent_stage57_run_id or None,
+    "stage58_run_id": stage58_run_id or None,
 
     "stage54_readiness_fingerprint": stored_stage54_fingerprint,
     "stage55_resolution_fingerprint": stored_stage55_resolution_fingerprint,
     "stage56_run_fingerprint": stage56_run_fingerprint,
     "stage56_update_fingerprint": stage56_update_fingerprint,
+    "stage58_result_fingerprint": stage58_result_fingerprint or None,
 
     "corrected_inventory": [
         {
@@ -592,7 +734,10 @@ run_basis = {
         for i in stage55_items
     ],
 
-    "source_registry_fingerprint": stable_sha256(source_registry),
+    "source_registry_fingerprint": stable_sha256(effective_source_registry),
+    "stage58_resolution_overlay_fingerprint": (
+        stable_sha256(stage58_resolution_overlay) if stage58_resolution_overlay else None
+    ),
     "stage57_gate": stage57_gate,
 }
 
@@ -616,10 +761,10 @@ def audit_corrected_section(corrected_row: dict, section_resolutions: list) -> d
 
     rules = (
         "You are a fail-closed evidence auditor for a corrected Horizon Europe proposal draft. "
-        "Audit ONLY the provided corrected text against the provided persisted source registry and persisted Stage 55 resolutions. "
+        "Audit ONLY the provided corrected text against the provided effective source registry, persisted Stage 55 resolutions, and any Stage 58 evidence-resolution overlay. "
         "Do not infer missing facts. "
         "Every factual claim must be classified as SUPPORTED, NEEDS_EVIDENCE, CONTRADICTED, or RESOLUTION_COMPLIANT. "
-        "SUPPORTED requires one or more exact valid source_ids from the provided source registry. "
+        "SUPPORTED requires one or more exact valid source_ids from the effective source registry. Stage 58 user-provided evidence may support only the exact factual value it records and must not be expanded into broader eligibility, consortium, financial, or technical conclusions. "
         "RESOLUTION_COMPLIANT is allowed only when the claim is directly constrained by a Stage 55 CONFIRMED/REJECTED/REMOVED resolution. "
         "A REJECTED or REMOVED claim may not reappear as a positive factual assertion. "
         "If it reappears positively, classify CONTRADICTED with violation_type=REJECTED_FACT_REINTRODUCED. "
@@ -633,7 +778,11 @@ def audit_corrected_section(corrected_row: dict, section_resolutions: list) -> d
         "section_key": corrected_row.get("section_key"),
         "section_title": corrected_row.get("section_title"),
         "corrected_text": corrected_text,
-        "source_registry": source_registry,
+        "source_registry": effective_source_registry,
+        "stage58_resolution_overlay": [
+            r for r in stage58_resolution_overlay
+            if normalize_text(r.get("section_key")) == normalize_text(corrected_row.get("section_key"))
+        ],
         "stage55_resolutions": [
             {
                 "claim_no": int(r.get("claim_no") or 0),
@@ -714,7 +863,7 @@ def audit_corrected_section(corrected_row: dict, section_resolutions: list) -> d
         if classification not in valid_classifications:
             classification = "NEEDS_EVIDENCE"
 
-        source_ids = [sid for sid in as_list(claim.get("source_ids")) if sid in source_registry]
+        source_ids = [sid for sid in as_list(claim.get("source_ids")) if sid in effective_source_registry]
 
         if classification == "SUPPORTED" and not source_ids:
             classification = "NEEDS_EVIDENCE"
@@ -789,9 +938,13 @@ def initialize_stage57():
         "stage54_run_id": stage54_run_id,
         "stage55_run_id": stage55_run_id,
         "stage56_run_id": stage56_run_id,
+        "parent_stage57_run_id": parent_stage57_run_id or None,
+        "stage58_run_id": stage58_run_id or None,
+        "stage58_result_fingerprint": stage58_result_fingerprint or None,
+        "revalidation_generation": 1 if stage58 else 0,
 
         "stage": 57,
-        "validator_version": "stage57-v1.0",
+        "validator_version": "stage57-v1.1",
 
         "opportunity_identity": identity,
         "official_deadline": str(deadline or "")[:10] or None,
@@ -813,7 +966,7 @@ def initialize_stage57():
         "resolution_compliant_claims": 0,
 
         "run_fingerprint": stage57_run_fingerprint,
-        "source_registry": source_registry,
+        "source_registry": effective_source_registry,
         "run_payload": run_basis,
 
         "initialized_at": now_iso(),
@@ -898,14 +1051,22 @@ def persist_section_audit(run_id: str, corrected_row: dict, result: dict):
 
     item_id = item_row["id"]
 
-    (
+    # IMPORTANT: do not delete prior claim rows.
+    # Stage 58 may hold foreign keys to them. Preserve IDs and update
+    # matching claim numbers in place; insert only genuinely new claims.
+    existing_claim_rows = (
         supabase.table("stage57_claim_audits")
-        .delete()
+        .select("*")
         .eq("user_id", user_id)
         .eq("stage57_run_id", run_id)
         .eq("stage57_revalidation_item_id", item_id)
         .execute()
-    )
+    ).data or []
+
+    existing_claims_by_no = {
+        int(row.get("claim_no") or 0): row
+        for row in existing_claim_rows
+    }
 
     for claim in result["claims"]:
         claim_payload = {
@@ -931,7 +1092,21 @@ def persist_section_audit(run_id: str, corrected_row: dict, result: dict):
             "created_at": now_iso(),
             "updated_at": now_iso(),
         }
-        supabase.table("stage57_claim_audits").insert(claim_payload).execute()
+        existing_claim = existing_claims_by_no.get(int(claim["claim_no"]))
+
+        if existing_claim:
+            update_payload = dict(claim_payload)
+            update_payload.pop("created_at", None)
+
+            (
+                supabase.table("stage57_claim_audits")
+                .update(update_payload)
+                .eq("id", existing_claim["id"])
+                .eq("user_id", user_id)
+                .execute()
+            )
+        else:
+            supabase.table("stage57_claim_audits").insert(claim_payload).execute()
 
     return item_row
 
@@ -1064,7 +1239,7 @@ st.subheader("Stage 57 execution gate")
 g1, g2, g3 = st.columns(3)
 g1.metric("Gate", stage57_gate)
 g2.metric("Checks passed", f"{sum(1 for c in checks if c['PASS'])}/{len(checks)}")
-g3.metric("Evidence sources", len(source_registry))
+g3.metric("Evidence sources", len(effective_source_registry))
 
 if stage57_gate == "READY":
     st.success("Etapa 57: READY. Post-update evidence revalidation poate începe.")
@@ -1073,6 +1248,15 @@ else:
 
 st.write(f"**Reason:** {gate_reason}")
 st.code(stage57_run_fingerprint, language=None)
+
+if stage58:
+    st.success(
+        f"Stage 58 handoff detected — Run ID: {stage58_run_id} — "
+        f"READY_FOR_STAGE57_REAUDIT. A new Stage 57 generation is used; "
+        f"the prior Stage 57 audit remains immutable."
+    )
+    st.write(f"**Parent Stage 57 run:** `{parent_stage57_run_id}`")
+    st.write(f"**Stage 58 result fingerprint:** `{stage58_result_fingerprint}`")
 
 st.divider()
 st.subheader("Stage 57 persistence")
@@ -1086,7 +1270,11 @@ else:
     st.info("Inițializează Stage 57 înainte de revalidare.")
 
 if st.button(
-    "🔁 Initialize Stage 57 revalidation",
+    (
+        "🔁 Initialize Stage 57 re-audit after Stage 58"
+        if stage58
+        else "🔁 Initialize Stage 57 revalidation"
+    ),
     type="primary",
     use_container_width=True,
     key="stage57_initialize",
@@ -1250,8 +1438,8 @@ if existing_stage57:
 
     if global_verdict == "PASS":
         st.success(
-            "Stage 57 PASS. Corrected draft is revalidated and may be handed to Stage 58 "
-            "for submission-readiness finalization."
+            "Stage 57 PASS. Corrected draft is revalidated after all applicable evidence overlays "
+            "and may be handed to Stage 59 for submission-readiness finalization."
         )
     elif global_verdict == "NEEDS_EVIDENCE":
         st.warning(
@@ -1267,7 +1455,7 @@ if existing_stage57:
         st.info("Stage 57 is still in progress.")
 
 st.caption(
-    "Invariantă Stage 57 v1.0: SUPPORTED necesită source_id valid; REJECTED/REMOVED nu pot reapărea "
-    "ca fapte pozitive; CONFIRMED nu poate fi extins peste valoarea persistată; orice contradicție "
-    "produce FAIL. Stage 58 este permis numai după verdictul corespunzător."
+    "Invariantă Stage 57 v1.1: auditurile anterioare sunt append-only; Stage 58 nu poate fi pierdut prin DELETE; "
+    "SUPPORTED necesită source_id valid din registrul efectiv; user-provided evidence susține numai valoarea exactă "
+    "declarată; REJECTED/REMOVED nu pot reapărea ca fapte pozitive; orice contradicție produce FAIL."
 )
