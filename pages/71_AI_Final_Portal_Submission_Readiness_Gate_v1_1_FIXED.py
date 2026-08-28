@@ -10,7 +10,7 @@ from supabase import create_client
 
 
 # =====================================================================
-# STAGE 71 v1.0 — AI FINAL PORTAL SUBMISSION READINESS GATE
+# STAGE 71 v1.4 — AI FINAL PORTAL SUBMISSION READINESS GATE
 #
 # Purpose:
 #   Consume ONLY Stage 70 PORTAL_POST_UPLOAD_VALIDATED and establish
@@ -56,12 +56,12 @@ from supabase import create_client
 
 
 st.set_page_config(
-    page_title="Stage 71 v1.3 — Final Portal Submission Readiness",
+    page_title="Stage 71 v1.4 — Final Portal Submission Readiness",
     page_icon="✅",
     layout="wide",
 )
 
-st.title("✅ Etapa 71 v1.0 — AI Final Portal Submission Readiness Gate")
+st.title("✅ Etapa 71 v1.4 — AI Final Portal Submission Readiness Gate")
 st.caption(
     "Ultimul control de readiness înainte de o eventuală etapă separată de autorizare explicită a trimiterii. "
     "Stage 71 NU apasă Submit și NU trimite propunerea."
@@ -291,9 +291,10 @@ st.write(f"**Lock ID:** `{lock_id}`")
 
 
 # ---------------------------------------------------------------------
-# Stage 70
+# Stage 70 + deterministic upstream fallback resolution
 # ---------------------------------------------------------------------
 
+# Candidate sets for the same exact user/project/opportunity lock.
 stage70_candidates = rows(
     "stage70_post_upload_portal_validation_runs",
     {
@@ -305,18 +306,88 @@ stage70_candidates = rows(
     100,
 )
 
-stage70 = next(
-    (
-        r for r in stage70_candidates
-        if normalize_text(r.get("run_status")).upper() == "COMPLETED"
-        and normalize_text(r.get("validation_outcome")).upper() == "PORTAL_POST_UPLOAD_VALIDATED"
+stage69_candidates = rows(
+    "stage69_portal_upload_confirmation_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    100,
+)
+
+stage68_candidates = rows(
+    "stage68_upload_package_preparation_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    100,
+)
+
+stage67_candidates = rows(
+    "stage67_portal_draft_binding_runs",
+    {
+        "user_id": user_id,
+        "project_id": project_id,
+        "opportunity_lock_id": lock_id,
+    },
+    "created_at",
+    100,
+)
+
+
+def valid_stage70_row(r: dict) -> bool:
+    return (
+        normalize_text(r.get("run_status")).upper() == "COMPLETED"
+        and normalize_text(r.get("validation_outcome")).upper()
+        == "PORTAL_POST_UPLOAD_VALIDATED"
         and bool(r.get("portal_upload_performed"))
         and not bool(r.get("external_submission_performed"))
         and not bool(r.get("external_receipt_obtained"))
         and not bool(r.get("blocking_errors_present"))
-    ),
-    None,
-)
+    )
+
+
+def valid_stage69_row(r: dict) -> bool:
+    return (
+        normalize_text(r.get("run_status")).upper() == "COMPLETED"
+        and normalize_text(r.get("upload_outcome")).upper()
+        == "PORTAL_UPLOAD_CONFIRMED"
+        and bool(r.get("portal_upload_performed"))
+        and not bool(r.get("external_submission_performed"))
+        and not bool(r.get("external_receipt_obtained"))
+    )
+
+
+def valid_stage68_row(r: dict) -> bool:
+    return (
+        normalize_text(r.get("run_status")).upper() == "COMPLETED"
+        and normalize_text(r.get("preparation_outcome")).upper()
+        == "UPLOAD_PACKAGE_READY"
+        and not bool(r.get("portal_upload_performed"))
+        and not bool(r.get("external_submission_performed"))
+        and not bool(r.get("external_receipt_obtained"))
+    )
+
+
+def valid_stage67_row(r: dict) -> bool:
+    return (
+        normalize_text(r.get("run_status")).upper() == "COMPLETED"
+        and normalize_text(r.get("binding_outcome")).upper()
+        == "PORTAL_DRAFT_BOUND"
+        and bool(r.get("draft_bound"))
+        and bool(r.get("portal_session_established"))
+        and not bool(r.get("external_submission_performed"))
+        and not bool(r.get("external_receipt_obtained"))
+    )
+
+
+# Resolve Stage 70 directly from its own table.
+stage70 = next((r for r in stage70_candidates if valid_stage70_row(r)), None)
 
 if stage70:
     stage70_run_id = str(stage70.get("id") or "")
@@ -357,16 +428,22 @@ else:
     stage70_draft_title = ""
     stage70_current_portal_url = ""
 
-    stage69_run_id = stage68_run_id = stage67_run_id = stage66_run_id = ""
-    stage65_run_id = stage64_run_id = stage63_run_id = stage62_run_id = ""
-    stage61_run_id = stage60_run_id = stage59_run_id = stage57_run_id = ""
+    stage69_run_id = ""
+    stage68_run_id = ""
+    stage67_run_id = ""
+    stage66_run_id = ""
+    stage65_run_id = ""
+    stage64_run_id = ""
+    stage63_run_id = ""
+    stage62_run_id = ""
+    stage61_run_id = ""
+    stage60_run_id = ""
+    stage59_run_id = ""
+    stage57_run_id = ""
 
 
 # ---------------------------------------------------------------------
-# Upstream chain — robust chained resolution
-#
-# Stage 70 may not physically persist every older stage*_run_id column.
-# Resolve the chain progressively from the IDs that are actually present.
+# Stage 69 deterministic resolution
 # ---------------------------------------------------------------------
 
 stage69 = get_bound(
@@ -374,90 +451,189 @@ stage69 = get_bound(
     stage69_run_id,
 )
 
-# If Stage 70 did not carry stage68_run_id, recover it from Stage 69.
-if stage69 and not stage68_run_id:
-    stage68_run_id = str(stage69.get("stage68_run_id") or "")
+if not stage69 or not valid_stage69_row(stage69):
+    stage69 = next((r for r in stage69_candidates if valid_stage69_row(r)), None)
+
+if stage69:
+    stage69_run_id = str(stage69.get("id") or "")
+
+    # Recover missing upstream IDs from Stage 69.
+    if not stage68_run_id:
+        stage68_run_id = str(stage69.get("stage68_run_id") or "")
+    if not stage67_run_id:
+        stage67_run_id = str(stage69.get("stage67_run_id") or "")
+    if not stage66_run_id:
+        stage66_run_id = str(stage69.get("stage66_run_id") or "")
+    if not stage65_run_id:
+        stage65_run_id = str(stage69.get("stage65_run_id") or "")
+    if not stage64_run_id:
+        stage64_run_id = str(stage69.get("stage64_run_id") or "")
+    if not stage63_run_id:
+        stage63_run_id = str(stage69.get("stage63_run_id") or "")
+    if not stage62_run_id:
+        stage62_run_id = str(stage69.get("stage62_run_id") or "")
+    if not stage61_run_id:
+        stage61_run_id = str(stage69.get("stage61_run_id") or "")
+    if not stage60_run_id:
+        stage60_run_id = str(stage69.get("stage60_run_id") or "")
+    if not stage59_run_id:
+        stage59_run_id = str(stage69.get("stage59_run_id") or "")
+    if not stage57_run_id:
+        stage57_run_id = str(stage69.get("stage57_run_id") or "")
+
+
+# ---------------------------------------------------------------------
+# Stage 68 deterministic resolution
+# ---------------------------------------------------------------------
 
 stage68 = get_bound(
     "stage68_upload_package_preparation_runs",
     stage68_run_id,
 )
 
-# If Stage 70 did not carry stage67_run_id, recover it from Stage 68.
-if stage68 and not stage67_run_id:
-    stage67_run_id = str(stage68.get("stage67_run_id") or "")
+if not stage68 or not valid_stage68_row(stage68):
+    # Prefer a row matching the Stage 69 application reference when available.
+    stage69_ref = normalize_text(stage69.get("application_reference")) if stage69 else ""
+    matching_stage68 = [
+        r for r in stage68_candidates
+        if valid_stage68_row(r)
+        and (
+            not stage69_ref
+            or not normalize_text(r.get("application_reference"))
+            or normalize_text(r.get("application_reference")) == stage69_ref
+        )
+    ]
+    stage68 = matching_stage68[0] if matching_stage68 else None
+
+if stage68:
+    stage68_run_id = str(stage68.get("id") or "")
+
+    if not stage67_run_id:
+        stage67_run_id = str(stage68.get("stage67_run_id") or "")
+    if not stage66_run_id:
+        stage66_run_id = str(stage68.get("stage66_run_id") or "")
+    if not stage65_run_id:
+        stage65_run_id = str(stage68.get("stage65_run_id") or "")
+    if not stage64_run_id:
+        stage64_run_id = str(stage68.get("stage64_run_id") or "")
+    if not stage63_run_id:
+        stage63_run_id = str(stage68.get("stage63_run_id") or "")
+    if not stage62_run_id:
+        stage62_run_id = str(stage68.get("stage62_run_id") or "")
+    if not stage61_run_id:
+        stage61_run_id = str(stage68.get("stage61_run_id") or "")
+    if not stage60_run_id:
+        stage60_run_id = str(stage68.get("stage60_run_id") or "")
+    if not stage59_run_id:
+        stage59_run_id = str(stage68.get("stage59_run_id") or "")
+    if not stage57_run_id:
+        stage57_run_id = str(stage68.get("stage57_run_id") or "")
+
+
+# ---------------------------------------------------------------------
+# Stage 67 canonical draft binding
+# ---------------------------------------------------------------------
 
 stage67 = get_bound(
     "stage67_portal_draft_binding_runs",
     stage67_run_id,
 )
 
-# Recover Stage 66 from Stage 67 when necessary.
-if stage67 and not stage66_run_id:
-    stage66_run_id = str(stage67.get("stage66_run_id") or "")
+if not stage67 or not valid_stage67_row(stage67):
+    # Prefer exact application reference compatibility with downstream rows.
+    downstream_reference = (
+        normalize_text(stage70.get("application_reference")) if stage70 else ""
+    ) or (
+        normalize_text(stage69.get("application_reference")) if stage69 else ""
+    ) or (
+        normalize_text(stage68.get("application_reference")) if stage68 else ""
+    )
+
+    matching_stage67 = [
+        r for r in stage67_candidates
+        if valid_stage67_row(r)
+        and (
+            not downstream_reference
+            or normalize_text(r.get("application_reference")) == downstream_reference
+        )
+    ]
+    stage67 = matching_stage67[0] if matching_stage67 else None
+
+if stage67:
+    stage67_run_id = str(stage67.get("id") or "")
+
+    if not stage66_run_id:
+        stage66_run_id = str(stage67.get("stage66_run_id") or "")
+    if not stage60_run_id:
+        stage60_run_id = str(stage67.get("stage60_run_id") or "")
+    if not stage59_run_id:
+        stage59_run_id = str(stage67.get("stage59_run_id") or "")
+    if not stage57_run_id:
+        stage57_run_id = str(stage67.get("stage57_run_id") or "")
+
+
+# ---------------------------------------------------------------------
+# Remaining bound upstream rows
+# ---------------------------------------------------------------------
 
 stage66 = get_bound(
     "stage66_portal_session_establishment_runs",
     stage66_run_id,
 )
 
-# Recover Stage 60 from the nearest upstream row that has it.
-if not stage60_run_id:
-    if stage67:
-        stage60_run_id = str(stage67.get("stage60_run_id") or "")
-    elif stage68:
-        stage60_run_id = str(stage68.get("stage60_run_id") or "")
-    elif stage69:
-        stage60_run_id = str(stage69.get("stage60_run_id") or "")
-
 stage60 = get_bound(
     "stage60_submission_package_runs",
     stage60_run_id,
 )
 
-# Final fail-safe: if the explicit Stage 67 id is unavailable but the project/lock
-# has exactly one completed PORTAL_DRAFT_BOUND run, use the latest matching run.
-if not stage67:
-    stage67_candidates_fallback = rows(
-        "stage67_portal_draft_binding_runs",
-        {
-            "user_id": user_id,
-            "project_id": project_id,
-            "opportunity_lock_id": lock_id,
-        },
-        "created_at",
-        50,
+
+# ---------------------------------------------------------------------
+# Cross-stage deterministic compatibility checks
+# ---------------------------------------------------------------------
+
+stage70_ref = normalize_text(stage70.get("application_reference")) if stage70 else ""
+stage69_ref = normalize_text(stage69.get("application_reference")) if stage69 else ""
+stage68_ref = normalize_text(stage68.get("application_reference")) if stage68 else ""
+stage67_ref = normalize_text(stage67.get("application_reference")) if stage67 else ""
+
+resolved_refs = [r for r in (stage70_ref, stage69_ref, stage68_ref, stage67_ref) if r]
+cross_stage_reference_consistent = (
+    len(set(resolved_refs)) <= 1
+    if resolved_refs
+    else False
+)
+
+stage69_manifest_sha = normalize_text(
+    stage69.get("stage68_file_manifest_sha256")
+) if stage69 else ""
+
+stage68_manifest_sha = normalize_text(
+    stage68.get("file_manifest_sha256")
+) if stage68 else ""
+
+stage69_stage68_manifest_consistent = (
+    bool(stage69_manifest_sha)
+    and bool(stage68_manifest_sha)
+    and stage69_manifest_sha == stage68_manifest_sha
+)
+
+stage70_stage69_link_consistent = (
+    bool(stage70)
+    and bool(stage69)
+    and (
+        not normalize_text(stage70.get("stage69_run_id"))
+        or normalize_text(stage70.get("stage69_run_id")) == str(stage69.get("id") or "")
     )
+)
 
-    stage67 = next(
-        (
-            r for r in stage67_candidates_fallback
-            if normalize_text(r.get("run_status")).upper() == "COMPLETED"
-            and normalize_text(r.get("binding_outcome")).upper() == "PORTAL_DRAFT_BOUND"
-            and bool(r.get("draft_bound"))
-            and bool(r.get("portal_session_established"))
-            and not bool(r.get("external_submission_performed"))
-            and not bool(r.get("external_receipt_obtained"))
-        ),
-        None,
+stage69_stage68_link_consistent = (
+    bool(stage69)
+    and bool(stage68)
+    and (
+        not normalize_text(stage69.get("stage68_run_id"))
+        or normalize_text(stage69.get("stage68_run_id")) == str(stage68.get("id") or "")
     )
-
-    if stage67:
-        stage67_run_id = str(stage67.get("id") or "")
-        if not stage66_run_id:
-            stage66_run_id = str(stage67.get("stage66_run_id") or "")
-        if not stage60_run_id:
-            stage60_run_id = str(stage67.get("stage60_run_id") or "")
-
-        stage66 = get_bound(
-            "stage66_portal_session_establishment_runs",
-            stage66_run_id,
-        )
-
-        stage60 = get_bound(
-            "stage60_submission_package_runs",
-            stage60_run_id,
-        )
+)
 
 stage69_outcome = (
     normalize_text(stage69.get("upload_outcome")).upper()
@@ -660,6 +836,40 @@ add_check(
     stage68_outcome,
 )
 
+
+add_check(
+    "Stage 70 → Stage 69 link consistent",
+    stage70_stage69_link_consistent,
+    (
+        f"stage70.stage69_run_id={normalize_text(stage70.get('stage69_run_id')) if stage70 else 'MISSING'}, "
+        f"resolved_stage69={stage69_run_id or 'MISSING'}"
+    ),
+)
+
+add_check(
+    "Stage 69 → Stage 68 link consistent",
+    stage69_stage68_link_consistent,
+    (
+        f"stage69.stage68_run_id={normalize_text(stage69.get('stage68_run_id')) if stage69 else 'MISSING'}, "
+        f"resolved_stage68={stage68_run_id or 'MISSING'}"
+    ),
+)
+
+add_check(
+    "Stage 69 / Stage 68 manifest SHA256 consistent",
+    stage69_stage68_manifest_consistent,
+    (
+        f"stage69={stage69_manifest_sha[:16]}..., "
+        f"stage68={stage68_manifest_sha[:16]}..."
+    ),
+)
+
+add_check(
+    "Cross-stage application reference consistent",
+    cross_stage_reference_consistent,
+    " | ".join(resolved_refs) if resolved_refs else "MISSING",
+)
+
 add_check(
     "Stage 67 PORTAL_DRAFT_BOUND",
     stage67_outcome == "PORTAL_DRAFT_BOUND",
@@ -718,7 +928,7 @@ stage71_gate = (
 )
 
 gate_reason = (
-    "Stage 70 post-upload validation and the full bound submission-readiness chain are valid."
+    "Stage 70→69→68→67 chain is deterministically resolved, integrity-compatible, and submission readiness is valid."
     if stage71_gate == "READY"
     else "Stage 71 fail-closed gate failed: "
     + "; ".join(c["Check"] for c in checks if not c["PASS"])
@@ -784,8 +994,12 @@ with st.expander("Resolved draft identity chain", expanded=False):
     st.write(f"Stage 67 run: `{stage67_run_id or 'MISSING'}`")
     st.write(f"Stage 67 reference: `{stage67_application_reference or 'MISSING'}`")
     st.write(f"Stage 70 reference: `{stage70_application_reference or 'MISSING'}`")
+    st.write(f"Stage 69 reference: `{stage69_ref or 'MISSING'}`")
+    st.write(f"Stage 68 reference: `{stage68_ref or 'MISSING'}`")
     st.write(f"Canonical reference: `{application_reference or 'MISSING'}`")
     st.write(f"Canonical URL: `{current_portal_url or 'MISSING'}`")
+    st.write(f"Cross-stage reference consistent: `{cross_stage_reference_consistent}`")
+    st.write(f"Stage69/68 manifest consistent: `{stage69_stage68_manifest_consistent}`")
 
 if stage70_evidence_sha256:
     st.write(f"**Stage 70 evidence SHA256:** `{stage70_evidence_sha256}`")
@@ -891,7 +1105,7 @@ if not existing_stage71:
     )
 
     readiness_payload = {
-        "readiness_version": "stage71-v1.3",
+        "readiness_version": "stage71-v1.4",
         "user_id": user_id,
         "project_id": project_id,
         "opportunity_lock_id": lock_id,
@@ -926,7 +1140,7 @@ if not existing_stage71:
 
     run_basis = {
         "stage": 71,
-        "fingerprint_contract": "stage71-v1.3-final-submission-readiness",
+        "fingerprint_contract": "stage71-v1.4-final-submission-readiness",
         "user_id": user_id,
         "project_id": project_id,
         "opportunity_lock_id": lock_id,
@@ -966,7 +1180,7 @@ if not existing_stage71:
                 "stage70_run_id": stage70_run_id,
 
                 "stage": 71,
-                "readiness_version": "stage71-v1.3",
+                "readiness_version": "stage71-v1.4",
 
                 "opportunity_identity": identity,
                 "official_deadline": str(deadline or "")[:10] or None,
@@ -1087,6 +1301,6 @@ if existing_stage71:
 
 
 st.caption(
-    "Invariantă Stage 71 v1.3: READY_FOR_SUBMISSION_AUTHORIZATION is a readiness state only. "
+    "Invariantă Stage 71 v1.4: READY_FOR_SUBMISSION_AUTHORIZATION is a readiness state only. "
     "It is not evidence of submission, signature, financial commitment or European Commission receipt."
 )
