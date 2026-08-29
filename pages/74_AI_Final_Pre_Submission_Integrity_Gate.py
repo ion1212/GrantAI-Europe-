@@ -4,11 +4,11 @@ from urllib.parse import urlparse
 import streamlit as st
 from supabase import create_client
 
-# STAGE 74 v1.0 — Final Pre-Submission Integrity Gate
+# STAGE 74 v1.1 — Final Pre-Submission Integrity Gate
 # Fail-closed. This stage NEVER presses Submit and NEVER records a receipt.
 
-st.set_page_config(page_title="Stage 74 v1.0 — Final Pre-Submission Integrity", page_icon="🛡️", layout="wide")
-st.title("🛡️ Etapa 74 v1.0 — AI Final Pre-Submission Integrity Gate")
+st.set_page_config(page_title="Stage 74 v1.1 — Final Pre-Submission Integrity", page_icon="🛡️", layout="wide")
+st.title("🛡️ Etapa 74 v1.1 — AI Final Pre-Submission Integrity Gate")
 st.caption("Ultima verificare înaintea unei eventuale etape de execuție. Stage 74 NU apasă Submit.")
 
 def norm(v): return str(v or "").strip()
@@ -166,10 +166,33 @@ if not existing:
             "integrity_payload":integrity_payload,"run_payload":run_basis,"confirmed_at":now(),"completed_at":now(),"created_at":now(),"updated_at":now()
         }
         try:
-            db().rpc("persist_stage74_final_pre_submission_integrity",{"p_payload":out}).execute()
-            st.success("Stage 74 persisted — FINAL_PRE_SUBMISSION_INTEGRITY_CONFIRMED."); st.rerun()
+            # Stage 74 v1.1 persistence:
+            # Use direct table insert, matching the working Stage 73 fallback pattern.
+            # This avoids AUTH_REQUIRED from an RPC that depends on auth.uid()
+            # when the app is using its own persisted user_id/session model.
+            existing_same = (
+                db()
+                .table("stage74_final_pre_submission_integrity_runs")
+                .select("*")
+                .eq("user_id", user_id)
+                .eq("project_id", project_id)
+                .eq("opportunity_lock_id", lock_id)
+                .eq("stage73_run_id", s73_id)
+                .eq("run_fingerprint", fingerprint)
+                .limit(1)
+                .execute()
+            ).data or []
+
+            if not existing_same:
+                db().table("stage74_final_pre_submission_integrity_runs").insert(out).execute()
+
+            st.success("Stage 74 persisted — FINAL_PRE_SUBMISSION_INTEGRITY_CONFIRMED.")
+            st.rerun()
         except Exception as e:
-            st.error(f"Persistence failed. Run Stage 74 SQL first. {type(e).__name__}: {str(e)[:1500]}")
+            st.error(
+                "Stage 74 direct persistence failed. "
+                f"{type(e).__name__}: {str(e)[:1500]}"
+            )
 
 existing=rows("stage74_final_pre_submission_integrity_runs",{"user_id":user_id,"project_id":project_id,"opportunity_lock_id":lock_id,"stage73_run_id":s73_id},"created_at",1)
 if existing:
