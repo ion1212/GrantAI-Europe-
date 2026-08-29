@@ -10,7 +10,7 @@ from supabase import create_client
 
 
 # =====================================================================
-# STAGE 71 v1.4 — AI FINAL PORTAL SUBMISSION READINESS GATE
+# STAGE 71 v1.5 — AI FINAL PORTAL SUBMISSION READINESS GATE
 #
 # Purpose:
 #   Consume ONLY Stage 70 PORTAL_POST_UPLOAD_VALIDATED and establish
@@ -56,12 +56,12 @@ from supabase import create_client
 
 
 st.set_page_config(
-    page_title="Stage 71 v1.4 — Final Portal Submission Readiness",
+    page_title="Stage 71 v1.5 — Final Portal Submission Readiness",
     page_icon="✅",
     layout="wide",
 )
 
-st.title("✅ Etapa 71 v1.4 — AI Final Portal Submission Readiness Gate")
+st.title("✅ Etapa 71 v1.5 — AI Final Portal Submission Readiness Gate")
 st.caption(
     "Ultimul control de readiness înainte de o eventuală etapă separată de autorizare explicită a trimiterii. "
     "Stage 71 NU apasă Submit și NU trimite propunerea."
@@ -306,6 +306,76 @@ stage70_candidates = rows(
     100,
 )
 
+
+# ---------------------------------------------------------------------
+# Stage 70 diagnostic — explains why a persisted Stage 70 row is
+# excluded by the strict resolver without weakening the gate.
+# ---------------------------------------------------------------------
+
+with st.expander("DEBUG Stage 70 resolution", expanded=True):
+    st.write("user_id:", user_id)
+    st.write("project_id:", project_id)
+    st.write("opportunity_lock_id:", lock_id)
+    st.write("Stage 70 candidates found:", len(stage70_candidates))
+
+    if not stage70_candidates:
+        st.error(
+            "No Stage 70 rows matched the exact user_id + project_id + "
+            "opportunity_lock_id filter."
+        )
+
+    for i, r in enumerate(stage70_candidates):
+        candidate_checks = {
+            "run_status_COMPLETED":
+                normalize_text(r.get("run_status")).upper() == "COMPLETED",
+            "validation_outcome_PORTAL_POST_UPLOAD_VALIDATED":
+                normalize_text(r.get("validation_outcome")).upper()
+                == "PORTAL_POST_UPLOAD_VALIDATED",
+            "portal_upload_performed_TRUE":
+                bool(r.get("portal_upload_performed")),
+            "external_submission_performed_FALSE":
+                not bool(r.get("external_submission_performed")),
+            "external_receipt_obtained_FALSE":
+                not bool(r.get("external_receipt_obtained")),
+            "blocking_errors_present_FALSE":
+                not bool(r.get("blocking_errors_present")),
+        }
+
+        st.markdown(f"**Candidate {i + 1}**")
+        st.json({
+            "id": r.get("id"),
+            "user_id": r.get("user_id"),
+            "project_id": r.get("project_id"),
+            "opportunity_lock_id": r.get("opportunity_lock_id"),
+            "run_status": r.get("run_status"),
+            "validation_outcome": r.get("validation_outcome"),
+            "portal_upload_performed": r.get("portal_upload_performed"),
+            "external_submission_performed": r.get("external_submission_performed"),
+            "external_receipt_obtained": r.get("external_receipt_obtained"),
+            "blocking_errors_present": r.get("blocking_errors_present"),
+            "application_reference": r.get("application_reference"),
+            "stage69_run_id": r.get("stage69_run_id"),
+            "post_upload_evidence_sha256": r.get("post_upload_evidence_sha256"),
+            "validation_evidence_sha256": r.get("validation_evidence_sha256"),
+            "evidence_sha256": r.get("evidence_sha256"),
+            "run_fingerprint": r.get("run_fingerprint"),
+            "candidate_checks": candidate_checks,
+            "candidate_passes_valid_stage70_rule":
+                all(candidate_checks.values()),
+        })
+
+        failed_checks = [
+            name for name, passed in candidate_checks.items() if not passed
+        ]
+
+        if failed_checks:
+            st.warning(
+                "Candidate rejected by Stage 71 because: "
+                + "; ".join(failed_checks)
+            )
+        else:
+            st.success("Candidate satisfies the Stage 70 resolver conditions.")
+
 stage69_candidates = rows(
     "stage69_portal_upload_confirmation_runs",
     {
@@ -388,6 +458,26 @@ def valid_stage67_row(r: dict) -> bool:
 
 # Resolve Stage 70 directly from its own table.
 stage70 = next((r for r in stage70_candidates if valid_stage70_row(r)), None)
+
+
+with st.expander("DEBUG Stage 70 selected candidate", expanded=True):
+    if stage70:
+        st.success(f"Selected Stage 70 run: {stage70.get('id')}")
+        st.json({
+            "id": stage70.get("id"),
+            "run_status": stage70.get("run_status"),
+            "validation_outcome": stage70.get("validation_outcome"),
+            "portal_upload_performed": stage70.get("portal_upload_performed"),
+            "external_submission_performed": stage70.get("external_submission_performed"),
+            "external_receipt_obtained": stage70.get("external_receipt_obtained"),
+            "blocking_errors_present": stage70.get("blocking_errors_present"),
+            "application_reference": stage70.get("application_reference"),
+            "stage69_run_id": stage70.get("stage69_run_id"),
+        })
+    else:
+        st.error(
+            "No Stage 70 candidate satisfied all strict Stage 71 resolver conditions."
+        )
 
 if stage70:
     stage70_run_id = str(stage70.get("id") or "")
@@ -1105,7 +1195,7 @@ if not existing_stage71:
     )
 
     readiness_payload = {
-        "readiness_version": "stage71-v1.4",
+        "readiness_version": "stage71-v1.5",
         "user_id": user_id,
         "project_id": project_id,
         "opportunity_lock_id": lock_id,
@@ -1140,7 +1230,7 @@ if not existing_stage71:
 
     run_basis = {
         "stage": 71,
-        "fingerprint_contract": "stage71-v1.4-final-submission-readiness",
+        "fingerprint_contract": "stage71-v1.5-final-submission-readiness",
         "user_id": user_id,
         "project_id": project_id,
         "opportunity_lock_id": lock_id,
@@ -1180,7 +1270,7 @@ if not existing_stage71:
                 "stage70_run_id": stage70_run_id,
 
                 "stage": 71,
-                "readiness_version": "stage71-v1.4",
+                "readiness_version": "stage71-v1.5",
 
                 "opportunity_identity": identity,
                 "official_deadline": str(deadline or "")[:10] or None,
@@ -1301,6 +1391,6 @@ if existing_stage71:
 
 
 st.caption(
-    "Invariantă Stage 71 v1.4: READY_FOR_SUBMISSION_AUTHORIZATION is a readiness state only. "
+    "Invariantă Stage 71 v1.5: READY_FOR_SUBMISSION_AUTHORIZATION is a readiness state only. "
     "It is not evidence of submission, signature, financial commitment or European Commission receipt."
 )
