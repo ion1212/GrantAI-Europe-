@@ -1,4 +1,4 @@
-import os
+
 import io
 import json
 import hashlib
@@ -22,9 +22,9 @@ except Exception:
 # its identifiers/hash to Stage 76. It never invents or downloads a receipt.
 # =====================================================================
 
-st.set_page_config(page_title="Stage 77 — Official Receipt Verification", page_icon="🧾", layout="wide")
-st.title("🧾 Etapa 77 v1.0 — AI Official Submission Receipt Verification Gate")
-st.caption("Verifică dovada oficială emisă de Funding & Tenders Portal după depunere.")
+st.set_page_config(page_title="Stage 77 — Submission Evidence Verification", page_icon="🧾", layout="wide")
+st.title("🧾 Etapa 77 v1.1 — AI Submission Evidence Verification Gate")
+st.caption("Acceptă confirmarea vizibilă din portal acum și permite verificarea receipt-ului PDF ulterior.")
 
 
 def secret(name, default=""):
@@ -177,13 +177,34 @@ c2.metric("Application", application_reference)
 c3.metric("Receipt", "VERIFIED" if existing else "PENDING")
 
 if not existing:
-    st.info("În portal, așteaptă apariția PDF-ului semnat digital și descarcă-l. Nu folosi o captură de ecran în locul receipt-ului PDF.")
-    receipt = st.file_uploader("Official EC submission receipt (PDF)", type=["pdf"], key="stage77_receipt")
+    evidence_mode = st.radio(
+        "Submission evidence available",
+        ["Portal confirmation (no PDF yet)", "Official digitally signed receipt PDF"],
+        key="stage77_evidence_mode",
+    )
+    provisional_mode = evidence_mode.startswith("Portal confirmation")
+
+    if provisional_mode:
+        st.info(
+            "Folosește pagina oficială care arată Submitted, Final ID și data/ora. "
+            "Rezultatul este provizoriu; receipt-ul poate fi verificat ulterior."
+        )
+        portal_image = st.file_uploader(
+            "Optional portal confirmation screenshot (PNG/JPG)",
+            type=["png", "jpg", "jpeg"],
+            key="stage77_portal_image",
+        )
+        receipt = None
+    else:
+        st.info("Încarcă PDF-ul semnat digital descărcat din Funding & Tenders Portal.")
+        receipt = st.file_uploader("Official EC submission receipt (PDF)", type=["pdf"], key="stage77_receipt")
+        portal_image = None
     final_proposal_id = st.text_input("Final proposal ID shown by the portal", placeholder="Example: 101363053", key="stage77_final_id")
     submitted_at_text = st.text_input("Official submitted timestamp", placeholder="Example: 30 August 2026 00:05:46 Brussels Local Time", key="stage77_submitted_at")
     receipt_source_url = st.text_input("Official portal URL where the receipt was obtained", value=portal_url, key="stage77_url")
 
     raw = receipt.getvalue() if receipt else b""
+    portal_image_raw = portal_image.getvalue() if portal_image else b""
     pdf_header_ok = raw.startswith(b"%PDF-")
     receipt_sha = sha_bytes(raw) if raw else ""
     extracted_text, extraction_error = extract_pdf_text(raw) if raw else ("", None)
@@ -192,18 +213,21 @@ if not existing:
     final_id_in_pdf = norm(final_proposal_id).lower() in searchable if searchable and norm(final_proposal_id) else False
     ec_marker = any(marker in searchable for marker in ("european commission", "funding & tenders", "submission receipt", "proposal")) if searchable else False
 
-    checks = [
+    common_checks = [
         ("Stage 76 completed", norm(stage76.get("run_status")).upper() == "COMPLETED"),
         ("Stage 76 fingerprint present", len(stage76_fingerprint) == 64),
         ("Stage 76 execution SHA present", len(stage76_execution_sha) == 64),
-        ("Receipt is a PDF", pdf_header_ok),
         ("Official portal URL", official_domain_ok(receipt_source_url)),
         ("Final proposal ID present", len(norm(final_proposal_id)) >= 5),
         ("Official submitted timestamp present", len(norm(submitted_at_text)) >= 8),
+    ]
+    pdf_checks = [
+        ("Receipt is a PDF", pdf_header_ok),
         ("Application reference found in PDF text", reference_in_pdf),
         ("Final proposal ID found in PDF text", final_id_in_pdf),
         ("EC/portal marker found in PDF text", ec_marker),
     ]
+    checks = common_checks if provisional_mode else common_checks + pdf_checks
 
     with st.expander("Receipt verification checks", expanded=True):
         st.dataframe([{"Check": name, "PASS": passed} for name, passed in checks], use_container_width=True, hide_index=True)
@@ -212,24 +236,41 @@ if not existing:
         if receipt_sha:
             st.code(receipt_sha, language=None)
 
-    exact_receipt_confirmed = st.checkbox("I confirm this is the official digitally signed receipt for this exact proposal.", key="stage77_exact")
-    no_manual_edit = st.checkbox("I confirm the receipt file was downloaded from the official portal and was not edited.", key="stage77_unedited")
-    phrase = st.text_input("Verification phrase", placeholder="Type exactly: VERIFY STAGE 77 OFFICIAL RECEIPT", key="stage77_phrase")
+    if provisional_mode:
+        portal_submitted_confirmed = st.checkbox("I confirm the official portal shows this exact proposal as SUBMITTED.", key="stage77_portal_submitted")
+        final_id_confirmed = st.checkbox("I confirm the Final ID and submitted timestamp above exactly match the portal.", key="stage77_final_id_confirmed")
+        phrase_target = "RECORD STAGE 77 PROVISIONAL PORTAL EVIDENCE"
+        phrase = st.text_input("Confirmation phrase", placeholder=f"Type exactly: {phrase_target}", key="stage77_phrase_provisional")
+        ready = all(value for _, value in checks) and portal_submitted_confirmed and final_id_confirmed and norm(phrase) == phrase_target
+    else:
+        exact_receipt_confirmed = st.checkbox("I confirm this is the official digitally signed receipt for this exact proposal.", key="stage77_exact")
+        no_manual_edit = st.checkbox("I confirm the receipt file was downloaded from the official portal and was not edited.", key="stage77_unedited")
+        phrase_target = "VERIFY STAGE 77 OFFICIAL RECEIPT"
+        phrase = st.text_input("Verification phrase", placeholder=f"Type exactly: {phrase_target}", key="stage77_phrase")
+        ready = all(value for _, value in checks) and exact_receipt_confirmed and no_manual_edit and norm(phrase) == phrase_target
 
-    ready = all(value for _, value in checks) and exact_receipt_confirmed and no_manual_edit and norm(phrase) == "VERIFY STAGE 77 OFFICIAL RECEIPT"
-
-    if st.button("🧾 Persist Stage 77 verified official receipt", type="primary", use_container_width=True, disabled=not ready, key="stage77_persist"):
+    button_label = "Record provisional portal evidence" if provisional_mode else "Persist verified official receipt"
+    if st.button(f"🧾 {button_label}", type="primary", use_container_width=True, disabled=not ready, key="stage77_persist"):
+        outcome = "PROVISIONAL_PORTAL_SUBMISSION_EVIDENCE_RECORDED" if provisional_mode else "OFFICIAL_SUBMISSION_RECEIPT_VERIFIED"
+        source_name = portal_image.name if portal_image else (receipt.name if receipt else None)
+        source_mime = portal_image.type if portal_image else ((receipt.type or "application/pdf") if receipt else None)
+        source_raw = portal_image_raw if provisional_mode else raw
         evidence = {
-            "verification_version": "stage77-v1.0",
+            "verification_version": "stage77-v1.1",
+            "evidence_mode": "PORTAL_CONFIRMATION" if provisional_mode else "OFFICIAL_RECEIPT_PDF",
             "stage76_run_id": stage76_run_id,
             "application_reference": application_reference,
             "final_proposal_id": norm(final_proposal_id),
             "official_submitted_at_text": norm(submitted_at_text),
             "receipt_source_url": norm(receipt_source_url),
-            "receipt_file_name": receipt.name,
-            "receipt_mime_type": receipt.type or "application/pdf",
-            "receipt_size_bytes": len(raw),
-            "receipt_sha256": receipt_sha,
+            "evidence_file_name": source_name,
+            "evidence_mime_type": source_mime,
+            "evidence_size_bytes": len(source_raw),
+            "evidence_file_sha256": sha_bytes(source_raw) if source_raw else None,
+            "receipt_file_name": receipt.name if receipt else None,
+            "receipt_mime_type": (receipt.type or "application/pdf") if receipt else None,
+            "receipt_size_bytes": len(raw) if receipt else None,
+            "receipt_sha256": receipt_sha or None,
             "stage76_execution_evidence_sha256": stage76_execution_sha,
             "stage76_run_fingerprint": stage76_fingerprint,
             "reference_in_pdf": reference_in_pdf,
@@ -237,7 +278,7 @@ if not existing:
             "ec_marker_in_pdf": ec_marker,
         }
         evidence_sha = sha_json(evidence)
-        run_basis = {"stage": 77, "contract": "stage77-v1.0-official-receipt-verification", "stage76_run_id": stage76_run_id, "receipt_sha256": receipt_sha, "verification_evidence_sha256": evidence_sha}
+        run_basis = {"stage": 77, "contract": "stage77-v1.1-submission-evidence-verification", "stage76_run_id": stage76_run_id, "outcome": outcome, "evidence_file_sha256": evidence.get("evidence_file_sha256"), "verification_evidence_sha256": evidence_sha}
         run_fingerprint = sha_json(run_basis)
         payload = {
             "user_id": user_id,
@@ -245,19 +286,24 @@ if not existing:
             "opportunity_lock_id": lock_id,
             "stage76_run_id": stage76_run_id,
             "stage": 77,
-            "verification_version": "stage77-v1.0",
+            "verification_version": "stage77-v1.1",
+            "evidence_mode": evidence["evidence_mode"],
             "opportunity_identity": identity,
             "application_reference": application_reference,
             "final_proposal_id": norm(final_proposal_id),
             "current_portal_url": norm(receipt_source_url),
             "run_status": "COMPLETED",
-            "verification_outcome": "OFFICIAL_SUBMISSION_RECEIPT_VERIFIED",
+            "verification_outcome": outcome,
             "external_submission_performed": True,
-            "external_receipt_obtained": True,
-            "receipt_file_name": receipt.name,
-            "receipt_mime_type": receipt.type or "application/pdf",
-            "receipt_size_bytes": len(raw),
-            "receipt_sha256": receipt_sha,
+            "external_receipt_obtained": not provisional_mode,
+            "evidence_file_name": source_name,
+            "evidence_mime_type": source_mime,
+            "evidence_size_bytes": len(source_raw),
+            "evidence_file_sha256": evidence.get("evidence_file_sha256"),
+            "receipt_file_name": receipt.name if receipt else None,
+            "receipt_mime_type": (receipt.type or "application/pdf") if receipt else None,
+            "receipt_size_bytes": len(raw) if receipt else None,
+            "receipt_sha256": receipt_sha or None,
             "stage76_execution_evidence_sha256": stage76_execution_sha,
             "stage76_run_fingerprint": stage76_fingerprint,
             "verification_evidence_sha256": evidence_sha,
@@ -272,7 +318,7 @@ if not existing:
         }
         try:
             supabase.table("stage77_official_submission_receipt_verifications").insert(payload).execute()
-            st.success("Stage 77 persisted — OFFICIAL_SUBMISSION_RECEIPT_VERIFIED.")
+            st.success(f"Stage 77 persisted — {outcome}.")
             st.rerun()
         except Exception as exc:
             st.error(f"Stage 77 persistence failed. Run Stage 77 SQL first. {type(exc).__name__}: {str(exc)[:1600]}")
@@ -284,10 +330,10 @@ if existing:
     st.subheader("Stage 77 outcome")
     st.success(f"Run ID: {existing.get('id')} — Outcome: {existing.get('verification_outcome')}")
     a, b, c = st.columns(3)
-    a.metric("Receipt", "VERIFIED")
+    a.metric("Evidence", "OFFICIAL RECEIPT" if existing.get("external_receipt_obtained") else "PORTAL CONFIRMATION")
     b.metric("Final ID", existing.get("final_proposal_id"))
     c.metric("Size", f"{existing.get('receipt_size_bytes') or 0} bytes")
     st.write(f"**Receipt SHA256:** `{existing.get('receipt_sha256')}`")
     st.write(f"**Run fingerprint:** `{existing.get('run_fingerprint')}`")
 
-st.caption("Invariant Stage 77 v1.0: success requires a real, unedited PDF receipt whose application reference and final proposal ID match the submitted proposal.")
+st.caption("Invariant Stage 77 v1.1: portal confirmation is provisional. Only a real, unedited EC PDF may produce OFFICIAL_SUBMISSION_RECEIPT_VERIFIED.")
