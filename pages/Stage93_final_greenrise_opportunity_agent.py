@@ -160,18 +160,14 @@ def extract_deadline(text):
 
 def candidate_title(raw_html, topic_id, context_text):
     escaped = re.escape(topic_id)
-    patterns = [
-        rf"<a\b[^>]*href=[\"'][^\"']*{escaped}[^\"']*[\"'][^>]*>(.*?)</a>",
-        rf"<a\b[^>]*>(.*?)</a>\s*.{{0,300}}{escaped}",
-    ]
+    patterns = [rf"<a\b[^>]*href=[\"'][^\"']*{escaped}[^\"']*[\"'][^>]*>(.*?)</a>"]
     for pattern in patterns:
         match = re.search(pattern, raw_html, flags=re.I | re.S)
         if match:
             title = strip_html(match.group(1))
             if 4 <= len(title) <= 500 and title.upper() != topic_id.upper():
                 return title
-    cleaned = context_text.replace(topic_id, " ")
-    return cleaned[:240].strip(" -:;|") or topic_id
+    return topic_id
 
 
 def candidate_url(raw_context, source_url, topic_id):
@@ -198,6 +194,24 @@ def score_candidate(text):
     return score, matched
 
 
+def identifier_year(topic_id):
+    match = re.search(r"-(20\d{2})(?:-|$)", topic_id)
+    return int(match.group(1)) if match else None
+
+
+def programme_fit_bonus(topic_id):
+    upper = topic_id.upper()
+    if "-CL6-" in upper:
+        return 12, ["HORIZON Cluster 6"]
+    if "-CL5-" in upper:
+        return 7, ["HORIZON Cluster 5"]
+    if upper.startswith("LIFE-"):
+        return 6, ["LIFE programme"]
+    if upper.startswith("EIC-"):
+        return 5, ["EIC programme"]
+    return 0, []
+
+
 def retrieve_and_extract(source_url, minimum_score, maximum_results, minimum_lead_days):
     response = requests.get(
         source_url,
@@ -221,11 +235,17 @@ def retrieve_and_extract(source_url, minimum_score, maximum_results, minimum_lea
             continue
         if topic_id in found:
             continue
-        start = max(0, match.start() - 1800)
-        end = min(len(raw_html), match.end() + 4200)
+        topic_year = identifier_year(topic_id)
+        if topic_year is not None and topic_year < date.today().year:
+            continue
+        start = max(0, match.start() - 350)
+        end = min(len(raw_html), match.end() + 650)
         raw_context = raw_html[start:end]
         context_text = strip_html(raw_context)
         score, keywords = score_candidate(context_text)
+        bonus, programme_keywords = programme_fit_bonus(topic_id)
+        score += bonus
+        keywords.extend(programme_keywords)
         deadline = extract_deadline(context_text)
         days_remaining = (deadline - date.today()).days if deadline else None
         if days_remaining is not None and days_remaining < minimum_lead_days:
@@ -234,9 +254,10 @@ def retrieve_and_extract(source_url, minimum_score, maximum_results, minimum_lea
             review_status = "REJECTED_LOW_RELEVANCE"
         else:
             review_status = "REQUIRES_OFFICIAL_ELIGIBILITY_REVIEW"
+        extracted_title = candidate_title(raw_html, topic_id, context_text)
         found[topic_id] = {
             "topic_identifier": topic_id,
-            "extracted_title": candidate_title(raw_html, topic_id, context_text),
+            "extracted_title": extracted_title,
             "official_topic_url": candidate_url(raw_context, source_url, topic_id),
             "official_source_url": source_url,
             "extracted_deadline": deadline.isoformat() if deadline else None,
@@ -437,7 +458,7 @@ if st.button(
     evidence_sha = sha_json(evidence)
     run_basis = {
         "stage": 93,
-        "contract": "stage93-final-v1.0-greenrise-opportunity-agent",
+        "contract": "stage93-final-v1.1-greenrise-opportunity-agent",
         "stage92_run_id": stage92_run_id,
         "outcome": "FINAL_AGENT_MONITORING_ACTIVE_REVIEW_QUEUE_READY",
         "extraction_evidence_sha256": evidence_sha,
@@ -447,7 +468,7 @@ if st.button(
         "project_id": project_id,
         "stage92_run_id": stage92_run_id,
         "stage": 93,
-        "agent_version": "stage93-final-v1.0",
+        "agent_version": "stage93-final-v1.1",
         "run_status": "COMPLETED",
         "final_outcome": "FINAL_AGENT_MONITORING_ACTIVE_REVIEW_QUEUE_READY",
         "operating_policy": "SOLO_ONLY",
@@ -556,6 +577,6 @@ if latest:
         )
 
 st.caption(
-    "FINAL invariant Stage 93 v1.0: monitoring and relevance ranking may be automated. Official eligibility, "
+    "FINAL invariant Stage 93 v1.1: monitoring and relevance ranking may be automated. Official eligibility, "
     "application creation, portal modification and final submission remain separately evidenced and human controlled."
 )
