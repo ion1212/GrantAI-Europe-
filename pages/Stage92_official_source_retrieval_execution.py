@@ -2,7 +2,9 @@ import hashlib
 import json
 import os
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
+import requests
 import streamlit as st
 from supabase import create_client
 
@@ -16,7 +18,7 @@ st.caption(
 
 JOB_NAME = "greenrise-stage91-weekly-dispatch"
 CRON_EXPRESSION = "0 7 * * 2"
-EXPECTED_COMMAND_FRAGMENT = "stage92_execute_official_retrieval"
+EXPECTED_COMMAND_FRAGMENT = "stage92_queue_official_retrieval"
 
 
 def secret(name, default=""):
@@ -90,6 +92,29 @@ def project_label(project):
 
 def rpc_data(name, params=None):
     return supabase.rpc(name, params or {}).execute().data
+
+
+def retrieve_official_source(url):
+    response = requests.get(
+        url,
+        timeout=30,
+        allow_redirects=True,
+        headers={"User-Agent": "GreenRise-Stage92/1.1 official-source-retrieval"},
+    )
+    content = response.content or b""
+    text = response.text or ""
+    final_host = (urlparse(response.url).hostname or "").lower()
+    official_final_url = final_host == "europa.eu" or final_host.endswith(".europa.eu")
+    return {
+        "http_status": int(response.status_code),
+        "content_type": response.headers.get("content-type", ""),
+        "content_bytes": len(content),
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "horizon_marker_count": text.count("HORIZON-"),
+        "content_excerpt": text[:4000],
+        "final_url": response.url,
+        "official_final_url": official_final_url,
+    }
 
 
 try:
@@ -274,9 +299,26 @@ if st.button(
             inserted = supabase.table("stage92_retrieval_configs").insert(pending_payload).execute().data or []
             config_id = str(inserted[0]["id"])
 
-        success_count = rpc_data(
-            "stage92_execute_official_retrieval",
-            {"p_trigger_source": "MANUAL_VERIFICATION"},
+        with st.spinner("Retrieving the official European Commission source..."):
+            live_result = retrieve_official_source(source_url)
+        if live_result["http_status"] < 200 or live_result["http_status"] > 299:
+            raise RuntimeError(f"Official source returned HTTP {live_result['http_status']}")
+        if live_result["content_bytes"] <= 0:
+            raise RuntimeError("Official source returned empty content")
+        if not live_result["official_final_url"]:
+            raise RuntimeError(f"Retrieval redirected outside the official europa.eu domain: {live_result['final_url']}")
+
+        execution_id = rpc_data(
+            "stage92_record_client_retrieval",
+            {
+                "p_config_id": config_id,
+                "p_http_status": live_result["http_status"],
+                "p_content_type": live_result["content_type"],
+                "p_content_bytes": live_result["content_bytes"],
+                "p_content_sha256": live_result["content_sha256"],
+                "p_horizon_marker_count": live_result["horizon_marker_count"],
+                "p_content_excerpt": live_result["content_excerpt"],
+            },
         )
         test_rows = rows(
             "stage92_retrieval_executions",
@@ -285,7 +327,7 @@ if st.button(
             1,
         )
         if not test_rows:
-            raise RuntimeError(f"Retrieval returned {success_count}, but no execution evidence was visible.")
+            raise RuntimeError(f"Retrieval evidence {execution_id} was not visible after recording.")
         test_run = test_rows[0]
         if test_run.get("execution_status") != "SUCCEEDED":
             raise RuntimeError(
