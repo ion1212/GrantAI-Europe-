@@ -212,6 +212,46 @@ def programme_fit_bonus(topic_id):
     return 0, []
 
 
+SOLO_RULE_PATTERNS = (
+    re.compile(r"\bsingle\s+(?:applicant|beneficiary|legal entity)\b", re.I),
+    re.compile(r"\bone\s+(?:applicant|beneficiary|legal entity)\b", re.I),
+    re.compile(r"\bmono[- ]beneficiary\b", re.I),
+    re.compile(r"\bapplications?\s+(?:may|can|must)\s+be\s+submitted\s+by\s+(?:a|one)\s+single\b", re.I),
+)
+CONSORTIUM_RULE_PATTERNS = (
+    re.compile(r"\bat least\s+(?:two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:independent\s+)?(?:applicants?|beneficiaries|legal entities|participants)\b", re.I),
+    re.compile(r"\bconsortium\s+(?:of|comprising|composed of)\s+(?:at least\s+)?(?:two|three|four|five|six|seven|eight|nine|ten|\d+)\b", re.I),
+)
+
+
+def applicant_rule_from_official_page(url):
+    """Return a conservative applicant-number decision from the official topic page.
+
+    Ambiguous wording never passes the SOLO_ONLY gate.  The exact matching
+    sentence is retained as evidence so a later audit can reproduce the choice.
+    """
+    response = requests.get(
+        url,
+        timeout=35,
+        allow_redirects=True,
+        headers={"User-Agent": "GreenRise-Stage93-SoloVerifier/1.2"},
+    )
+    if response.status_code < 200 or response.status_code > 299 or not official_eu_url(response.url):
+        return "UNCLEAR", None, None
+
+    text = strip_html(response.text or "")
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    consortium = next((s for s in sentences if any(p.search(s) for p in CONSORTIUM_RULE_PATTERNS)), None)
+    solo = next((s for s in sentences if any(p.search(s) for p in SOLO_RULE_PATTERNS)), None)
+
+    # A consortium requirement takes precedence over a generic solo phrase.
+    if consortium:
+        return "CONSORTIUM_REQUIRED", consortium[:1200], response.url
+    if solo:
+        return "SINGLE_APPLICANT_CONFIRMED", solo[:1200], response.url
+    return "UNCLEAR", None, response.url
+
+
 def retrieve_and_extract(source_url, minimum_score, maximum_results, minimum_lead_days):
     response = requests.get(
         source_url,
@@ -255,17 +295,34 @@ def retrieve_and_extract(source_url, minimum_score, maximum_results, minimum_lea
         else:
             review_status = "REQUIRES_OFFICIAL_ELIGIBILITY_REVIEW"
         extracted_title = candidate_title(raw_html, topic_id, context_text)
+        topic_url = candidate_url(raw_context, source_url, topic_id)
+        applicant_rule = "UNCLEAR"
+        applicant_evidence = None
+        evidence_url = None
+        if review_status == "REQUIRES_OFFICIAL_ELIGIBILITY_REVIEW":
+            try:
+                applicant_rule, applicant_evidence, evidence_url = applicant_rule_from_official_page(topic_url)
+            except requests.RequestException:
+                applicant_rule = "UNCLEAR"
+
+            if applicant_rule == "SINGLE_APPLICANT_CONFIRMED":
+                review_status = "READY_FOR_SEPARATE_HUMAN_VERIFICATION"
+            elif applicant_rule == "CONSORTIUM_REQUIRED":
+                review_status = "REJECTED_CONSORTIUM_REQUIRED"
+            else:
+                review_status = "REJECTED_SOLO_RULE_NOT_PROVEN"
+
         found[topic_id] = {
             "topic_identifier": topic_id,
             "extracted_title": extracted_title,
-            "official_topic_url": candidate_url(raw_context, source_url, topic_id),
+            "official_topic_url": evidence_url or topic_url,
             "official_source_url": source_url,
             "extracted_deadline": deadline.isoformat() if deadline else None,
             "days_remaining": days_remaining,
             "relevance_score": score,
             "matched_keywords": keywords,
-            "applicant_rule": "UNCLEAR",
-            "applicant_rule_evidence": None,
+            "applicant_rule": applicant_rule,
+            "applicant_rule_evidence": applicant_evidence,
             "location_eligibility": "UNVERIFIED",
             "entity_type_eligibility": "UNVERIFIED",
             "review_status": review_status,
@@ -273,7 +330,13 @@ def retrieve_and_extract(source_url, minimum_score, maximum_results, minimum_lea
         }
 
     all_candidates = list(found.values())
-    queue = [c for c in all_candidates if c["review_status"] == "REQUIRES_OFFICIAL_ELIGIBILITY_REVIEW"]
+    # Hard invariant: the automatic queue contains only officially evidenced
+    # single-applicant opportunities.  UNCLEAR is a rejection, never a pass.
+    queue = [
+        c for c in all_candidates
+        if c["applicant_rule"] == "SINGLE_APPLICANT_CONFIRMED"
+        and c["review_status"] == "READY_FOR_SEPARATE_HUMAN_VERIFICATION"
+    ]
     queue.sort(key=lambda c: (-c["relevance_score"], -(c["days_remaining"] or -999999), c["topic_identifier"]))
     queue = queue[:maximum_results]
     for index, candidate in enumerate(queue, 1):
@@ -336,7 +399,7 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Policy", "SOLO ONLY")
 c2.metric("Minimum lead", "30 days")
 c3.metric("Weekly monitoring", "ARMED" if weekly_monitoring_armed else "NOT ACTIVE")
-c4.metric("Final submission", "HUMAN CONTROLLED")
+c4.metric("Solo filter", "STRICT / AUTOMATIC")
 
 st.warning(
     "FINAL safety rule: a topic stays in the review queue until an official call document confirms applicant number, "
@@ -375,7 +438,7 @@ if extraction:
     st.write(f"**Source SHA-256:** `{extraction['content_sha256']}`")
 
     if extraction["queue"]:
-        st.markdown("### Final human-review queue")
+        st.markdown("### Verified solo-only preparation queue")
         preview = []
         for candidate in extraction["queue"]:
             preview.append({
@@ -399,7 +462,7 @@ checks = [
     ("Official source extraction completed", bool(extraction)),
     ("Official HTTP response verified", bool(extraction and extraction["http_status"] == 200)),
     ("Official content SHA-256 present", bool(extraction and len(extraction["content_sha256"]) == 64)),
-    ("All extracted applicant rules remain unverified", bool(extraction and all(c["applicant_rule"] == "UNCLEAR" for c in extraction["queue"]))),
+    ("Every queued opportunity is officially solo-confirmed", bool(extraction is not None and all(c["applicant_rule"] == "SINGLE_APPLICANT_CONFIRMED" and c["applicant_rule_evidence"] for c in extraction["queue"]))),
 ]
 
 with st.expander("Final Stage 93 controls", expanded=True):
@@ -481,7 +544,7 @@ if st.button(
         "discovered_count": extraction["discovered_count"],
         "relevant_count": extraction["relevant_count"],
         "review_queue_count": len(queue),
-        "verified_solo_count": 0,
+        "verified_solo_count": len(queue),
         "weekly_monitoring_armed": weekly_monitoring_armed,
         "automatic_application_creation": False,
         "automatic_submission": False,
